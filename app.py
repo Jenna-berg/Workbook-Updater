@@ -2488,17 +2488,23 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
 
 
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
-    """Full ROB new-month setup. Returns (new_file_name, error_str)."""
+    """Full ROB new-month setup.
+    Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
+    `original_bytes` is the file's content exactly as it was before this
+    run's changes (None on any early-exit failure) — the caller can use it
+    to offer an "undo"/reset-to-original for this setup, the same way the
+    Strategy Report setup already does.
+    """
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
     # ── Locate month folder (never created — must already exist) ────────────
     rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
     if not rev_id:
-        return None, "No REVENUE REPORTS folder."
+        return None, "No REVENUE REPORTS folder.", None, None
     month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
     if not month_id:
-        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
+        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist.", None, None
 
     # ── Find or copy the file ─────────────────────────────────────────────────
     # Diagnostic: list every file in month_id whose name contains "ROB" —
@@ -2529,7 +2535,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         is_fresh_copy = True
         master_id, master_name = find_rob_master(service, hotel_id)
         if not master_id:
-            return None, master_name
+            return None, master_name, None, None
         hotel_suffix = hotel_name.upper()
         name_upper   = master_name.upper()
         if "ROB" in name_upper:
@@ -2542,7 +2548,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         try:
             new_file_id, new_file_name = drive_copy_file(service, master_id, new_file_name, month_id)
         except Exception as e:
-            return None, str(e)
+            return None, str(e), None, None
 
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
@@ -2646,7 +2652,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     new_wb.save(out)
     drive_upload(service, new_file_id, out.getvalue(), new_file_name)
     warn_str = "; ".join(warnings) if warnings else None
-    return new_file_name, warn_str
+    return new_file_name, warn_str, new_file_id, new_wb_bytes
 
 
 def find_forecast_master(service, hotel_id: str):
@@ -3971,7 +3977,8 @@ with tab_weekly:
                         svc         = get_drive_service()
                         hotel_id_nm = hotel_id_map.get(hotel_sel, "")
                         with st.spinner("Setting up ROB — this may take a moment..."):
-                            rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
+                            rob_name, rob_err, rob_file_id, rob_orig_bytes = setup_new_rob_month(
+                                svc, hotel_id_nm, hotel_sel, setup_month_dt)
                         if rob_err and not rob_name:
                             if "storageQuotaExceeded" in str(rob_err):
                                 _, master_name = find_rob_master(svc, hotel_id_nm)
@@ -3995,9 +4002,27 @@ with tab_weekly:
                         else:
                             if rob_err:
                                 st.warning(rob_err)
+                            if rob_file_id and rob_orig_bytes is not None:
+                                st.session_state["setup_undo_rob"] = {
+                                    "file_id":   rob_file_id,
+                                    "file_name": rob_name,
+                                    "bytes":     rob_orig_bytes,
+                                }
                             st.success(f"**{rob_name}** ready for {setup_month_dt.strftime('%B %Y')}.")
                     except Exception as e:
                         st.error(f"ROB setup error: {e}")
+
+                # Reset button — shown after a successful ROB setup
+                if "setup_undo_rob" in st.session_state:
+                    if st.button("↩ Reset ROB to Original", key="setup_reset_rob", type="secondary", use_container_width=True):
+                        try:
+                            info = st.session_state["setup_undo_rob"]
+                            with st.spinner("Restoring original ROB workbook..."):
+                                drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
+                            del st.session_state["setup_undo_rob"]
+                            st.success(f"**{info['file_name']}** restored to original state.")
+                        except Exception as e:
+                            st.error(f"Reset error: {e}")
 
             # ── Strategy Report setup ──────────────────────────────────────────────
             with sr_col:
@@ -4077,7 +4102,7 @@ with tab_weekly:
                             out = io.BytesIO()
                             wb.save(out)
                             drive_upload(svc, file_id, out.getvalue(), file_name)
-                            st.session_state["setup_undo"] = {
+                            st.session_state["setup_undo_sr"] = {
                                 "file_id":   file_id,
                                 "file_name": file_name,
                                 "bytes":     original_bytes,
@@ -4090,21 +4115,17 @@ with tab_weekly:
                     except Exception as e:
                         st.error(f"Setup error: {e}")
 
-            # Reset button — shown after a successful setup
-            if "setup_undo" in st.session_state:
-                st.divider()
-                reset_col, _ = st.columns([2, 5])
-                with reset_col:
-                 if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary", use_container_width=True):
-                     try:
-                         info = st.session_state["setup_undo"]
-                         with st.spinner("Restoring original workbook..."):
-                             get_drive_service()
-                             drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
-                         del st.session_state["setup_undo"]
-                         st.success(f"**{info['file_name']}** restored to original state.")
-                     except Exception as e:
-                         st.error(f"Reset error: {e}")
+                # Reset button — shown after a successful SR setup
+                if "setup_undo_sr" in st.session_state:
+                    if st.button("↩ Reset SR to Original", key="setup_reset_sr", type="secondary", use_container_width=True):
+                        try:
+                            info = st.session_state["setup_undo_sr"]
+                            with st.spinner("Restoring original SR workbook..."):
+                                drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
+                            del st.session_state["setup_undo_sr"]
+                            st.success(f"**{info['file_name']}** restored to original state.")
+                        except Exception as e:
+                            st.error(f"Reset error: {e}")
 
 
 
