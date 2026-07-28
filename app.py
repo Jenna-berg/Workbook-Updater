@@ -1268,9 +1268,14 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     # include previous month — final numbers arrive on the 1st of the following month
     prev_month_start = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
     scope_start = prev_month_start
-    scope_end = datetime.date(today.year, 12, 31)
 
     date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
+    # Cover the sheet's actual date range, not a hardcoded Dec 31 — the SR's
+    # rolling 12 months usually crosses into the next calendar year (e.g. a
+    # July setup runs into next June), and a hardcoded year-end cutoff was
+    # silently dropping every month past December, regardless of what real
+    # data the CSV had for those dates.
+    scope_end = max(date_row_map.keys()) if date_row_map else datetime.date(today.year, 12, 31)
     ws = wb[sheet_name]
 
     restric_col = find_restrictions_col(ws)
