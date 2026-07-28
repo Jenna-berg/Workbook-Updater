@@ -2009,19 +2009,41 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
     return None, None
 
 
-def _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name):
-    """Resolve the month folder for a new-month setup, handling both layouts:
+def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name):
+    """Locate the month folder for a new-month setup, handling both layouts:
     month folders directly inside the REVENUE REPORTS folder (common when
     there's one REVENUE REPORTS folder per year), or nested under a year
-    subfolder. Creates the month folder if neither is found.
+    subfolder. NEVER creates a folder — the month folder is expected to
+    already exist (created ahead of time as part of the standard process).
+    Returns (None, None) if it can't be found, so the caller can error out
+    with a clear message instead of the app silently creating a new one in
+    the wrong place.
+
+    Finding the "year subfolder" is trickier than a plain keyword search:
+    a sibling MONTH folder (e.g. "JUL2026 REVENUE REPORTS X") also contains
+    the year digits as a substring, so a naive year_kw match can pick a
+    sibling month folder instead of a real year folder. Excluding any
+    candidate whose name contains a month abbreviation avoids that ambiguity.
     """
     month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=rev_id)
     if month_id:
         return month_id, month_name
-    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+
+    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+         "and '%s' in parents") % rev_id
+    siblings = service.files().list(
+        q=q, fields="files(id, name)", pageSize=100,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+    year_id = None
+    for f in siblings:
+        name_upper = f["name"].upper()
+        if year_kw in f["name"] and not any(m.upper() in name_upper for m in MONTH_ABBR):
+            year_id = f["id"]
+            break
     if year_id:
-        return drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
-    return drive_find_or_create_month_folder(service, rev_id, rev_id, target_month, hotel_name)
+        return drive_find_month_folder(service, year_id, month_kw)
+    return None, None
 
 
 def drive_find_file(service, keyword, parent_id):
@@ -2089,47 +2111,24 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
 
-def drive_find_or_create_month_folder(service, rev_id: str, year_id: str, month_date: datetime.date, hotel_name: str):
-    """Return (folder_id, folder_name) for the month folder under year_id.
-    Folder name pattern: '[LETTER]: [MON][YEAR] REVENUE REPORTS [HOTEL_UPPER]'
-    where LETTER = A-L for Jan-Dec.
-    Creates the folder if it doesn't exist.
+def drive_find_month_folder(service, parent_id: str, month_kw: str):
+    """Return (folder_id, folder_name) for the month folder under parent_id,
+    or (None, None) if it isn't there. Never creates a folder — the month
+    folder is expected to already exist as part of the standard process;
+    the caller is responsible for erroring out clearly when it's missing
+    instead of the app silently creating one (which is how folders ended
+    up nested in the wrong place before).
     """
-    month_kw = month_date.strftime("%b%Y").upper()  # e.g. JUL2026
-
-    # Try to find existing folder first
     q = ("mimeType='application/vnd.google-apps.folder' and trashed=false "
-         "and '%s' in parents") % year_id
-    result = service.files().list(q=q, fields="files(id,name)", pageSize=100).execute()
+         "and '%s' in parents") % parent_id
+    result = service.files().list(
+        q=q, fields="files(id,name)", pageSize=100,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     for f in result.get("files", []):
         if month_kw in f["name"].upper():
             return f["id"], f["name"]
-
-    # Not found — infer name from existing sibling folder naming pattern
-    # Pattern: "[LETTER]: [MON][YEAR] REVENUE REPORTS [HOTEL]"
-    letter = chr(ord("A") + month_date.month - 1)  # A=Jan, B=Feb, ..., L=Dec
-
-    # Try to infer hotel suffix from existing month folders in this year folder
-    hotel_suffix = hotel_name.upper()
-    for f in result.get("files", []):
-        name_upper = f["name"].upper()
-        if "REVENUE REPORTS" in name_upper:
-            # Extract everything after "REVENUE REPORTS "
-            idx = name_upper.find("REVENUE REPORTS ")
-            if idx != -1:
-                hotel_suffix = f["name"][idx + len("REVENUE REPORTS "):].strip()
-                break
-
-    new_name = f"{letter}: {month_kw} REVENUE REPORTS {hotel_suffix}"
-    folder_meta = {
-        "name": new_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [year_id],
-    }
-    created = service.files().create(
-        body=folder_meta, fields="id,name", supportsAllDrives=True,
-    ).execute()
-    return created["id"], created["name"]
+    return None, None
 
 
 def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_id: str):
@@ -2493,11 +2492,13 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    # ── Locate or create month folder ────────────────────────────────────────
+    # ── Locate month folder (never created — must already exist) ────────────
     rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
-    month_id, _ = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    if not month_id:
+        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
 
     # ── Find or copy the file ─────────────────────────────────────────────────
     # Diagnostic: list every file in month_id whose name contains "ROB" —
@@ -2679,7 +2680,9 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
-    month_id, _ = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    if not month_id:
+        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
 
     # Check if Forecast already exists
     existing_id, existing_name = drive_find_file(service, "FORECAST", month_id)
@@ -2774,8 +2777,10 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
-    # Find or create month folder
-    month_id, month_name = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    # Find month folder — never created, must already exist
+    month_id, month_name = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    if not month_id:
+        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
 
     # Check if SR already exists in that folder
     existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
@@ -4219,6 +4224,7 @@ with tab_weekly:
                 created_name, setup_err = setup_new_forecast_month(svc, hotel_id, hotel_sel, next_month_dt)
                 if setup_err and not created_name:
                     st.warning(f"Next month Forecast: {setup_err}")
+                    nm_result = None
                 else:
                     if setup_err:
                         st.warning(setup_err)
@@ -4227,7 +4233,14 @@ with tab_weekly:
                     nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
                     if nm_err:
                         st.warning(f"Still could not find next month Forecast after creation: {nm_err}")
-            else:
+                        nm_result = None
+
+            # Populate week 3/4's data into next month's WK1 regardless of
+            # whether the file already existed or was just created above —
+            # this used to live in the sibling `else` of `if nm_err`, so on
+            # the very run that created the file, population never ran at
+            # all (the new copy was created with dates only, no OTB data).
+            if nm_result:
                 nm_file_id, nm_file_name = nm_result
                 nm_bytes = drive_download(svc, nm_file_id)
                 nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
