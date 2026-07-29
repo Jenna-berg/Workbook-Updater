@@ -1,14 +1,16 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-from openpyxl.utils import column_index_from_string
+from openpyxl.utils import column_index_from_string, get_column_letter
 import io
 import csv
 import re
+import zipfile
 import datetime
 import hashlib
 import json
 import bcrypt
+from xml.sax.saxutils import escape
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -3229,6 +3231,434 @@ def apply_ancillary_changes(ws, changes):
         ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
 
 
+# ── Monthly OOO Report (Sell-Out Efficiency Report .xlsm) ────────────────────
+# This workbook has a macro-driven "Save Report" shape button on every one of
+# its 170+ dated tabs. Confirmed by direct round-trip test: loading it with
+# openpyxl and saving it back — even completely untouched — silently drops
+# every one of those shape/button objects (openpyxl's drawing writer doesn't
+# preserve non-image/non-chart shapes). So this feature never opens the file
+# through openpyxl for writing. It only uses openpyxl (read-only) to read
+# values off the existing dated tabs, then adds the new summary tab via
+# direct zip/XML surgery — copying every original zip entry byte-for-byte
+# and touching only the 3 small manifest parts that must change to register
+# a new sheet (workbook.xml, workbook.xml.rels, [Content_Types].xml). This
+# was verified to leave xl/vbaProject.bin and every xl/drawings/*.xml
+# identical to the source file.
+OOO_TAB_RGB = "FF00FF00"  # bright green, per explicit request — distinct from
+                          # the app's other "done" green (FF00B050) used elsewhere
+OOO_REPORT_FILE_KEYWORD = "SELL-OUT EFFICIENCY REPORT"
+
+
+def find_ooo_report_file(service):
+    """Locate the company-wide Sell-Out Efficiency Report workbook (currently
+    shared as 'COPY Sell-Out Efficiency Report.xlsm - TEST'). Searched by
+    filename across all of Drive rather than a fixed folder, since there's
+    exactly one of these (unlike the per-hotel workbooks). Returns
+    (file_id, file_name) or (None, error_str) — errors out on zero or
+    multiple matches rather than guessing which one is right."""
+    q = ("trashed = false and "
+         "(mimeType='application/vnd.ms-excel.sheet.macroenabled.12' "
+         "or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')")
+    result = service.files().list(
+        q=q, fields="files(id, name)", pageSize=1000, corpora="allDrives",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    candidates = [f for f in result.get("files", [])
+                  if OOO_REPORT_FILE_KEYWORD in f["name"].strip().upper()]
+    if not candidates:
+        return None, (f"No workbook matching '{OOO_REPORT_FILE_KEYWORD.title()}' found anywhere "
+                       f"in Drive — make sure it's been shared with the service account.")
+    if len(candidates) > 1:
+        names = ", ".join(f["name"] for f in candidates)
+        return None, f"Found {len(candidates)} matching workbooks, expected exactly 1: {names}"
+    return candidates[0]["id"], candidates[0]["name"]
+
+
+def _parse_ooo_sheet_date(name):
+    """Dated tabs are named like '07-28-2026' (M-D-YYYY, not always zero-
+    padded). Anything that doesn't match — e.g. a stray old '10-22-22'
+    2-digit-year tab found in a real file — is skipped rather than guessed."""
+    m = re.match(r'^(\d{1,2})-(\d{1,2})-(\d{4})$', name.strip())
+    if not m:
+        return None
+    month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return datetime.date(year, month, day)
+    except ValueError:
+        return None
+
+
+def list_ooo_available_months(wb):
+    """Returns [(year, month, [sheet_names_in_date_order]), ...] sorted with
+    the most recent month first. Derived from the tabs actually present in
+    the uploaded file, never assumed from today's date."""
+    months = {}
+    for name in wb.sheetnames:
+        d = _parse_ooo_sheet_date(name)
+        if d:
+            months.setdefault((d.year, d.month), []).append((d, name))
+    out = []
+    for (y, m), pairs in months.items():
+        pairs.sort()
+        out.append((y, m, [n for _, n in pairs]))
+    out.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return out
+
+
+def build_ooo_monthly_totals(wb, year, month, sheet_names):
+    """Sums column J ('End. OOO Rooms', per the row-7 header) per property
+    (column C) across every daily tab in the given month. Row range is read
+    per-day (row 8 down until column C is blank) rather than assumed fixed,
+    since not every hotel appears on every day. Headers are checked on each
+    sheet before trusting the columns — a sheet that doesn't match the
+    expected 'Property' / 'End...OOO' layout is skipped, not guessed at."""
+    totals = {}
+    order = []
+    days_included = 0
+    skipped = []
+    for name in sheet_names:
+        ws = wb[name]
+        prop_header = str(ws.cell(row=7, column=3).value or "").strip().lower()
+        ooo_header = str(ws.cell(row=7, column=10).value or "").strip().lower().replace("\n", " ")
+        if "propert" not in prop_header or "end" not in ooo_header or "ooo" not in ooo_header:
+            skipped.append(name)
+            continue
+        days_included += 1
+        row = 8
+        while True:
+            prop = ws.cell(row=row, column=3).value
+            if prop is None or str(prop).strip() == "":
+                break
+            prop = str(prop).strip()
+            val = ws.cell(row=row, column=10).value
+            try:
+                val = float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                val = 0.0
+            if prop not in totals:
+                totals[prop] = 0.0
+                order.append(prop)
+            totals[prop] += val
+            row += 1
+    return order, totals, days_included, skipped
+
+
+# ── OOO Report: per-property ADR pulled from each hotel's own ROB ────────────
+# Each hotel's ROB is a full-year "trailing" sheet: every WK tab (wk one..wk
+# six) contains one 8-row block per calendar month (Jan..Dec), laid out as
+# Month-header / Revenue / Room Nights / ADR / Group Rms sold / Group Rm Rev
+# / Group Rm ADR / PICKUP WoW, starting at row 4 and repeating every 8 rows —
+# confirmed against a real file: block_start = 4 + 8*(month-1), Revenue =
+# block_start+1, Room Nights = block_start+2, ADR = block_start+3 (verified
+# July 2026 block landing at rows 52-59, ADR at row 55, matching a real
+# screenshot of Hotel 1620's ROB with July 2026 ADR highlighted at that exact
+# position). Year columns (2023/2024/2025/2026...) are consistent across
+# every month block in a sheet, but how many trailing years — and therefore
+# which column is "this year" — varies per hotel, so it's detected from the
+# one header row that reliably holds literal (non-formula) dates: Jan's.
+_OOO_HOTEL_MATCH_EXCLUDE = ("TEST",)
+
+
+def _find_rob_year_column(ws, target_year):
+    """Jan's header row (row 4) holds literal dates; every other month's
+    header is a formula chain off the previous month and its cached value is
+    often stale/blank on files this app has re-saved with openpyxl (which
+    never recalculates formulas) — so only Jan's row is trusted here."""
+    for c in range(2, 12):
+        v = ws.cell(4, c).value
+        if isinstance(v, (datetime.datetime, datetime.date)) and v.year == target_year:
+            return c
+        if isinstance(v, (int, float)) and int(v) == target_year:
+            return c
+    return None
+
+
+def read_rob_adr(wb_bytes, sheet_name, target_year, target_month):
+    """ADR is computed here as Revenue / Room Nights rather than read from
+    the sheet's own ADR formula cell — Revenue and Room Nights are written
+    as literal values by this app (always reliable), while the ADR formula
+    cell's cached result is frequently blank on files this app has re-saved,
+    since openpyxl never recalculates formulas on save. Returns (adr_or_None,
+    error_str_or_None)."""
+    wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=True)
+    if sheet_name not in wb.sheetnames:
+        return None, f"Sheet '{sheet_name}' not found."
+    ws = wb[sheet_name]
+    year_col = _find_rob_year_column(ws, target_year)
+    if year_col is None:
+        year_col = 5  # fall back to column E, the typical "current year" column
+    block_start = 4 + 8 * (target_month - 1)
+    rev = safe_float(ws.cell(block_start + 1, year_col).value)
+    rms = safe_float(ws.cell(block_start + 2, year_col).value)
+    if rev is None or rms is None or rms == 0:
+        month_label = datetime.date(target_year, target_month, 1).strftime("%b %Y")
+        return None, f"No {month_label} Revenue/Room Nights on '{sheet_name}' (col {get_column_letter(year_col)})."
+    return rev / rms, None
+
+
+def match_ooo_property_to_hotel(prop_name, hotels):
+    """hotels: [(name, id), ...] from get_hotels_from_drive(). Matches by
+    substring in either direction after normalizing (uppercase, strip
+    punctuation) — the same 'read the actual name, don't assume a fixed
+    mapping' approach used for every other keyword match in this app.
+    Excludes '-TEST' sandbox copies. Returns (hotel_name, hotel_id,
+    error_note) — error_note is None on a clean single match, otherwise
+    explains why nothing was matched (no match / ambiguous) rather than
+    silently guessing."""
+    def norm(s):
+        return re.sub(r'[^A-Z0-9 ]', '', s.upper()).strip()
+    prop_norm = norm(prop_name)
+    candidates = []
+    for name, hid in hotels:
+        if any(x in name.upper() for x in _OOO_HOTEL_MATCH_EXCLUDE):
+            continue
+        hotel_norm = norm(name)
+        if prop_norm and (prop_norm in hotel_norm or hotel_norm in prop_norm):
+            candidates.append((name, hid))
+    if not candidates:
+        return None, None, "no matching hotel found in Drive"
+    if len(candidates) > 1:
+        return None, None, f"ambiguous — matched {len(candidates)} hotels: {', '.join(c[0] for c in candidates)}"
+    return candidates[0][0], candidates[0][1], None
+
+
+def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
+    """Reverse-scans WK six -> WK one of the hotel's CURRENT actual month's
+    ROB file for the last week tab marked done (our green). Falls back to
+    the previous month's ROB file (same reverse scan) if none of the
+    current month's weeks are filled in yet — e.g. right after month
+    rollover, WK1 of the new month is often blank for a few days, so the
+    most recently-finalized data is still the prior month's last filled
+    week. Returns (wb_bytes, sheet_name, file_name, error_str)."""
+    today = datetime.date.today()
+    cur_month_dt  = today.replace(day=1)
+    prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+    tried = []
+    for month_dt in (cur_month_dt, prev_month_dt):
+        result, err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB", month_dt)
+        if not result:
+            tried.append(f"{month_dt.strftime('%b %Y')} ROB: {err}")
+            continue
+        fid, fname = result
+        wb_bytes = drive_download(service, fid)
+        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        for sheet_name in reversed(ROB_SHEETS):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            tc = ws.sheet_properties.tabColor
+            if tc is not None and getattr(tc, "rgb", None) == DONE_TAB_RGB:
+                return wb_bytes, sheet_name, fname, None
+        tried.append(f"{fname}: no week tab is marked done yet")
+    return None, None, None, "; ".join(tried) or "No ROB file found for the current or previous month."
+
+
+def build_ooo_adr_lookup(service, order, hotels, year, month):
+    """For each property in `order`, resolves it to a Drive hotel and reads
+    its most-recently-available ADR for (year, month) off that hotel's ROB.
+    Returns {property: (adr_or_None, note_or_None)} — note explains why a
+    property has no ADR (unmatched hotel, ambiguous match, no filled ROB
+    week found, etc.) so gaps are visible rather than silently blank."""
+    out = {}
+    for prop in order:
+        hotel_name, hotel_id, match_note = match_ooo_property_to_hotel(prop, hotels)
+        if not hotel_name:
+            out[prop] = (None, match_note)
+            continue
+        wb_bytes, sheet_name, file_name, src_err = _find_ooo_adr_source_workbook(service, hotel_id, hotel_name)
+        if not wb_bytes:
+            out[prop] = (None, src_err)
+            continue
+        adr, adr_err = read_rob_adr(wb_bytes, sheet_name, year, month)
+        out[prop] = (adr, adr_err)
+    return out
+
+
+def _ooo_extract_style_ids(zin, wb_xml, rels_xml):
+    """Sample the newest dated tab's cell styles so the summary tab visually
+    matches the daily report — navy title bar, bordered bold headers, bordered
+    property names, blue bordered numbers, blue $-formatted rates. Style
+    indices are read from the actual sheet XML at build time (never
+    hardcoded): cellXfs order isn't guaranteed stable across future edits to
+    the workbook, same reason column positions are re-detected per sheet
+    everywhere else in this app. Returns a dict of style ids (values may be
+    None if a sample cell wasn't found — those cells just render unstyled)."""
+    sample_path = None
+    for m in re.finditer(r'<sheet [^>]*name="([^"]+)"[^>]*r:id="(rId\d+)"', wb_xml):
+        if _parse_ooo_sheet_date(m.group(1)):
+            rel = re.search(r'Id="%s"[^>]*Target="(worksheets/sheet\d+\.xml)"' % m.group(2), rels_xml)
+            if rel:
+                sample_path = 'xl/' + rel.group(1)
+                break
+    ids = {"title": None, "title_bar": None, "header_left": None,
+           "header": None, "prop": None, "num": None, "money": None}
+    if not sample_path:
+        return ids
+    try:
+        sx = zin.read(sample_path).decode('utf-8')
+    except KeyError:
+        return ids
+
+    def s_of(ref):
+        m = re.search(r'<c [^>]*r="%s"[^>]*?s="(\d+)"' % ref, sx)
+        if not m:  # s= can precede r= depending on the writer
+            m = re.search(r'<c [^>]*s="(\d+)"[^>]*?r="%s"' % ref, sx)
+        return m.group(1) if m else None
+
+    ids["title"]       = s_of("C5")   # navy bar, bold white text
+    ids["title_bar"]   = s_of("D5")   # navy bar continuation
+    ids["header_left"] = s_of("C7")   # bold, bordered, left ("Property")
+    ids["header"]      = s_of("D7")   # bold, bordered, centered
+    ids["prop"]        = s_of("C8")   # property name, bordered
+    ids["num"]         = s_of("F8")   # blue centered #,##0, bordered
+    ids["money"]       = s_of("L8")   # blue centered $#,##0.00, bordered
+    return ids
+
+
+def _ooo_build_new_sheet_xml(month_label, order, totals, days_included,
+                             adr_by_property=None, style_ids=None):
+    adr_by_property = adr_by_property or {}
+    sid = style_ids or {}
+
+    def _s(kind):
+        v = sid.get(kind)
+        return f' s="{v}"' if v else ''
+
+    def cell_str(ref, text, kind=None):
+        return (f'<c r="{ref}"{_s(kind)} t="inlineStr">'
+                f'<is><t xml:space="preserve">{escape(str(text))}</t></is></c>')
+
+    def cell_num(ref, val, kind=None):
+        return f'<c r="{ref}"{_s(kind)}><v>{val}</v></c>'
+
+    def cell_empty(ref, kind):
+        return f'<c r="{ref}"{_s(kind)}/>'
+
+    # Row 1: navy title bar across A-D, matching the daily report's banner.
+    rows_xml = [('<row r="1">'
+                 + cell_str("A1", f"Monthly OOO Rooms Summary - {month_label}", "title")
+                 + cell_empty("B1", "title_bar") + cell_empty("C1", "title_bar")
+                 + cell_empty("D1", "title_bar") + '</row>')]
+    r = 3
+    rows_xml.append(f'<row r="{r}">'
+                    + cell_str(f"A{r}", "Property", "header_left")
+                    + cell_str(f"B{r}", "Total End. OOO Rooms", "header")
+                    + cell_str(f"C{r}", "ADR", "header")
+                    + cell_str(f"D{r}", "Revenue", "header") + '</row>')
+    r += 1
+    grand_total = 0.0
+    grand_revenue = 0.0
+    for prop in order:
+        v = totals[prop]
+        grand_total += v
+        adr, _note = adr_by_property.get(prop, (None, None))
+        adr_cell = cell_num(f"C{r}", round(adr, 2), "money") if adr is not None else cell_empty(f"C{r}", "prop")
+        if adr is not None:
+            revenue = adr * v
+            grand_revenue += revenue
+            rev_cell = cell_num(f"D{r}", round(revenue, 2), "money")
+        else:
+            rev_cell = cell_empty(f"D{r}", "prop")
+        rows_xml.append(f'<row r="{r}">'
+                        + cell_str(f"A{r}", prop, "prop")
+                        + cell_num(f"B{r}", v, "num")
+                        + adr_cell + rev_cell + '</row>')
+        r += 1
+    rows_xml.append(f'<row r="{r}">'
+                    + cell_str(f"A{r}", "TOTAL", "header_left")
+                    + cell_num(f"B{r}", grand_total, "num")
+                    + cell_empty(f"C{r}", "prop")
+                    + cell_num(f"D{r}", round(grand_revenue, 2), "money") + '</row>')
+    r += 1
+    rows_xml.append(f'<row r="{r}">{cell_str(f"A{r}", f"({days_included} daily reports included)")}</row>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheetPr><tabColor rgb="{OOO_TAB_RGB}"/></sheetPr>'
+        f'<dimension ref="A1:D{r}"/>'
+        '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        '<cols><col min="1" max="1" width="30" customWidth="1"/><col min="2" max="2" width="22" customWidth="1"/>'
+        '<col min="3" max="3" width="14" customWidth="1"/><col min="4" max="4" width="16" customWidth="1"/></cols>'
+        '<sheetData>' + "".join(rows_xml) + '</sheetData>'
+        '</worksheet>'
+    )
+
+
+def inject_ooo_monthly_sheet(original_bytes, year, month, order, totals, days_included, adr_by_property=None):
+    """Adds the bright-green monthly summary tab to the OOO report, placed
+    immediately to the right of the 'Report' tab (i.e. 2nd tab on the sheet),
+    via raw zip/XML surgery. Never opens the file through openpyxl for
+    writing — see the module note above for why. Returns (new_bytes,
+    tab_name, error_str). error_str is set (and new_bytes is None) if a tab
+    with that name already exists, rather than silently duplicating it."""
+    month_label = datetime.date(year, month, 1).strftime("%B %Y")
+    tab_name = datetime.date(year, month, 1).strftime("%b %Y").upper()  # e.g. "JUL 2026"
+    tab_name = re.sub(r'[:\\/?*\[\]]', '', tab_name)[:31]
+
+    zin = zipfile.ZipFile(io.BytesIO(original_bytes))
+
+    wb_xml = zin.read('xl/workbook.xml').decode('utf-8')
+    if f'name="{escape(tab_name)}"' in wb_xml:
+        return None, tab_name, (f"A tab named '{tab_name}' already exists in this workbook — "
+                                 f"delete it manually first if you want to regenerate it.")
+
+    sheet_nums = [int(m.group(1)) for m in
+                  (re.match(r'xl/worksheets/sheet(\d+)\.xml$', n) for n in zin.namelist()) if m]
+    new_sheet_num = max(sheet_nums) + 1 if sheet_nums else 1
+    new_sheet_path = f"xl/worksheets/sheet{new_sheet_num}.xml"
+
+    existing_sheet_ids = [int(x) for x in re.findall(r'sheetId="(\d+)"', wb_xml)]
+    new_sheet_id = max(existing_sheet_ids) + 1 if existing_sheet_ids else 1
+
+    rels_xml = zin.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    existing_rids = [int(x) for x in re.findall(r'Id="rId(\d+)"', rels_xml)]
+    new_rid = f"rId{max(existing_rids) + 1 if existing_rids else 1}"
+
+    style_ids = _ooo_extract_style_ids(zin, wb_xml, rels_xml)
+    new_sheet_xml = _ooo_build_new_sheet_xml(month_label, order, totals, days_included,
+                                             adr_by_property, style_ids)
+
+    new_sheet_el = f'<sheet state="visible" name="{escape(tab_name)}" sheetId="{new_sheet_id}" r:id="{new_rid}"/>'
+    # Goes right after the "Report" tab (2nd position), not at the very front —
+    # falls back to right after whichever tab is first if no "Report" tab is found,
+    # rather than guessing at a name match.
+    report_match = re.search(r'<sheet[^>]+name="Report"[^>]*/>', wb_xml)
+    if not report_match:
+        report_match = re.search(r'<sheet[^>]*/>', wb_xml)
+    if report_match:
+        insert_pos = report_match.end()
+        wb_xml_new = wb_xml[:insert_pos] + new_sheet_el + wb_xml[insert_pos:]
+    else:
+        wb_xml_new = wb_xml.replace('<sheets>', '<sheets>' + new_sheet_el, 1)
+
+    new_rel_el = (f'<Relationship Id="{new_rid}" '
+                  f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+                  f'Target="worksheets/sheet{new_sheet_num}.xml"/>')
+    rels_xml_new = rels_xml.replace('</Relationships>', new_rel_el + '</Relationships>', 1)
+
+    ct_xml = zin.read('[Content_Types].xml').decode('utf-8')
+    new_override = (f'<Override ContentType="application/vnd.openxmlformats-officedocument'
+                    f'.spreadsheetml.worksheet+xml" PartName="/{new_sheet_path}"/>')
+    ct_xml_new = ct_xml.replace('</Types>', new_override + '</Types>', 1)
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == 'xl/workbook.xml':
+                data = wb_xml_new.encode('utf-8')
+            elif item.filename == 'xl/_rels/workbook.xml.rels':
+                data = rels_xml_new.encode('utf-8')
+            elif item.filename == '[Content_Types].xml':
+                data = ct_xml_new.encode('utf-8')
+            zout.writestr(item, data)
+        zout.writestr(new_sheet_path, new_sheet_xml)
+    return out_buf.getvalue(), tab_name, None
+
+
 # ── User accounts (self-serve requests + admin approval) ─────────────────────
 # Streamlit Cloud's filesystem is ephemeral and st.secrets is read-only at
 # runtime, so per-person accounts created through the app can't live in either
@@ -3893,7 +4323,7 @@ if test_mode:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
     
-tab_weekly, tab_ancillary = st.tabs(["Weekly Workbook Update", "Ancillary Revenue"])
+tab_weekly, tab_ancillary, tab_ooo = st.tabs(["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
 
 with tab_weekly:
     st.divider()
@@ -4515,6 +4945,114 @@ with tab_ancillary:
                 st.success(f"**{st.session_state['ar_file_name']}** updated.")
                 for key in ["ar_changes", "ar_bytes", "ar_file_id", "ar_file_name", "ar_month_sel", "ar_week_sel"]:
                     del st.session_state[key]
+            except Exception as e:
+                st.error(f"Apply error: {e}")
+
+with tab_ooo:
+    st.caption(
+        "Pulls the Sell-Out Efficiency Report straight from Drive, adds a bright-green "
+        "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
+        "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
+        "the selected month, with an ADR column pulled from that property's own ROB "
+        "(most recently-finalized week, current month falling back to previous month), "
+        "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
+        "macro buttons on every existing tab are left completely untouched."
+    )
+
+    today = datetime.date.today()
+    ooo_cur_month_dt  = today.replace(day=1)
+    ooo_prev_month_dt = (ooo_cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+    ooo_next_month_dt = (ooo_cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
+    ooo_month_options = {
+        ooo_prev_month_dt.strftime("%B %Y"): ooo_prev_month_dt,
+        ooo_cur_month_dt.strftime("%B %Y"):  ooo_cur_month_dt,
+        ooo_next_month_dt.strftime("%B %Y"): ooo_next_month_dt,
+    }
+    ooo_month_labels = list(ooo_month_options.keys())
+    # Default to the previous (just-completed) month — e.g. on Aug 1st this
+    # defaults to July — since current/next are only there for override.
+    ooo_sel_label = st.selectbox(
+        "Month to summarize", ooo_month_labels,
+        index=ooo_month_labels.index(ooo_prev_month_dt.strftime("%B %Y")),
+        key="ooo_month_sel",
+    )
+    ooo_target_dt = ooo_month_options[ooo_sel_label]
+
+    if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
+        try:
+            svc = get_drive_service()
+            ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
+            if not ooo_file_id:
+                st.error(ooo_file_name)
+            else:
+                ooo_bytes = drive_download(svc, ooo_file_id)
+                ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
+                ooo_months = list_ooo_available_months(ooo_wb)
+                match = next((m for m in ooo_months
+                              if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
+                if not match:
+                    st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
+                else:
+                    ooo_year, ooo_month, ooo_sheet_names = match
+                    order, totals, days_included, skipped = build_ooo_monthly_totals(
+                        ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
+                    if not order:
+                        st.error(
+                            "None of that month's tabs matched the expected layout "
+                            "('Property' header in row 7 col C, 'End...OOO' in row 7 col J) — "
+                            "nothing was totaled, so no report was built."
+                        )
+                    else:
+                        with st.spinner("Looking up ADR for each property from its ROB..."):
+                            hotels_for_adr = get_hotels_from_drive()
+                            adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
+                        st.session_state["ooo_file_id"]       = ooo_file_id
+                        st.session_state["ooo_file_name"]     = ooo_file_name
+                        st.session_state["ooo_bytes"]         = ooo_bytes
+                        st.session_state["ooo_year"]          = ooo_year
+                        st.session_state["ooo_month"]         = ooo_month
+                        st.session_state["ooo_order"]         = order
+                        st.session_state["ooo_totals"]        = totals
+                        st.session_state["ooo_days_included"] = days_included
+                        st.session_state["ooo_skipped"]       = skipped
+                        st.session_state["ooo_adr_lookup"]    = adr_lookup
+                        matched = sum(1 for adr, _ in adr_lookup.values() if adr is not None)
+                        st.success(f"Ready to summarize **{ooo_target_dt.strftime('%B %Y')}** "
+                                   f"from **{ooo_file_name}** ({days_included} daily reports found, "
+                                   f"ADR matched for {matched}/{len(order)} properties).")
+        except Exception as e:
+            st.error(f"Preview error: {e}")
+
+    if "ooo_order" in st.session_state:
+        order      = st.session_state["ooo_order"]
+        totals     = st.session_state["ooo_totals"]
+        adr_lookup = st.session_state["ooo_adr_lookup"]
+        if st.session_state.get("ooo_skipped"):
+            st.caption(f"Skipped tabs that didn't match the expected layout: "
+                       f"{', '.join(st.session_state['ooo_skipped'])}")
+        st.dataframe(
+            [{"Property": p, "Total End. OOO Rooms": totals[p],
+              "ADR": adr_lookup[p][0],
+              "Revenue": round(adr_lookup[p][0] * totals[p], 2) if adr_lookup[p][0] is not None else None,
+              "ADR note": adr_lookup[p][1] or ""} for p in order],
+            use_container_width=True,
+        )
+        if st.button("Apply to Google Drive", key="ooo_apply", type="primary"):
+            try:
+                svc = get_drive_service()
+                new_bytes, tab_name, err = inject_ooo_monthly_sheet(
+                    st.session_state["ooo_bytes"], st.session_state["ooo_year"],
+                    st.session_state["ooo_month"], order, totals,
+                    st.session_state["ooo_days_included"], adr_lookup)
+                if err:
+                    st.error(err)
+                else:
+                    drive_upload(svc, st.session_state["ooo_file_id"], new_bytes,
+                                 st.session_state["ooo_file_name"])
+                    st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
+                    for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
+                                "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped", "ooo_adr_lookup"]:
+                        del st.session_state[key]
             except Exception as e:
                 st.error(f"Apply error: {e}")
 
