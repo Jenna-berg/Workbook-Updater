@@ -3400,11 +3400,18 @@ def match_ooo_property_to_hotel(prop_name, hotels):
     """hotels: [(name, id), ...] from get_hotels_from_drive(). Matches by
     substring in either direction after normalizing (uppercase, strip
     punctuation) — the same 'read the actual name, don't assume a fixed
-    mapping' approach used for every other keyword match in this app.
-    Excludes '-TEST' sandbox copies. Returns (hotel_name, hotel_id,
+    mapping' approach used for every other keyword match in this app — and
+    falls back to the KNOWN_MULTI_FOLDER_HOTELS keyword registry, which
+    catches display-name mismatches like 'Plymouth 1620' (OOO report) vs
+    'Hotel 1620' (Drive) that share no substring but share a registered
+    keyword. Excludes '-TEST' sandbox copies. Returns (hotel_name, hotel_id,
     error_note) — error_note is None on a clean single match, otherwise
-    explains why nothing was matched (no match / ambiguous) rather than
-    silently guessing."""
+    explains why nothing was matched (no match / ambiguous / no hotels
+    visible at all) rather than silently guessing."""
+    if not hotels:
+        return None, None, ("the app can see 0 hotel folders in Drive — nothing is shared "
+                            "with this environment's service account (or the Drive listing failed)")
+
     def norm(s):
         return re.sub(r'[^A-Z0-9 ]', '', s.upper()).strip()
     prop_norm = norm(prop_name)
@@ -3415,6 +3422,15 @@ def match_ooo_property_to_hotel(prop_name, hotels):
         hotel_norm = norm(name)
         if prop_norm and (prop_norm in hotel_norm or hotel_norm in prop_norm):
             candidates.append((name, hid))
+            continue
+        # Keyword-registry fallback: the property name and the hotel's Drive
+        # display name may each contain a registered keyword without either
+        # being a substring of the other.
+        for reg_name, kws in KNOWN_MULTI_FOLDER_HOTELS.items():
+            if norm(reg_name) == hotel_norm or reg_name.upper() in name.upper():
+                if any(kw in prop_norm for kw in kws):
+                    candidates.append((name, hid))
+                break
     if not candidates:
         return None, None, "no matching hotel found in Drive"
     if len(candidates) > 1:
@@ -5005,7 +5021,14 @@ with tab_ooo:
                     else:
                         with st.spinner("Looking up ADR for each property from its ROB..."):
                             hotels_for_adr = get_hotels_from_drive()
+                            if not hotels_for_adr:
+                                # A silent [] can also be a cached transient Drive
+                                # failure (5-min TTL) — clear and retry once before
+                                # concluding nothing is shared.
+                                get_hotels_from_drive.clear()
+                                hotels_for_adr = get_hotels_from_drive()
                             adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
+                        st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
                         st.session_state["ooo_file_id"]       = ooo_file_id
                         st.session_state["ooo_file_name"]     = ooo_file_name
                         st.session_state["ooo_bytes"]         = ooo_bytes
@@ -5027,6 +5050,10 @@ with tab_ooo:
         order      = st.session_state["ooo_order"]
         totals     = st.session_state["ooo_totals"]
         adr_lookup = st.session_state["ooo_adr_lookup"]
+        hotels_seen = st.session_state.get("ooo_hotels_seen", [])
+        with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
+            st.write(", ".join(hotels_seen) if hotels_seen else
+                     "None — no hotel folders are shared with this environment's service account.")
         if st.session_state.get("ooo_skipped"):
             st.caption(f"Skipped tabs that didn't match the expected layout: "
                        f"{', '.join(st.session_state['ooo_skipped'])}")
@@ -5051,8 +5078,9 @@ with tab_ooo:
                                  st.session_state["ooo_file_name"])
                     st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
                     for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
-                                "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped", "ooo_adr_lookup"]:
-                        del st.session_state[key]
+                                "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
+                                "ooo_adr_lookup", "ooo_hotels_seen"]:
+                        st.session_state.pop(key, None)
             except Exception as e:
                 st.error(f"Apply error: {e}")
 
