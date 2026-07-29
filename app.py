@@ -3961,8 +3961,12 @@ with tab_weekly:
                 next_month_dt.strftime("%B %Y"): next_month_dt,
             }
             month_labels = list(month_options.keys())
+            # Week 4+ of the current month → default to next month; week 1 → default
+            # to the current month. Weeks 2-3 keep the plain current-month default.
+            # All three options remain selectable regardless of the default.
+            default_dt = next_month_dt if today.day >= 22 else cur_month_dt
             sel_month_label = st.selectbox("Month to set up", month_labels,
-                                            index=month_labels.index(cur_month_dt.strftime("%B %Y")),
+                                            index=month_labels.index(default_dt.strftime("%B %Y")),
                                             key="setup_month_sel")
             setup_month_dt  = month_options[sel_month_label]
             month_kw        = setup_month_dt.strftime("%b%Y").upper()
