@@ -978,24 +978,68 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
     if sheet_name not in ly_wb.sheetnames:
         return {}
 
-    # Detect target year from TY sheet if provided, otherwise infer from LY year + 1
+    # Detect target year from TY sheet if provided, otherwise infer from available columns in LY
     target_year = None
     if ty_wb and sheet_name in ty_wb.sheetnames:
         ty_ws = ty_wb[sheet_name]
         ty_date_col = detect_date_column(ty_ws, wb=ty_wb)
-        # Scan first few rows to find the target year
-        for r in range(5, min(15, ty_ws.max_row + 1)):
-            v = ty_ws.cell(r, ty_date_col).value
-            if isinstance(v, datetime.datetime):
-                target_year = v.year
-                break
-            elif isinstance(v, datetime.date):
-                target_year = v.year
-                break
+        if ty_date_col:
+            # Scan first few rows to find the target year
+            for r in range(5, min(15, ty_ws.max_row + 1)):
+                v = ty_ws.cell(r, ty_date_col).value
+                if isinstance(v, datetime.datetime):
+                    target_year = v.year
+                    break
+                elif isinstance(v, datetime.date):
+                    target_year = v.year
+                    break
 
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
+
+    # Find the right date column: when target_year is set, pick the column
+    # whose row 4 year label matches target_year - 1 (previous fiscal year).
+    # This handles multi-year files (e.g., AUG2025 has both 2024 LY and 2025 TY columns).
+    # If target_year is not detected (ty_wb doesn't have dates yet), find the column
+    # with the most recent dates and assume target_year = max_year_in_dates + 1.
     date_col = detect_date_column(ws, wb=ly_wb)
+
+    if not target_year:
+        # Infer target_year from the most recent date column in ly_wb
+        max_year = None
+        for col in range(1, ws.max_column + 1):
+            for row in range(5, min(50, ws.max_row + 1)):
+                v = ws.cell(row, col).value
+                if isinstance(v, datetime.datetime):
+                    year = v.year
+                elif isinstance(v, datetime.date):
+                    year = v.year
+                else:
+                    continue
+                if max_year is None or year > max_year:
+                    max_year = year
+        if max_year:
+            target_year = max_year + 1
+
+    if target_year:
+        prior_year = target_year - 1
+        # Scan row 4 for year labels to find the LY date column
+        for col in range(1, ws.max_column + 1):
+            cell_val = ws.cell(4, col).value
+            # Check if this cell has a year that matches prior_year
+            if isinstance(cell_val, (int, float)) and int(cell_val) == prior_year:
+                # Found the year label; its date column is likely this col or nearby
+                # Scan this column and adjacent ones for dates
+                for test_col in [col, col - 1, col + 1]:
+                    if test_col < 1 or test_col > ws.max_column:
+                        continue
+                    test_val = ws.cell(5, test_col).value
+                    if isinstance(test_val, (datetime.datetime, datetime.date)):
+                        date_col = test_col
+                        break
+                if date_col and ws.cell(5, date_col).value:
+                    break
+
     comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
 
     out = {}
