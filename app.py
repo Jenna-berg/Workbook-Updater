@@ -995,33 +995,53 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
             elif isinstance(v, datetime.date):
                 last_date_year = v.year
                 break
-        if last_date_year:
+        if last_date_year and last_date_year >= 2025:
             target_year = last_date_year
+
+    # If target_year not detected, infer from LY source file's max year
+    if not target_year:
+        ws = ly_wb[sheet_name]
+        max_year = None
+        for col in range(1, ws.max_column + 1):
+            for row in range(5, min(50, ws.max_row + 1)):
+                v = ws.cell(row, col).value
+                if isinstance(v, datetime.datetime):
+                    if max_year is None or v.year > max_year:
+                        max_year = v.year
+                elif isinstance(v, datetime.date):
+                    if max_year is None or v.year > max_year:
+                        max_year = v.year
+        if max_year:
+            target_year = max_year + 1
 
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
 
-    # For LY extraction in multi-year files, use the PREVIOUS fiscal year's date column.
-    # AUG2025 has: col 1 labeled "2024" (LY), col 3 labeled "2025" (TY)
-    # For target_year=2026, we want the "2025" dates (col 3), not "2024" (col 1)
-    # because col 3 has Aug 2025 - Aug 2026, which normalizes to full Aug 2026 - Jul 2027.
+    # For LY extraction in multi-year files, use the HIGHEST year-labeled date column.
+    # AUG2025 has: col 1 labeled "2024" (old), col 3 labeled "2025" (current)
+    # We want the "2025" dates (col 3) for extraction.
+    # Find the highest year label in row 4 and use its date column.
     date_col = detect_date_column(ws, wb=ly_wb)  # Default: column 3 (2025 TY)
 
-    # If target_year detected, verify we're using the right column
-    if target_year and target_year >= 2025:
-        # Find which column has target_year-1 as year label
-        prior_year = target_year - 1
-        for col in range(1, ws.max_column + 1):
-            cell_val = ws.cell(4, col).value
-            if isinstance(cell_val, (int, float)) and int(cell_val) == prior_year:
-                # This column has the prior year - it should have the date
-                for test_col in [col, col + 1]:  # Year label might be in col, date in col+1
-                    if test_col <= ws.max_column:
-                        test_val = ws.cell(5, test_col).value
-                        if isinstance(test_val, (datetime.datetime, datetime.date)):
-                            date_col = test_col
-                            break
-                break
+    # Look for year labels in row 4 and find the highest year
+    max_year_in_file = None
+    max_year_col = None
+    for col in range(1, ws.max_column + 1):
+        cell_val = ws.cell(4, col).value
+        if isinstance(cell_val, (int, float)):
+            year_val = int(cell_val)
+            if year_val >= 2020 and (max_year_in_file is None or year_val > max_year_in_file):
+                max_year_in_file = year_val
+                max_year_col = col
+
+    # If we found a year label, use the date column for that year
+    if max_year_col:
+        for test_col in [max_year_col, max_year_col + 1]:  # Year label might be in col, date in col+1
+            if test_col <= ws.max_column:
+                test_val = ws.cell(5, test_col).value
+                if isinstance(test_val, (datetime.datetime, datetime.date)):
+                    date_col = test_col
+                    break
 
     comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
 
@@ -1052,12 +1072,13 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
                 continue
 
         row_data = {}
-        for ly_dest, ty_src in LY_FROM_TY.items():
-            src_col = col_map.get(ty_src)
+        # Read from LY columns, not TY columns
+        for ly_field in ["otb_ly_trans", "grp_pu_ly", "grp_npu_ly", "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly"]:
+            src_col = col_map.get(ly_field)
             if src_col:
                 val = ws.cell(r, src_col).value
                 if val is not None and not is_formula(val):
-                    row_data[ly_dest] = safe_float(val)
+                    row_data[ly_field] = safe_float(val)
         if comp_ty_col:
             val = ws.cell(r, comp_ty_col).value
             if val is not None and not is_formula(val):
