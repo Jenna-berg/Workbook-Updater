@@ -2868,14 +2868,14 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     month_kw = target_month.strftime("%b%Y").upper()
 
     # Resolve REVENUE REPORTS and month folder
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
+    rev_id, rev_name = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
     # Find month folder — never created, must already exist
     month_id, month_name = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
     if not month_id:
-        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
+        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist. (Revenue Reports folder: {rev_name})"
 
     # Check if SR already exists in that folder
     existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
