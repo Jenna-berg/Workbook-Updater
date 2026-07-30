@@ -1037,11 +1037,13 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
                 base_date = datetime.date(target_year, d.month, d.day)
             else:
                 base_date = datetime.date(d.year + 1, d.month, d.day)
-            # Only apply -1 day if it stays within the same month
-            if d.day > 1:
+            # Only apply -1 day if it's not at month boundary (day 1 or 31+)
+            # Day 1: -1 would cross to previous month
+            # Day 31: -1 would misalign with month-end in target
+            if d.day > 1 and d.day < 31:
                 this_year = base_date - datetime.timedelta(days=1)
             else:
-                # Day 1 of month: -1 would cross to previous month, skip shift
+                # Month boundaries: use date as-is
                 this_year = base_date
         except ValueError:
             # Feb 29 in non-leap year: use Feb 28 instead
