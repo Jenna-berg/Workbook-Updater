@@ -1006,11 +1006,24 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         else: continue
 
         # Shift to target year, applying DOW adjustment (-1 day for non-leap year)
-        if target_year:
-            this_year = datetime.date(target_year, d.month, d.day) - datetime.timedelta(days=1)
-        else:
-            # Fallback: shift by 1 year if target year unknown
-            this_year = datetime.date(d.year + 1, d.month, d.day) - datetime.timedelta(days=1)
+        # Handle Feb 29 in non-leap years by using Feb 28 instead
+        try:
+            if target_year:
+                base_date = datetime.date(target_year, d.month, d.day)
+            else:
+                base_date = datetime.date(d.year + 1, d.month, d.day)
+            this_year = base_date - datetime.timedelta(days=1)
+        except ValueError:
+            # Feb 29 in non-leap year: use Feb 28 instead
+            if d.month == 2 and d.day == 29:
+                if target_year:
+                    base_date = datetime.date(target_year, 2, 28)
+                else:
+                    base_date = datetime.date(d.year + 1, 2, 28)
+                this_year = base_date - datetime.timedelta(days=1)
+            else:
+                # Other date error: skip this row
+                continue
 
         row_data = {}
         for ly_dest, ty_src in LY_FROM_TY.items():
