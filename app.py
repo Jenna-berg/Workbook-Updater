@@ -979,45 +979,49 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         return {}
 
     # Detect target year from TY sheet if provided, otherwise infer from LY year + 1
+    # For fiscal year files (Aug-Jul), use the LAST date to get the correct year,
+    # not the first date (e.g., AUG2026 starts 2026-08-01 but ends 2027-07-31, so target_year=2027)
     target_year = None
     if ty_wb and sheet_name in ty_wb.sheetnames:
         ty_ws = ty_wb[sheet_name]
         ty_date_col = detect_date_column(ty_ws, wb=ty_wb)
-        # Scan first few rows to find the target year
-        for r in range(5, min(15, ty_ws.max_row + 1)):
+        # Scan to find last date in column
+        last_date_year = None
+        for r in range(ty_ws.max_row, 4, -1):
             v = ty_ws.cell(r, ty_date_col).value
             if isinstance(v, datetime.datetime):
-                target_year = v.year
+                last_date_year = v.year
                 break
             elif isinstance(v, datetime.date):
-                target_year = v.year
+                last_date_year = v.year
                 break
+        if last_date_year:
+            target_year = last_date_year
 
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
 
-    # For LY extraction, find the column with ACTUAL LY labels (not TY).
-    # In a multi-year file like AUG2025: col 1 = "2024" LY, col 3 = "2025" TY
-    # We want col 1 (LY column) for proper year range.
-    date_col = None
-    for col in range(1, ws.max_column + 1):
-        r3 = str(ws.cell(3, col).value or "").upper()
-        r4 = str(ws.cell(4, col).value or "").upper()
-        combined = f"{r3} {r4}"
-        # Look for "LY" label but not "TY" label
-        if "LY" in combined and "TY" not in combined:
-            # Check if this column has dates
-            for row in range(5, min(20, ws.max_row + 1)):
-                val = ws.cell(row, col).value
-                if isinstance(val, (datetime.datetime, datetime.date)):
-                    date_col = col
-                    break
-            if date_col:
-                break
+    # For LY extraction in multi-year files, use the PREVIOUS fiscal year's date column.
+    # AUG2025 has: col 1 labeled "2024" (LY), col 3 labeled "2025" (TY)
+    # For target_year=2026, we want the "2025" dates (col 3), not "2024" (col 1)
+    # because col 3 has Aug 2025 - Aug 2026, which normalizes to full Aug 2026 - Jul 2027.
+    date_col = detect_date_column(ws, wb=ly_wb)  # Default: column 3 (2025 TY)
 
-    # Fallback to default detection if no LY column found
-    if not date_col:
-        date_col = detect_date_column(ws, wb=ly_wb)
+    # If target_year detected, verify we're using the right column
+    if target_year and target_year >= 2025:
+        # Find which column has target_year-1 as year label
+        prior_year = target_year - 1
+        for col in range(1, ws.max_column + 1):
+            cell_val = ws.cell(4, col).value
+            if isinstance(cell_val, (int, float)) and int(cell_val) == prior_year:
+                # This column has the prior year - it should have the date
+                for test_col in [col, col + 1]:  # Year label might be in col, date in col+1
+                    if test_col <= ws.max_column:
+                        test_val = ws.cell(5, test_col).value
+                        if isinstance(test_val, (datetime.datetime, datetime.date)):
+                            date_col = test_col
+                            break
+                break
 
     comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
 
@@ -1033,10 +1037,9 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         # At year/month boundaries (e.g., Jan 1), -1 day crosses to previous month/year
         # and breaks the date matching. In those cases, use the date as-is.
         try:
-            if target_year:
-                base_date = datetime.date(target_year, d.month, d.day)
-            else:
-                base_date = datetime.date(d.year + 1, d.month, d.day)
+            # For fiscal year files, use d.year + 1 (not target_year)
+            # This maintains the fiscal year structure (e.g., 2025-08 → 2026-08)
+            base_date = datetime.date(d.year + 1, d.month, d.day)
             # Only apply -1 day if it's not at month boundary (day 1 or 31+)
             # Day 1: -1 would cross to previous month
             # Day 31: -1 would misalign with month-end in target
