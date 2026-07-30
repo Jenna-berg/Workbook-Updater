@@ -1037,17 +1037,10 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         # At year/month boundaries (e.g., Jan 1), -1 day crosses to previous month/year
         # and breaks the date matching. In those cases, use the date as-is.
         try:
-            # For fiscal year files, use d.year + 1 (not target_year)
-            # This maintains the fiscal year structure (e.g., 2025-08 → 2026-08)
-            base_date = datetime.date(d.year + 1, d.month, d.day)
-            # Only apply -1 day if it's not at month boundary (day 1 or 31+)
-            # Day 1: -1 would cross to previous month
-            # Day 31: -1 would misalign with month-end in target
-            if d.day > 1 and d.day < 31:
-                this_year = base_date - datetime.timedelta(days=1)
-            else:
-                # Month boundaries: use date as-is
-                this_year = base_date
+            # For fiscal year files, shift dates by +1 year to match target year.
+            # No DOW adjustment needed - target file has continuous dates.
+            # Example: 2025-08-30 → 2026-08-30 (matches target)
+            this_year = datetime.date(d.year + 1, d.month, d.day)
         except ValueError:
             # Feb 29 in non-leap year: use Feb 28 instead
             if d.month == 2 and d.day == 29:
