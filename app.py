@@ -1005,14 +1005,21 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         elif isinstance(v, datetime.date):   d = v
         else: continue
 
-        # Shift to target year, applying DOW adjustment (-1 day for non-leap year)
-        # Handle Feb 29 in non-leap years by using Feb 28 instead
+        # Shift to target year, applying DOW adjustment (-1 day for non-leap year).
+        # CRITICAL: Only subtract the -1 day if it doesn't cross a month boundary.
+        # At year/month boundaries (e.g., Jan 1), -1 day crosses to previous month/year
+        # and breaks the date matching. In those cases, use the date as-is.
         try:
             if target_year:
                 base_date = datetime.date(target_year, d.month, d.day)
             else:
                 base_date = datetime.date(d.year + 1, d.month, d.day)
-            this_year = base_date - datetime.timedelta(days=1)
+            # Only apply -1 day if it stays within the same month
+            if d.day > 1:
+                this_year = base_date - datetime.timedelta(days=1)
+            else:
+                # Day 1 of month: -1 would cross to previous month, skip shift
+                this_year = base_date
         except ValueError:
             # Feb 29 in non-leap year: use Feb 28 instead
             if d.month == 2 and d.day == 29:
