@@ -1954,18 +1954,50 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     return None, None
 
 
-def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
-    """Find the REVENUE REPORTS folder to use for a given year.
+def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
+    """Rank REVENUE REPORTS folder candidates for a target month/year.
+    Some hotels (confirmed real case: Provincetown Harbor Hotel) have a
+    SEPARATE folder per MONTH ('H: AUG2026 REVENUE REPORTS ...', 'G: JUL2026
+    ...') — several of which all contain the target year as a substring, so
+    'first name containing the year' is Drive-listing-order luck and picked
+    a different (wrong) folder on the live environment than in testing.
+    Order of preference:
+      1. name contains the target month keyword (AUG2026 / AUG26) — the
+         flat per-month folder for exactly the month being set up;
+      2. name contains the year but NO month abbreviation — a true year
+         folder (month subfolders live inside it);
+      3. name contains the year at all (previous behavior, kept as fallback);
+      4. first candidate.
+    """
+    if not candidates:
+        return None
+    month_kw_2digit = month_kw[:3] + month_kw[-2:] if month_kw else None
+    for f in candidates:
+        name_upper = f["name"].upper()
+        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
+            return f
+    for f in candidates:
+        name_upper = f["name"].upper()
+        if year_kw in f["name"] and not any(m.upper() in name_upper for m in MONTH_ABBR):
+            return f
+    for f in candidates:
+        if year_kw in f["name"]:
+            return f
+    return candidates[0]
+
+
+def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None):
+    """Find the REVENUE REPORTS folder to use for a given year (and,
+    preferably, the specific target month — see _pick_rev_reports_candidate
+    for the ranking; the old first-year-substring-match behavior silently
+    picked whichever same-year sibling Drive happened to list first for
+    hotels with one folder per month).
     Some hotels have ONE 'REVENUE REPORTS' folder for years directly (year/month
     subfolders inside it); others have a SEPARATE '<year> REVENUE REPORTS <hotel>'
-    folder per year, sitting side by side. drive_find_folder_by_keyword only
-    ever returns the first match, which silently picks the wrong year's folder
-    for hotels using the per-year pattern. Prefer an exact year-name match;
-    fall back to the first REVENUE REPORTS folder found.
+    folder per year (or per month), sitting side by side.
     """
-    # Hotel has a separate REVENUE REPORTS folder shared per year (each
+    # Hotel has separate REVENUE REPORTS folders shared per year/month (each
     # individually shared, since there's no common parent to share instead).
-    # Pick the one matching year_kw directly from the group.
     if hotel_id.startswith(MULTI_ID_PREFIX):
         candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
         candidates = []
@@ -1975,11 +2007,9 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
                 candidates.append({"id": cid, "name": info["name"]})
             except Exception:
                 continue
-        year_match = next((f for f in candidates if year_kw in f["name"]), None)
-        if year_match:
-            return year_match["id"], year_match["name"]
-        if candidates:
-            return candidates[0]["id"], candidates[0]["name"]
+        best = _pick_rev_reports_candidate(candidates, year_kw, month_kw)
+        if best:
+            return best["id"], best["name"]
         return None, None
 
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
@@ -1989,11 +2019,9 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
     candidates = [f for f in children if "revenue reports" in f["name"].lower()]
-    year_match = next((f for f in candidates if year_kw in f["name"]), None)
-    if year_match:
-        return year_match["id"], year_match["name"]
-    if candidates:
-        return candidates[0]["id"], candidates[0]["name"]
+    best = _pick_rev_reports_candidate(candidates, year_kw, month_kw)
+    if best:
+        return best["id"], best["name"]
 
     # Some hotels are shared directly at the REVENUE REPORTS folder level
     # (Shared Drive permissions don't propagate to a parent folder) — hotel_id
@@ -2027,6 +2055,19 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
     sibling month folder instead of a real year folder. Excluding any
     candidate whose name contains a month abbreviation avoids that ambiguity.
     """
+    # Flat per-month layout (confirmed real case: Provincetown Harbor Hotel,
+    # 'H: AUG2026 REVENUE REPORTS ...'): the rev folder's own name already
+    # names the target month — it IS the month folder; there is no month
+    # subfolder inside it to find.
+    try:
+        rev_info = service.files().get(fileId=rev_id, fields="name", supportsAllDrives=True).execute()
+        rev_name = rev_info.get("name", "")
+        month_kw_2digit = month_kw[:3] + month_kw[-2:]
+        if month_kw in rev_name.upper() or month_kw_2digit in rev_name.upper():
+            return rev_id, rev_name
+    except Exception:
+        pass
+
     month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=rev_id)
     if month_id:
         return month_id, month_name
@@ -2197,10 +2238,12 @@ def find_rob_master(service, hotel_id: str):
 
 
 def _is_rob_month_blank(ws, block_start):
-    """Return True if cols 2,3,4 of the Revenue row are all empty."""
+    """Return True if cols 2,3,4 of the Revenue row are all empty (None, '', or formula)."""
     rev_row = block_start + 1
     return all(
-        ws.cell(rev_row, c).value is None or ws.cell(rev_row, c).value == ""
+        ws.cell(rev_row, c).value is None
+        or ws.cell(rev_row, c).value == ""
+        or is_formula(str(ws.cell(rev_row, c).value))
         for c in [2, 3, 4]
     )
 
@@ -2501,7 +2544,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     month_kw = target_month.strftime("%b%Y").upper()
 
     # ── Locate month folder (never created — must already exist) ────────────
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder.", None, None
     month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
@@ -2684,7 +2727,7 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
@@ -2781,7 +2824,7 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     month_kw = target_month.strftime("%b%Y").upper()
 
     # Resolve REVENUE REPORTS and month folder
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
