@@ -968,12 +968,31 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
     return out
 
 
-def _extract_ly_data_from_wb(ly_wb, sheet_name):
+def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
     """Read all LY source fields + comp set TY col from an in-memory workbook.
-    Returns {this_year_date: {field: value}} (dates shifted +1 year).
+    Returns {this_year_date: {field: value}} (dates shifted to match TY sheet's year).
+
+    Robust to year mismatches in LY file (e.g., AUG2025 file has 2024 dates due to
+    copy/paste error). Detects target year from TY sheet and shifts LY dates accordingly.
     """
     if sheet_name not in ly_wb.sheetnames:
         return {}
+
+    # Detect target year from TY sheet if provided, otherwise infer from LY year + 1
+    target_year = None
+    if ty_wb and sheet_name in ty_wb.sheetnames:
+        ty_ws = ty_wb[sheet_name]
+        ty_date_col = detect_date_column(ty_ws, wb=ty_wb)
+        # Scan first few rows to find the target year
+        for r in range(5, min(15, ty_ws.max_row + 1)):
+            v = ty_ws.cell(r, ty_date_col).value
+            if isinstance(v, datetime.datetime):
+                target_year = v.year
+                break
+            elif isinstance(v, datetime.date):
+                target_year = v.year
+                break
+
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
     date_col = detect_date_column(ws, wb=ly_wb)
@@ -985,9 +1004,14 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name):
         if isinstance(v, datetime.datetime): d = v.date()
         elif isinstance(v, datetime.date):   d = v
         else: continue
-        # Shift +1 day to match DOW: DOW shifts by 1 in a non-leap year, so
-        # LY July 2 (Wed) should fill TY July 1 (Wed), not LY July 1 (Tue).
-        this_year = d.replace(year=d.year + 1) - datetime.timedelta(days=1)
+
+        # Shift to target year, applying DOW adjustment (-1 day for non-leap year)
+        if target_year:
+            this_year = datetime.date(target_year, d.month, d.day) - datetime.timedelta(days=1)
+        else:
+            # Fallback: shift by 1 year if target year unknown
+            this_year = datetime.date(d.year + 1, d.month, d.day) - datetime.timedelta(days=1)
+
         row_data = {}
         for ly_dest, ty_src in LY_FROM_TY.items():
             src_col = col_map.get(ty_src)
@@ -1055,7 +1079,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     # LY data — every week, from last year's same month/week tab (already in memory)
     ly_data = {}
     if ly_wb:
-        ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name)
+        ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=wb)
 
     changes = []
 
