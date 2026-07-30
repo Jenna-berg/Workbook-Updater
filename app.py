@@ -2486,6 +2486,8 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
         # ── Data rows (offsets 1–7) ───────────────────────────────────────────
         if month_idx < prev_idx:
             # Past months (Jan–May when target=Jul): copy all 4 cols from prev ROB
+            # For new hotels with no historical data (e.g., first year), prev_ws will be None —
+            # just skip and leave those months with master template values (no error).
             if not _is_rob_month_blank(new_ws, block_start):
                 continue
             if is_wk_one:
@@ -2533,6 +2535,8 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
 
         else:
             # Current month and future months (Jul+): cols 2,3,4 from LY ROB
+            # For new hotels with no historical data (e.g., Foxberry), ly_ws will be None —
+            # just skip and leave those months with master template values (no error).
             if ly_ws is None:
                 continue
             for dr in data_offsets:
