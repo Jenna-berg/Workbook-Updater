@@ -1087,8 +1087,21 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
             val = ws.cell(r, comp_ty_col).value
             if val is not None and not is_formula(val):
                 row_data["comp_set_ly"] = val  # preserve text values like "Sold out", "LOS2"
+
+        # Only include rows where at least one numeric field is non-zero.
+        # This filters out placeholder rows with all 0s (unpopulated cells from source file).
+        # Empty/formulas-only rows are ok; the issue is explicit 0s from placeholders.
         if row_data:
-            out[this_year] = row_data
+            has_nonzero = any(
+                isinstance(v, (int, float)) and v != 0
+                for v in row_data.values()
+                if isinstance(v, (int, float))
+            )
+            if has_nonzero or any(
+                not isinstance(v, (int, float)) for v in row_data.values()
+            ):
+                # Row has at least one non-zero numeric value, or has non-numeric data
+                out[this_year] = row_data
     return out
 
 
