@@ -503,6 +503,7 @@ STRATEGY_FIELD_PATTERNS = {
     "trans_rev_ty":    [("TY TRANS", "REV"),             ("TRAN!LY", "REV TY")],
     "grp_rev_ty":      [("GRP TY", "REV"),               ("GRP!LY!N/PU", "REV TY")],
     "otb_lst_wk":      [("OTB", "LST WEK"),               ("OTB", "LST WK"),         ("OTB", "LAST WK"), ("OTB LST", None)],
+    "casino_ballroom": [("CASINO", "BALLROOM!LY"),       ("CASINO BALLROOM", None)],
     # ── LY columns (written from last year's SR) ───────────────────────────────
     "otb_ly_trans":    [("LY", "TRAN"),                  ("OTB LY", "TRANS"),       ("TRANS!TY", "SOLD!TY"), ("LY", "TRANS!TY")],
     "grp_pu_ly":       [("LY", "GRP"),                   ("GRP PU", "LY"),          ("GROUP!TY", "LY"),        ("GRP PU LY", None)],
@@ -510,16 +511,18 @@ STRATEGY_FIELD_PATTERNS = {
     "trans_rev_ly":    [("LY TRANS", "REV"),             ("TRAN!TY", "REV LY"),     ("LY", "TRANS REV")],
     "grp_rev_ly":      [("GRP LY", "REV"),               ("GRP!TY!N/PU", "REV LY")],
     "grp_npu_rev_ly":  [("GRP N/PU", "REV LY"),         ("N/PU LY", "REV"),        ("N/PU", "REV LY")],
+    "casino_ballroom_ly": [("CASINO", "BALLROOM!TY"),    ("CASINO", "LY")],
 }
 
 # Maps LY destination field → TY source field in last year's SR
 LY_FROM_TY = {
-    "otb_ly_trans":   "otb_trans",
-    "grp_pu_ly":      "grp_pu_ty",
-    "grp_npu_ly":     "grp_npu_ty",
-    "trans_rev_ly":   "trans_rev_ty",
-    "grp_rev_ly":     "grp_rev_ty",
-    "grp_npu_rev_ly": "grp_npu_ty",  # source is GRP N/PU TY
+    "otb_ly_trans":    "otb_trans",
+    "grp_pu_ly":       "grp_pu_ty",
+    "grp_npu_ly":      "grp_npu_ty",
+    "trans_rev_ly":    "trans_rev_ty",
+    "grp_rev_ly":      "grp_rev_ty",
+    "grp_npu_rev_ly":  "grp_npu_ty",  # source is GRP N/PU TY
+    "casino_ballroom_ly": "casino_ballroom",
 }
 
 def _kw_matches(cell_val, keyword, r3_val, r4_val):
@@ -1019,7 +1022,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     # Detect actual column positions from headers — no guessing
     col_map = detect_strategy_columns(ws)
     ly_only_fields = {"otb_lst_wk", "otb_ly_trans", "grp_pu_ly", "grp_npu_ly",
-                      "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly"}
+                      "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly", "casino_ballroom_ly"}
     missing = [f for f, c in col_map.items() if c is None and f not in ly_only_fields]
     if missing:
         st.warning(f"Strategy: could not locate columns for: {', '.join(missing)}")
@@ -1281,12 +1284,26 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     ws = wb[sheet_name]
 
     restric_col = find_restrictions_col(ws)
-    hotel_col   = (restric_col + 1) if restric_col else None
+
+    # Find hotel rate column by scanning right from Restrictions looking for "hotel" or "rate"
+    # Don't assume it's restric_col+1 — there may be intermediate columns (e.g. casino ballroom).
+    # Always read actual column headers, never assume positions.
+    hotel_col = None
+    if restric_col:
+        for c in range(restric_col + 1, min(restric_col + 10, ws.max_column + 1)):
+            hdr3 = str(ws.cell(3, c).value or "").upper()
+            hdr4 = str(ws.cell(4, c).value or "").upper()
+            combined = hdr3 + " " + hdr4
+            if ("HOTEL" in combined or "RATE" in combined) and "BALLROOM" not in combined:
+                hotel_col = c
+                break
 
     changes = []
     warnings = []
     if not restric_col:
         warnings.append("Could not find Restrictions column in sheet headers.")
+    if not hotel_col and restric_col:
+        warnings.append("Could not find Hotel Rate column after Restrictions.")
 
     for _, row in rate_df.iterrows():
         date_str = str(row.get("Date", "")).strip()
