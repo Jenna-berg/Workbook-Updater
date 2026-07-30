@@ -995,7 +995,30 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
 
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
-    date_col = detect_date_column(ws, wb=ly_wb)
+
+    # For LY extraction, find the column with ACTUAL LY labels (not TY).
+    # In a multi-year file like AUG2025: col 1 = "2024" LY, col 3 = "2025" TY
+    # We want col 1 (LY column) for proper year range.
+    date_col = None
+    for col in range(1, ws.max_column + 1):
+        r3 = str(ws.cell(3, col).value or "").upper()
+        r4 = str(ws.cell(4, col).value or "").upper()
+        combined = f"{r3} {r4}"
+        # Look for "LY" label but not "TY" label
+        if "LY" in combined and "TY" not in combined:
+            # Check if this column has dates
+            for row in range(5, min(20, ws.max_row + 1)):
+                val = ws.cell(row, col).value
+                if isinstance(val, (datetime.datetime, datetime.date)):
+                    date_col = col
+                    break
+            if date_col:
+                break
+
+    # Fallback to default detection if no LY column found
+    if not date_col:
+        date_col = detect_date_column(ws, wb=ly_wb)
+
     comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
 
     out = {}
