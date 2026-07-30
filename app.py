@@ -1999,23 +1999,10 @@ def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     if year_only:
         return year_only[0]
 
-    # Step 2: If no year-only folders exist, this is likely a NESTED structure
-    # with only individual month folders in MULTI_ID (e.g., DEC + AUG folders).
-    # This is a setup issue — we should NOT pick a month folder as the revenue
-    # reports root. Return None and let the caller error out with a clear message.
-    has_any_month = any(any(m.upper() in f["name"].upper() for m in MONTH_ABBR) for f in candidates)
-    if has_any_month and year_kw in " ".join(f["name"] for f in candidates):
-        # All candidates appear to be month folders (no year-only folder found).
-        # This is a misconfigured MULTI_ID for a nested structure.
-        return None
-
-    # Step 2b: For true flat per-month layout, try exact month match
+    # Step 2: If no year-only folders, try exact month match (flat per-month layout)
     for f in candidates:
         name_upper = f["name"].upper()
-        # Count how many month abbrs are in this candidate
-        month_count = sum(1 for m in MONTH_ABBR if m.upper() in name_upper)
-        # Use it only if it has EXACTLY the target month (flat layout)
-        if month_kw and month_count == 1 and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
+        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
             return f
 
     # Step 3-5: Fallback rankings
