@@ -1975,32 +1975,50 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
 
 def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     """Rank REVENUE REPORTS folder candidates for a target month/year.
-    Some hotels have NESTED month folders; others have FLAT per-month folders.
-    For nested: prefer year folders (e.g., '2026 REVENUE REPORTS') over month
-    folders (e.g., 'H: AUG2026 REVENUE REPORTS'). For flat: a month folder IS
-    the revenue reports root, so it will be ranked 1st.
+    CRITICAL: Prefer year-only folders (2026 REVENUE REPORTS) over month
+    folders, even for the target month. Month folders should only be used
+    if they're the ONLY folders available (flat per-month layout like Harbor).
     Order of preference:
       1. name contains the year but NO month abbreviation — a true year
-         folder (month subfolders live inside it);
-      2. name contains the target month keyword (AUG2026 / AUG26) — the
-         flat per-month folder for exactly the month being set up;
-      3. name contains the year at all (fallback for other structures);
-      4. first candidate.
+         folder (month subfolders live inside it) [NESTED LAYOUT];
+      2. name contains target month AND no other month abbr [FLAT LAYOUT];
+      3. name contains year but NO month abbr (if step 2 didn't find anything);
+      4. name contains the year at all (fallback);
+      5. first candidate.
     """
     if not candidates:
         return None
     month_kw_2digit = month_kw[:3] + month_kw[-2:] if month_kw else None
-    # Prefer year-only folders (nested layout) over month folders
+
+    # Step 1: Prefer year-only folders (nested layout)
+    year_only = []
     for f in candidates:
         name_upper = f["name"].upper()
         if year_kw in f["name"] and not any(m.upper() in name_upper for m in MONTH_ABBR):
-            return f
-    # Then try exact month match (flat per-month layout)
+            year_only.append(f)
+    if year_only:
+        return year_only[0]
+
+    # Step 2: If no year-only folders exist, this is likely a NESTED structure
+    # with only individual month folders in MULTI_ID (e.g., DEC + AUG folders).
+    # This is a setup issue — we should NOT pick a month folder as the revenue
+    # reports root. Return None and let the caller error out with a clear message.
+    has_any_month = any(any(m.upper() in f["name"].upper() for m in MONTH_ABBR) for f in candidates)
+    if has_any_month and year_kw in " ".join(f["name"] for f in candidates):
+        # All candidates appear to be month folders (no year-only folder found).
+        # This is a misconfigured MULTI_ID for a nested structure.
+        return None
+
+    # Step 2b: For true flat per-month layout, try exact month match
     for f in candidates:
         name_upper = f["name"].upper()
-        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
+        # Count how many month abbrs are in this candidate
+        month_count = sum(1 for m in MONTH_ABBR if m.upper() in name_upper)
+        # Use it only if it has EXACTLY the target month (flat layout)
+        if month_kw and month_count == 1 and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
             return f
-    # Fallback to any year match
+
+    # Step 3-5: Fallback rankings
     for f in candidates:
         if year_kw in f["name"]:
             return f
@@ -2030,8 +2048,6 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
                 continue
         best = _pick_rev_reports_candidate(candidates, year_kw, month_kw)
         if best:
-            # Diagnostic: show which folder was picked and alternatives
-            alternatives = [c["name"] for c in candidates if c["id"] != best["id"]]
             return best["id"], best["name"]
         return None, None
 
