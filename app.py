@@ -1973,30 +1973,32 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
 
 def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     """Rank REVENUE REPORTS folder candidates for a target month/year.
-    Some hotels (confirmed real case: Provincetown Harbor Hotel) have a
-    SEPARATE folder per MONTH ('H: AUG2026 REVENUE REPORTS ...', 'G: JUL2026
-    ...') — several of which all contain the target year as a substring, so
-    'first name containing the year' is Drive-listing-order luck and picked
-    a different (wrong) folder on the live environment than in testing.
+    Some hotels have NESTED month folders; others have FLAT per-month folders.
+    For nested: prefer year folders (e.g., '2026 REVENUE REPORTS') over month
+    folders (e.g., 'H: AUG2026 REVENUE REPORTS'). For flat: a month folder IS
+    the revenue reports root, so it will be ranked 1st.
     Order of preference:
-      1. name contains the target month keyword (AUG2026 / AUG26) — the
-         flat per-month folder for exactly the month being set up;
-      2. name contains the year but NO month abbreviation — a true year
+      1. name contains the year but NO month abbreviation — a true year
          folder (month subfolders live inside it);
-      3. name contains the year at all (previous behavior, kept as fallback);
+      2. name contains the target month keyword (AUG2026 / AUG26) — the
+         flat per-month folder for exactly the month being set up;
+      3. name contains the year at all (fallback for other structures);
       4. first candidate.
     """
     if not candidates:
         return None
     month_kw_2digit = month_kw[:3] + month_kw[-2:] if month_kw else None
-    for f in candidates:
-        name_upper = f["name"].upper()
-        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
-            return f
+    # Prefer year-only folders (nested layout) over month folders
     for f in candidates:
         name_upper = f["name"].upper()
         if year_kw in f["name"] and not any(m.upper() in name_upper for m in MONTH_ABBR):
             return f
+    # Then try exact month match (flat per-month layout)
+    for f in candidates:
+        name_upper = f["name"].upper()
+        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
+            return f
+    # Fallback to any year match
     for f in candidates:
         if year_kw in f["name"]:
             return f
