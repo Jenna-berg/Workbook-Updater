@@ -1023,7 +1023,9 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     col_map = detect_strategy_columns(ws)
     ly_only_fields = {"otb_lst_wk", "otb_ly_trans", "grp_pu_ly", "grp_npu_ly",
                       "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly", "casino_ballroom_ly"}
-    missing = [f for f, c in col_map.items() if c is None and f not in ly_only_fields]
+    # Casino ballroom is optional — only some hotels (e.g., Hampton Beach) have it
+    optional_fields = {"casino_ballroom", "casino_ballroom_ly"}
+    missing = [f for f, c in col_map.items() if c is None and f not in ly_only_fields and f not in optional_fields]
     if missing:
         st.warning(f"Strategy: could not locate columns for: {', '.join(missing)}")
 
