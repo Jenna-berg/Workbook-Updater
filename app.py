@@ -2026,6 +2026,8 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
                 continue
         best = _pick_rev_reports_candidate(candidates, year_kw, month_kw)
         if best:
+            # Diagnostic: show which folder was picked and alternatives
+            alternatives = [c["name"] for c in candidates if c["id"] != best["id"]]
             return best["id"], best["name"]
         return None, None
 
@@ -2565,12 +2567,15 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     month_kw = target_month.strftime("%b%Y").upper()
 
     # ── Locate month folder (never created — must already exist) ────────────
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
+    rev_id, rev_name = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder.", None, None
-    month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, month_name = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
     if not month_id:
         return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist.", None, None
+
+    # Diagnostic: which folders are being used
+    folder_diagnostic = f"Revenue Reports folder: {rev_name}; Month folder: {month_name}"
 
     # ── Find or copy the file ─────────────────────────────────────────────────
     # Diagnostic: list every file in month_id whose name contains "ROB" —
@@ -2628,7 +2633,10 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # an error) and load failures (download/openpyxl exceptions) are now
     # captured into `warnings` and surfaced to the caller alongside the
     # success message, matching the diagnostic the SR flow already shows.
-    warnings = [f"Target file id: {new_file_id} (name: {new_file_name})"] + dup_check_warnings
+    warnings = [
+        f"Target file id: {new_file_id} (name: {new_file_name})",
+        f"Folder placement: {folder_diagnostic}",
+    ] + dup_check_warnings
 
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
     prev_result, prev_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
