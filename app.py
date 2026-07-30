@@ -2692,12 +2692,23 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # for this tab" from "something after this point (save/upload) lost
     # it". Checked across all six week tabs, not just WKONE — confirmed
     # real case where wk one's fill succeeded but wk two's silently didn't.
+    # Also check Jan/Feb/Mar/Dec to verify backward/future months are filled.
     target_idx = target_month.month - 1
     target_block_start = 4 + 8 * target_idx
     readback = {
         s: new_wb[s].cell(target_block_start + 1, 2).value
         for s in ROB_SHEETS if s in new_wb.sheetnames
     }
+    wk_one_sheet = ROB_SHEETS[0]
+    if wk_one_sheet in new_wb.sheetnames:
+        ws = new_wb[wk_one_sheet]
+        month_check = {}
+        for m, mlabel in [(1, "Jan"), (2, "Feb"), (3, "Mar"), (12, "Dec")]:
+            block = 4 + 8 * (m - 1)
+            month_check[mlabel] = ws.cell(block + 1, 2).value
+        warnings.append(
+            f"Months check (wk one only) — Jan/Feb/Mar/Dec Revenue (col B): {month_check!r}"
+        )
     warnings.append(
         f"Readback check — {target_month.strftime('%b %Y')} Revenue (row "
         f"{target_block_start + 1}, col B) per tab after fill: {readback!r}"
