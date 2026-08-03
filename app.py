@@ -2042,6 +2042,44 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def has_edit_access(folder_id, email="workbook-updater-live@linchris-rob-updater.iam.gserviceaccount.com"):
+    """Check if the given email has editor access to a folder.
+    Returns True if editor, False if viewer-only or no access.
+    """
+    try:
+        svc = get_drive_service()
+        perms = svc.permissions().list(
+            fileId=folder_id, fields="permissions(emailAddress,role)",
+            supportsAllDrives=True
+        ).execute()
+        for perm in perms.get("permissions", []):
+            if perm.get("emailAddress") == email:
+                return perm.get("role") == "owner" or perm.get("role") == "organizer" or perm.get("role") == "editor"
+        return False
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=300)
+def get_hotels_with_edit_access():
+    """Return list of hotels where the service account has edit access.
+    For Weekly Workbook Update tab only.
+    """
+    all_hotels = get_hotels_from_drive()
+    filtered = []
+    for hotel_name, folder_id in all_hotels:
+        # Handle MULTI_ID format: "MULTI:id1,id2,..."
+        if folder_id.startswith(MULTI_ID_PREFIX):
+            ids = folder_id[len(MULTI_ID_PREFIX):].split(",")
+            # Include if ANY folder has edit access
+            if any(has_edit_access(fid) for fid in ids):
+                filtered.append((hotel_name, folder_id))
+        else:
+            if has_edit_access(folder_id):
+                filtered.append((hotel_name, folder_id))
+    return filtered
+
+
 def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     """Return the first folder whose name contains keyword (case-insensitive)."""
     q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -4526,7 +4564,8 @@ with tab_weekly:
         st.write("")
         st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
-    hotels = get_hotels_from_drive()
+    # Weekly Workbook Update only shows hotels with edit access
+    hotels = get_hotels_with_edit_access()
     hotel_names = [h[0] for h in hotels]
     hotel_id_map = {h[0]: h[1] for h in hotels}
 
@@ -4539,6 +4578,7 @@ with tab_weekly:
             st.write("")
             if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
                 get_hotels_from_drive.clear()
+                get_hotels_with_edit_access.clear()
                 st.rerun()
         with col_w:
             wb_sels = st.pills(
