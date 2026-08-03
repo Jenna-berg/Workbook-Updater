@@ -2042,9 +2042,11 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+@st.cache_data(ttl=3600)
 def has_edit_access(folder_id, email="workbook-updater-live@linchris-rob-updater.iam.gserviceaccount.com"):
     """Check if the given email has editor access to a folder.
     Returns True if editor, False if viewer-only or no access.
+    Cached for 1 hour to avoid repeated API calls.
     """
     try:
         svc = get_drive_service()
@@ -2058,6 +2060,23 @@ def has_edit_access(folder_id, email="workbook-updater-live@linchris-rob-updater
         return False
     except Exception:
         return False
+
+
+@st.cache_data(ttl=3600)
+def get_hotels_with_edit_access():
+    """Return list of hotels with edit access. Cached for 1 hour."""
+    all_hotels = get_hotels_from_drive()
+    filtered = []
+    for hotel_name, folder_id in all_hotels:
+        # Handle MULTI_ID format
+        if folder_id.startswith(MULTI_ID_PREFIX):
+            ids = folder_id[len(MULTI_ID_PREFIX):].split(",")
+            if any(has_edit_access(fid) for fid in ids):
+                filtered.append((hotel_name, folder_id))
+        else:
+            if has_edit_access(folder_id):
+                filtered.append((hotel_name, folder_id))
+    return filtered
 
 
 def drive_find_folder_by_keyword(service, keyword, parent_id=None):
@@ -4544,8 +4563,8 @@ with tab_weekly:
         st.write("")
         st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
-    # Show all hotels in dropdown (permission check happens at update time)
-    hotels = get_hotels_from_drive()
+    # Weekly Workbook Update only shows hotels with edit access
+    hotels = get_hotels_with_edit_access()
     hotel_names = [h[0] for h in hotels]
     hotel_id_map = {h[0]: h[1] for h in hotels}
 
@@ -4558,6 +4577,7 @@ with tab_weekly:
             st.write("")
             if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
                 get_hotels_from_drive.clear()
+                get_hotels_with_edit_access.clear()
                 st.rerun()
         with col_w:
             wb_sels = st.pills(
@@ -5012,23 +5032,10 @@ with tab_weekly:
         if ready and st.button("Preview Changes", key="drive_preview"):
             try:
                 svc = get_drive_service()
-                hotel_id = hotel_id_map.get(hotel_sel, "")
-
-                # Check edit access for this hotel
-                if hotel_id and not hotel_id.startswith(MULTI_ID_PREFIX):
-                    if not has_edit_access(hotel_id):
-                        st.error(f"❌ No edit access to {hotel_sel}. You only have viewing access.")
-                        st.stop()
-                elif hotel_id and hotel_id.startswith(MULTI_ID_PREFIX):
-                    ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
-                    if not any(has_edit_access(fid) for fid in ids):
-                        st.error(f"❌ No edit access to {hotel_sel}. You only have viewing access.")
-                        st.stop()
-
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
-                st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
                 st.session_state["drive_hotel_sel"] = hotel_sel
             except Exception as e:
                 st.error(f"Drive error: {e}")
@@ -5068,24 +5075,11 @@ with tab_weekly:
         if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
             try:
                 svc = get_drive_service()
-                hotel_id = hotel_id_map.get(hotel_sel, "")
-
-                # Check edit access for this hotel
-                if hotel_id and not hotel_id.startswith(MULTI_ID_PREFIX):
-                    if not has_edit_access(hotel_id):
-                        st.error(f"❌ No edit access to {hotel_sel}. You only have viewing access.")
-                        st.stop()
-                elif hotel_id and hotel_id.startswith(MULTI_ID_PREFIX):
-                    ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
-                    if not any(has_edit_access(fid) for fid in ids):
-                        st.error(f"❌ No edit access to {hotel_sel}. You only have viewing access.")
-                        st.stop()
-
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
                 with st.spinner("Updating workbooks in Google Drive..."):
-                    all_plans       = build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                    all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
                     saved, errors   = apply_and_upload(svc, all_plans)
                 for name in saved:
                     st.success(f"Saved **{name}** to Google Drive.")
