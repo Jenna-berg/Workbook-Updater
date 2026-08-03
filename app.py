@@ -4563,8 +4563,7 @@ with tab_weekly:
         st.write("")
         st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
-    # Weekly Workbook Update only shows hotels with edit access
-    hotels = get_hotels_with_edit_access()
+    hotels = get_hotels_from_drive()
     hotel_names = [h[0] for h in hotels]
     hotel_id_map = {h[0]: h[1] for h in hotels}
 
@@ -4577,7 +4576,6 @@ with tab_weekly:
             st.write("")
             if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
                 get_hotels_from_drive.clear()
-                get_hotels_with_edit_access.clear()
                 st.rerun()
         with col_w:
             wb_sels = st.pills(
