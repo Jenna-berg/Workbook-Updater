@@ -1072,13 +1072,13 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
                 continue
 
         row_data = {}
-        # Read from LY columns, not TY columns
-        for ly_field in ["otb_ly_trans", "grp_pu_ly", "grp_npu_ly", "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly"]:
-            src_col = col_map.get(ly_field)
+        # Read from TY columns — for SR LY extraction, this year's TY becomes next year's LY
+        for ly_dest, ty_src in LY_FROM_TY.items():
+            src_col = col_map.get(ty_src)
             if src_col:
                 val = ws.cell(r, src_col).value
                 if val is not None and not is_formula(val):
-                    row_data[ly_field] = safe_float(val)
+                    row_data[ly_dest] = safe_float(val)
         if comp_ty_col:
             val = ws.cell(r, comp_ty_col).value
             if val is not None and not is_formula(val):
