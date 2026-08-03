@@ -3665,13 +3665,14 @@ def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
         fid, fname = result
         wb_bytes = drive_download(service, fid)
         wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-        # First pass: look for tab marked done (green)
+        # First pass: look for tab with any color (marked/highlighted)
         for sheet_name in reversed(ROB_SHEETS):
             if sheet_name not in wb.sheetnames:
                 continue
             ws = wb[sheet_name]
             tc = ws.sheet_properties.tabColor
-            if tc is not None and getattr(tc, "rgb", None) == DONE_TAB_RGB:
+            # Any color means it's been marked/highlighted
+            if tc is not None and getattr(tc, "rgb", None):
                 return wb_bytes, sheet_name, fname, None
         # Second pass: if no tab marked done, use the first week with any data
         for sheet_name in reversed(ROB_SHEETS):
