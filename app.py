@@ -3650,13 +3650,9 @@ def match_ooo_property_to_hotel(prop_name, hotels):
 
 
 def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
-    """Reverse-scans WK six -> WK one of the hotel's CURRENT actual month's
-    ROB file for the last week tab marked done (our green). Falls back to
-    the previous month's ROB file (same reverse scan) if none of the
-    current month's weeks are filled in yet — e.g. right after month
-    rollover, WK1 of the new month is often blank for a few days, so the
-    most recently-finalized data is still the prior month's last filled
-    week. Returns (wb_bytes, sheet_name, file_name, error_str)."""
+    """Finds the most recent week with data in the hotel's ROB file.
+    Scans current month first (WK6 -> WK1), then previous month if current is empty.
+    Returns (wb_bytes, sheet_name, file_name, error_str)."""
     today = datetime.date.today()
     cur_month_dt  = today.replace(day=1)
     prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
@@ -3669,6 +3665,7 @@ def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
         fid, fname = result
         wb_bytes = drive_download(service, fid)
         wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        # First pass: look for tab marked done (green)
         for sheet_name in reversed(ROB_SHEETS):
             if sheet_name not in wb.sheetnames:
                 continue
@@ -3676,7 +3673,15 @@ def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
             tc = ws.sheet_properties.tabColor
             if tc is not None and getattr(tc, "rgb", None) == DONE_TAB_RGB:
                 return wb_bytes, sheet_name, fname, None
-        tried.append(f"{fname}: no week tab is marked done yet")
+        # Second pass: if no tab marked done, use the first week with any data
+        for sheet_name in reversed(ROB_SHEETS):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            # Check if sheet has any OTB data (column B, rows 5-14)
+            if any(ws.cell(r, 2).value for r in range(5, 15)):
+                return wb_bytes, sheet_name, fname, None
+        tried.append(f"{fname}: no week with data found")
     return None, None, None, "; ".join(tried) or "No ROB file found for the current or previous month."
 
 
