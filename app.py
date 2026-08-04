@@ -560,10 +560,10 @@ def detect_strategy_columns(ws):
         r3_val = str(ws.cell(3, c).value or "").strip()
         r4_val = str(ws.cell(4, c).value or "").strip()
 
-        # If row 4 is blank, infer from row 3 context
-        if not r4_val and r3_val:
+        # If row 4 is blank or "None", infer from row 3 context
+        if (not r4_val or r4_val == "None") and r3_val:
             if "OTB TY" in r3_val:
-                r4_val = "TRANS"  # First OTB TY column always has TRANS
+                r4_val = "TRANS"  # OTB TY column always has TRANS
             elif "TY" in r3_val and "LY" not in r3_val:
                 r4_val = "TY"  # Other TY columns infer "TY"
             elif "LY" in r3_val:
