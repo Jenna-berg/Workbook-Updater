@@ -2165,7 +2165,9 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
-    candidates = [f for f in children if "revenue reports" in f["name"].lower()]
+    # Match "revenue reports", "rev reports", or just "revenue" in folder name
+    candidates = [f for f in children
+                  if any(kw in f["name"].lower() for kw in ["revenue reports", "rev reports", "revenue"])]
     best = _pick_rev_reports_candidate(candidates, year_kw, month_kw)
     if best:
         return best["id"], best["name"]
