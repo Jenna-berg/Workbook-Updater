@@ -2247,15 +2247,22 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute().get("files", [])
 
+            best_match = None
             for child in children:
                 child_name_upper = child["name"].upper()
-                # Check if this is the month folder
-                if month_kw in child_name_upper:
+                # Prefer folders with both month_kw and "REVENUE" (more specific)
+                # to avoid stopping at intermediate folders
+                if month_kw in child_name_upper and "REVENUE" in child_name_upper:
                     return child["id"], child["name"]
-                # Recurse into subfolders
+                # Also check for "REPORTS" to catch "AUG2026 REVENEU REPORTS SALEM"
+                if month_kw in child_name_upper and "REPORTS" in child_name_upper:
+                    best_match = (child["id"], child["name"])
+                # Recurse into subfolders to find deeper matches
                 result_id, result_name = search_recursive(child["id"], depth + 1)
                 if result_id:
                     return result_id, result_name
+            if best_match:
+                return best_match
         except Exception:
             pass
         return None, None
