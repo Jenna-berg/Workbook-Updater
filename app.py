@@ -549,15 +549,27 @@ def detect_strategy_columns(ws):
     week-2+ tabs can differ (e.g. an extra pickup-tracking column shifts
     everything after it), so a value pinned from one sheet can silently be
     wrong on another.
+
+    If row 4 is blank under a TY/LY column, infer it from context (e.g., blank
+    under "OTB TY" → assume "TRANS", blank under "GRP PU TY" → assume "TY").
     """
     max_col = ws.max_column
     # Build lookup: col → (r3_text, r4_text)
     headers = {}
     for c in range(1, max_col + 1):
-        headers[c] = (
-            str(ws.cell(3, c).value or "").strip(),
-            str(ws.cell(4, c).value or "").strip(),
-        )
+        r3_val = str(ws.cell(3, c).value or "").strip()
+        r4_val = str(ws.cell(4, c).value or "").strip()
+
+        # If row 4 is blank, infer from row 3 context
+        if not r4_val and r3_val:
+            if "OTB TY" in r3_val:
+                r4_val = "TRANS"  # First OTB TY column always has TRANS
+            elif "TY" in r3_val and "LY" not in r3_val:
+                r4_val = "TY"  # Other TY columns infer "TY"
+            elif "LY" in r3_val:
+                r4_val = "LY"  # LY columns infer "LY"
+
+        headers[c] = (r3_val, r4_val)
 
     col_map = {}
     for field, patterns in STRATEGY_FIELD_PATTERNS.items():
