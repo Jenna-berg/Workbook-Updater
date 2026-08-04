@@ -2233,7 +2233,34 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
             break
     if year_id:
         return drive_find_month_folder(service, year_id, month_kw)
-    return None, None
+
+    # Fallback: search recursively through nested folders (handles deep nesting like SALEM)
+    # Some hotels have multiple intermediate folders before reaching the month folder
+    def search_recursive(parent_id, depth=0):
+        if depth > 3:  # Prevent infinite recursion
+            return None, None
+        try:
+            q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+                 "and '%s' in parents") % parent_id
+            children = service.files().list(
+                q=q, fields="files(id, name)", pageSize=100,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
+
+            for child in children:
+                child_name_upper = child["name"].upper()
+                # Check if this is the month folder
+                if month_kw in child_name_upper:
+                    return child["id"], child["name"]
+                # Recurse into subfolders
+                result_id, result_name = search_recursive(child["id"], depth + 1)
+                if result_id:
+                    return result_id, result_name
+        except Exception:
+            pass
+        return None, None
+
+    return search_recursive(rev_id)
 
 
 def drive_find_file(service, keyword, parent_id):
