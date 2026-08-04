@@ -4880,9 +4880,11 @@ with tab_weekly:
                     st.info(f"BOB CSV: {len(df)} rows | daily rows matched: {bob_daily} | first 5 col-0 values: {sample_dates}")
                 else:
                     st.warning("BOB CSV: df is None — no CSV uploaded or parse failed")
+                # Only extract LY data during month setup, not on regular CSV uploads
+                # (ly_sr_wb is already cleared of blanking logic if ly_data is empty)
                 changes  = build_strategy_change_plan(df, wb, sheet,
                                                        prev_month_wb=prev_month_sr_wb,
-                                                       ly_wb=ly_sr_wb)
+                                                       ly_wb=None)
                 warnings = []
                 if rate_df is not None:
                     rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
