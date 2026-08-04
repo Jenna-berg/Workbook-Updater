@@ -1264,9 +1264,9 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
 
     # ── Blank LY cells with no confirmed LY data — don't leave stale leftovers
     # from whatever the template last held (e.g. a day with no LY rates). Only
-    # runs when last year's SR actually loaded, so a missing/failed ly_wb never
-    # wipes cells out of ignorance.
-    if ly_wb:
+    # runs when last year's SR actually loaded AND we extracted LY data (not
+    # just a regular weekly upload). Skip if ly_data is empty (extraction failed).
+    if ly_wb and ly_data:
         ly_field_labels = [
             ("otb_ly_trans",   "OTB LY Trans"),
             ("grp_pu_ly",      "GRP PU LY"),
