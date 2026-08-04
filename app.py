@@ -3298,8 +3298,15 @@ def restructure_sr_dates(wb, target_month):
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        ws.cell(4, 1).value = ly_start.year
-        ws.cell(4, 3).value = ty_start.year
+        # Skip merged cells (can't set value on merged cells)
+        try:
+            ws.cell(4, 1).value = ly_start.year
+        except (AttributeError, ValueError):
+            pass
+        try:
+            ws.cell(4, 3).value = ty_start.year
+        except (AttributeError, ValueError):
+            pass
         num_rows = min(_count_sheet_data_rows(ws), 365)
         if num_rows == 0:
             continue
@@ -3308,9 +3315,18 @@ def restructure_sr_dates(wb, target_month):
             ty_date = ty_start + datetime.timedelta(days=i)
             ly_date = ly_start + datetime.timedelta(days=i)
             dow     = DOW_ABBREVS[ty_date.weekday()]
-            ws.cell(row, 1).value = datetime.datetime(ly_date.year, ly_date.month, ly_date.day)
-            ws.cell(row, 2).value = dow
-            ws.cell(row, 3).value = datetime.datetime(ty_date.year, ty_date.month, ty_date.day)
+            try:
+                ws.cell(row, 1).value = datetime.datetime(ly_date.year, ly_date.month, ly_date.day)
+            except (AttributeError, ValueError):
+                pass
+            try:
+                ws.cell(row, 2).value = dow
+            except (AttributeError, ValueError):
+                pass
+            try:
+                ws.cell(row, 3).value = datetime.datetime(ty_date.year, ty_date.month, ty_date.day)
+            except (AttributeError, ValueError):
+                pass
 
 
 def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_only=True):
