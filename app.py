@@ -5424,8 +5424,6 @@ with tab_pl:
                     "headers differ - check the Hotel column above."
                 )
 
-        for msg in pl_dupes:
-            st.warning("Duplicate - " + msg)
         for msg in pl_problems:
             st.warning("Skipped - " + msg)
 
