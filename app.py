@@ -4659,10 +4659,10 @@ with tab_weekly:
         # Keying these to the selected hotel clears any uploaded file the moment you
         # switch hotels — one hotel's BOB/R&R CSV should never carry over and get
         # applied to a different hotel.
-        drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}", width=500)
+        drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}")
         drive_rate_csv = None
         if "Strategy Report" in (wb_sels or []):
-            drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
+            drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}")
         drive_npu_compare_csv = None
         if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
             drive_npu_compare_csv = st.file_uploader(
