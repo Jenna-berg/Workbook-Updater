@@ -5391,20 +5391,27 @@ with tab_pl:
     if not pl_files:
         st.info("Drop your operating statements above to get started.")
     else:
-        pl_parsed, pl_problems, pl_rows, pl_dupes = {}, [], [], []
+        pl_parsed, pl_problems, pl_rows, pl_asof = {}, [], [], {}
         for f in pl_files:
             try:
-                h, y, lines = PL.parse_statement(data=f.getvalue(), name=f.name)
-                if y in pl_parsed.get(h, {}):
-                    pl_dupes.append("{} - {} {} was already loaded from another file"
-                                    .format(f.name, h, y))
-                pl_parsed.setdefault(h, {})[y] = lines
+                h, y, lines, asof = PL.parse_statement(data=f.getvalue(), name=f.name)
+                used = "yes"
+                prev = pl_asof.get((h, y))
+                if prev is not None and prev >= asof:
+                    used = "no - older as-of than another file for this year"
+                else:
+                    if prev is not None:
+                        used = "yes - replaced an earlier as-of for this year"
+                    pl_parsed.setdefault(h, {})[y] = lines
+                    pl_asof[(h, y)] = asof
                 pl_rows.append({"File": f.name, "Hotel": h, "Year": y,
-                                "Lines read": len(lines)})
+                                "As of": "{}/{}".format(asof[0], asof[1]),
+                                "Lines read": len(lines), "Used": used})
             except Exception as exc:
                 pl_problems.append("{}: {}".format(f.name, exc))
                 pl_rows.append({"File": f.name, "Hotel": "COULD NOT READ",
-                                "Year": None, "Lines read": 0})
+                                "Year": None, "As of": "", "Lines read": 0,
+                                "Used": "no"})
 
         # always show what every file resolved to - this is where surprises show up
         with st.expander("Files read  ({} uploaded, {} hotel(s) found)".format(
@@ -5428,8 +5435,17 @@ with tab_pl:
             hotel_pick = st.selectbox("Hotel", sorted(pl_parsed), key="pl_hotel")
             per_year = pl_parsed[hotel_pick]
             years = sorted(per_year)
+            years = years[-PL.MAX_YEARS:]
+            per_year = {y: per_year[y] for y in years}
             st.success("**{}** - {} year(s): {}".format(
                 hotel_pick, len(years), ", ".join(str(y) for y in years)))
+            if len(years) == 1:
+                st.info(
+                    "Each operating statement covers **one year**, so one file gives "
+                    "one column. To get 10 years, upload 10 statements for this hotel "
+                    "- one per year end. Check the 'Files read' table above to confirm "
+                    "every file was picked up and resolved to the year you expect."
+                )
 
             WANT = ["Total Revenue", "Room", "Food & Beverage", "Miscellaneous",
                     "Rental Income", "Operating Profit or Loss",

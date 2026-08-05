@@ -34,6 +34,7 @@ from openpyxl.utils import get_column_letter as gcl
 # --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
+MAX_YEARS = 10                  # keep at most this many years, most recent first
 VAR_PCT = 0.10                  # flag when |actual-budget| / budget exceeds this
 VAR_MIN = 5000                  # ...and the dollar swing exceeds this
 
@@ -124,7 +125,11 @@ def _num(sheet, r, c):
 
 
 def parse_statement(path=None, *, data: bytes = None, name: str = ""):
-    """-> (hotel, year, [Line, ...])  from a file path or raw .xls bytes."""
+    """-> (hotel, year, [Line, ...], (month, day))  from a path or raw .xls bytes.
+
+    The 4th value is the statement's "As of" month/day. If someone uploads twelve
+    monthly exports for one year they all carry the same year, so the caller keeps
+    whichever has the latest as-of date - that is the most complete YTD."""
     if data is not None:
         book = xlrd.open_workbook(file_contents=data)
         path = Path(name or "uploaded.xls")
@@ -132,14 +137,15 @@ def parse_statement(path=None, *, data: bytes = None, name: str = ""):
         book = xlrd.open_workbook(str(path), on_demand=False)
     sh = book.sheet_by_index(0)
 
-    hotel, year = None, None
+    hotel, year, asof = None, None, (0, 0)
     for r in range(min(sh.nrows, 12)):
         g = str(_txt(sh, r, 6))
         if "Property:" in g and "Operating" in g and hotel is None:
             hotel = g.split("Property:")[-1].strip()
-        m = re.search(r"As of\s+\d{1,2}/\d{1,2}/(\d{4})", g)
+        m = re.search(r"As of\s+(\d{1,2})/(\d{1,2})/(\d{4})", g)
         if m:
-            year = int(m.group(1))
+            asof = (int(m.group(1)), int(m.group(2)))
+            year = int(m.group(3))
     if hotel is None:
         for r in range(min(sh.nrows, 12)):
             g = str(_txt(sh, r, 6))
@@ -175,7 +181,7 @@ def parse_statement(path=None, *, data: bytes = None, name: str = ""):
                           act or 0.0, bud or 0.0,
                           low.startswith("total") or "profit or loss" in low
                           or low.startswith("net income")))
-    return hotel, year, lines
+    return hotel, year, lines, asof
 
 
 # --------------------------------------------------------------------------
@@ -257,24 +263,39 @@ def _apply_variance_rules(ws, years, first_data_row, last_row, first_col=2):
         ws.conditional_formatting.add(rng, FormulaRule(formula=[under[1:]], fill=FILL_GOOD))
 
 
-def _add_charts(ws, years, at, start_row):
-    """A small year-by-year block under the grid, plus three charts off it."""
-    from openpyxl.chart import BarChart, LineChart, Reference
+def _summary_value(data, order, yr, label, budget=False):
+    """Look up one Summary-page line for one year. Returns a real number."""
+    for key, ln in order.items():
+        if ln.page == "Summary" and ln.label.lower() == label.lower():
+            a, b = data.get(yr, {}).get(key, (0.0, 0.0))
+            return b if budget else a
+    return 0.0
 
-    METRICS = [("Total Revenue", "total revenue"),
-               ("Room", "room"),
-               ("Food & Beverage", "food & beverage"),
-               ("Miscellaneous", "miscellaneous"),
-               ("Rental Income", "rental income"),
-               ("Operating Profit", "operating profit or loss"),
-               ("Net Income", "net income or loss"),
-               ("Total Revenue Budget", "total revenue")]
+
+def _add_charts(ws, years, data, order, start_row):
+    """Chart-feed block plus the charts.
+
+    The feed holds LITERAL numbers, not formulas. openpyxl cannot write cached
+    formula results, and an Excel chart plots the cached value - so a feed built
+    from formulas renders as a completely empty chart.
+    """
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart.marker import Marker
+
+    METRICS = [("Total Revenue", "Total Revenue", False),
+               ("Room", "Room", False),
+               ("Food & Beverage", "Food & Beverage", False),
+               ("Miscellaneous", "Miscellaneous", False),
+               ("Rental Income", "Rental Income", False),
+               ("Operating Profit", "Operating Profit or Loss", False),
+               ("Net Income", "Net Income or Loss", False),
+               ("Total Revenue Budget", "Total Revenue", True)]
 
     hdr = start_row
-    ws.cell(row=hdr, column=1, value="YEAR-OVER-YEAR DATA  (feeds the charts)").font = F_SECT
+    ws.cell(row=hdr, column=1, value="CHART DATA").font = F_SECT
     ws.cell(row=hdr, column=1).border = Border(bottom=thin)
     ws.cell(row=hdr + 1, column=1, value="Year").font = F_HDR
-    for j, (title, _) in enumerate(METRICS):
+    for j, (title, _lab, _b) in enumerate(METRICS):
         c = ws.cell(row=hdr + 1, column=2 + j, value=title)
         c.font, c.alignment = F_HDR, Alignment(horizontal="right", wrap_text=True)
         c.border = Border(bottom=thin)
@@ -284,20 +305,17 @@ def _add_charts(ws, years, at, start_row):
         r = hdr + 2 + i
         ws.cell(row=r, column=1, value=yr).number_format = '0'
         ws.cell(row=r, column=1).font = F_LBL
-        src_a = gcl(2 + i * 4)          # Actual column for this year in the grid above
-        src_b = gcl(3 + i * 4)          # Budget column
-        for j, (title, key) in enumerate(METRICS):
-            row_in_grid = at.get(key)
-            col = src_b if title.endswith("Budget") else src_a
+        for j, (title, label, is_bud) in enumerate(METRICS):
             cell = ws.cell(row=r, column=2 + j,
-                           value=f"={col}{row_in_grid}" if row_in_grid else 0)
+                           value=_summary_value(data, order, yr, label, is_bud))
             cell.number_format, cell.font = MONEY, F_LBL
 
     first, last = hdr + 2, hdr + 1 + len(years)
     cats = Reference(ws, min_col=1, min_row=first, max_row=last)
     anchor_row = last + 2
+    single = len(years) < 2          # one data point cannot draw a line
 
-    def place(chart, title, col_idxs, anchor, kind="bar", stacked=False):
+    def place(chart, title, col_idxs, anchor, stacked=False):
         chart.title = title
         chart.height, chart.width = 8.5, 17
         chart.y_axis.numFmt = '#,##0'
@@ -306,30 +324,35 @@ def _add_charts(ws, years, at, start_row):
             chart.add_data(Reference(ws, min_col=ci, min_row=first - 1, max_row=last),
                            titles_from_data=True)
         chart.set_categories(cats)
-        if kind == "bar":
+        if isinstance(chart, BarChart):
             chart.type = "col"
             if stacked:
                 chart.grouping, chart.overlap = "stacked", 100
+        else:
+            for ser in chart.series:          # markers, so single points show
+                ser.marker = Marker(symbol="circle", size=7)
+                ser.smooth = False
         ws.add_chart(chart, anchor)
 
-    place(BarChart(), "TOTAL REVENUE  —  ACTUAL vs BUDGET", [2, 9], f"A{anchor_row}")
+    place(BarChart(), "TOTAL REVENUE  -  ACTUAL vs BUDGET", [2, 9], f"A{anchor_row}")
     place(BarChart(), "REVENUE MIX BY DEPARTMENT", [3, 4, 5, 6],
           f"K{anchor_row}", stacked=True)
-    place(LineChart(), "OPERATING PROFIT & NET INCOME", [7, 8], f"A{anchor_row + 18}")
+    place(BarChart() if single else LineChart(),
+          "OPERATING PROFIT & NET INCOME", [7, 8], f"A{anchor_row + 18}")
 
 
-def _sheet_header(ws, hotel, title, note):
-    ws["A1"] = f"{hotel}  —  {title}"
+def _sheet_header(ws, hotel, title):
+    ws["A1"] = f"{hotel}  -  {title}"
     ws["A1"].font = F_TITLE
-    ws["A2"] = note
-    ws["A2"].font = F_SUB
     ws.column_dimensions["A"].width = 44
     ws.sheet_view.showGridLines = False
 
 
 def build_workbook(hotel, per_year, out_path: Path, sources=None):
-    # only the years we actually have a statement for - never zero-filled
-    years = span = sorted(per_year)
+    # only the years we actually have a statement for - never zero-filled,
+    # capped at the most recent MAX_YEARS
+    years = sorted(per_year)
+    span = years[-MAX_YEARS:]
 
     data = defaultdict(dict)
     order = OrderedDict()          # key -> (page, section, label, is_total)
@@ -343,9 +366,7 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
 
     # ---- Summary ---------------------------------------------------------
     ws = wb.create_sheet("Summary")
-    _sheet_header(ws, hotel, "SUMMARY",
-                  f"One column block per year you have a statement for. "
-                  f"Variance highlights when the gap tops {VAR_PCT:.0%} and ${VAR_MIN:,}. Charts are below.")
+    _sheet_header(ws, hotel, "SUMMARY")
     _year_header(ws, span, 4)
     rows, used = [], set()
     for heading, labels in SUMMARY_GROUPS:
@@ -378,7 +399,7 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
                                value=f'=IF({c}{rev}=0,"",{c}{src}/{c}{rev})')
                 cell.number_format, cell.font = '0.0%', F_LBL
     ws.freeze_panes = "B6"
-    _add_charts(ws, span, at, end + 5)
+    _add_charts(ws, span, data, order, end + 5)
 
     # ---- department tabs -------------------------------------------------
     tabs = OrderedDict()
@@ -389,9 +410,7 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
     for tab in ["Rooms", "Food", "Beverage", "Miscellaneous"]:
         items = tabs.get(tab, [])
         ws = wb.create_sheet(tab)
-        _sheet_header(ws, hotel, tab.upper(),
-                      "Actual and Budget come straight from the operating statements. "
-                      "Projected is yours to fill in. Var = Actual - Budget.")
+        _sheet_header(ws, hotel, tab.upper())
         _year_header(ws, span, 4)
         rows, cur = [], None
         for key, ln in items:
@@ -405,9 +424,7 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
 
     # ---- Fixed Expenses --------------------------------------------------
     ws = wb.create_sheet("Fixed Expenses")
-    _sheet_header(ws, hotel, "FIXED EXPENSES",
-                  "Real estate taxes and insurance only — corporate and payroll taxes "
-                  "are deliberately excluded.")
+    _sheet_header(ws, hotel, "FIXED EXPENSES")
     _year_header(ws, span, 4)
     rows = [(None, "FIXED EXPENSES", False)]
     fx = [f.lower() for f in FIXED_LINES]
@@ -453,14 +470,20 @@ def main():
 
     hotels = defaultdict(dict)
     srcmap = defaultdict(dict)
+    asofmap = defaultdict(dict)
     for p in files:
         try:
-            hotel, year, lines = parse_statement(p)
+            hotel, year, lines, asof = parse_statement(p)
         except Exception as e:                                  # noqa: BLE001
             print(f"  SKIPPED {p.name}: {e}")
             continue
+        prev = asofmap[hotel].get(year)
+        if prev is not None and prev >= asof:
+            print(f"  read {p.name:52} -> {hotel} {year} (older as-of, ignored)")
+            continue
         hotels[hotel][year] = lines
         srcmap[hotel][year] = p.name
+        asofmap[hotel][year] = asof
         print(f"  read {p.name:52} -> {hotel} {year} ({len(lines)} lines)")
 
     for hotel, per_year in hotels.items():
