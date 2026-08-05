@@ -5381,7 +5381,6 @@ with tab_pl:
         "Ten files for one hotel gives you ten years."
     )
 
-    import altair as alt
     import hotel_pl_tool as PL
 
     pl_files = st.file_uploader(
@@ -5452,22 +5451,34 @@ with tab_pl:
                            "Upload more years to see the trend.")
 
             def _dotline(frame, title, y_title="$"):
+                """Line + dot chart drawn from a raw Vega-Lite spec.
+
+                Deliberately does NOT use altair: altair 5.5 fails to import on
+                Python 3.14 (TypedDict closed=True), and st.line_chart routes
+                through it too. st.vega_lite_chart takes a plain dict, and
+                Streamlit only imports altair lazily, so this path never touches
+                it.
+                """
                 long = frame.reset_index().melt(
                     "Year", var_name="Series", value_name="Value").dropna(subset=["Value"])
-                chart = (
-                    alt.Chart(long, title=title)
-                    .mark_line(point=alt.OverlayMarkDef(size=80, filled=True))
-                    .encode(
-                        x=alt.X("Year:O", title=None),
-                        y=alt.Y("Value:Q", title=y_title, axis=alt.Axis(format="~s")),
-                        color=alt.Color("Series:N", title=None,
-                                        legend=alt.Legend(orient="bottom")),
-                        tooltip=["Year:O", "Series:N",
-                                 alt.Tooltip("Value:Q", format=",.0f")],
-                    )
-                    .properties(height=300)
-                )
-                st.altair_chart(chart, use_container_width=True)
+                spec = {
+                    "title": title,
+                    "height": 300,
+                    "mark": {"type": "line", "point": {"size": 80, "filled": True}},
+                    "encoding": {
+                        "x": {"field": "Year", "type": "ordinal", "title": None},
+                        "y": {"field": "Value", "type": "quantitative",
+                              "title": y_title, "axis": {"format": "~s"}},
+                        "color": {"field": "Series", "type": "nominal", "title": None,
+                                  "legend": {"orient": "bottom"}},
+                        "tooltip": [
+                            {"field": "Year", "type": "ordinal"},
+                            {"field": "Series", "type": "nominal"},
+                            {"field": "Value", "type": "quantitative", "format": ",.0f"},
+                        ],
+                    },
+                }
+                st.vega_lite_chart(long, spec, use_container_width=True)
 
             c1, c2 = st.columns(2)
             with c1:
