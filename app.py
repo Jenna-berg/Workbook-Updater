@@ -5391,14 +5391,34 @@ with tab_pl:
     if not pl_files:
         st.info("Drop your operating statements above to get started.")
     else:
-        pl_parsed, pl_problems = {}, []
+        pl_parsed, pl_problems, pl_rows, pl_dupes = {}, [], [], []
         for f in pl_files:
             try:
                 h, y, lines = PL.parse_statement(data=f.getvalue(), name=f.name)
+                if y in pl_parsed.get(h, {}):
+                    pl_dupes.append("{} - {} {} was already loaded from another file"
+                                    .format(f.name, h, y))
                 pl_parsed.setdefault(h, {})[y] = lines
+                pl_rows.append({"File": f.name, "Hotel": h, "Year": y,
+                                "Lines read": len(lines)})
             except Exception as exc:
                 pl_problems.append("{}: {}".format(f.name, exc))
+                pl_rows.append({"File": f.name, "Hotel": "COULD NOT READ",
+                                "Year": None, "Lines read": 0})
 
+        # always show what every file resolved to - this is where surprises show up
+        with st.expander("Files read  ({} uploaded, {} hotel(s) found)".format(
+                len(pl_files), len(pl_parsed)), expanded=len(pl_parsed) != 1):
+            st.dataframe(pd.DataFrame(pl_rows), use_container_width=True, hide_index=True)
+            if len(pl_parsed) > 1:
+                st.warning(
+                    "More than one hotel name was found, so the years are split "
+                    "between them. If these are all the same property, the report "
+                    "headers differ - check the Hotel column above."
+                )
+
+        for msg in pl_dupes:
+            st.warning("Duplicate - " + msg)
         for msg in pl_problems:
             st.warning("Skipped - " + msg)
 

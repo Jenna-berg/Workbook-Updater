@@ -148,6 +148,7 @@ def parse_statement(path=None, *, data: bytes = None, name: str = ""):
                 break
     if hotel is None or year is None:
         raise ValueError(f"{path.name}: could not read hotel name / year from header")
+    hotel = re.sub(r"\s+", " ", hotel).strip()   # header spacing varies between exports
 
     lines, page_title, section = [], None, None
     seen_page_header = False
