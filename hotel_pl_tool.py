@@ -3,8 +3,8 @@ Hotel P&L Builder
 =================
 
 Reads a folder of Operating Statement .xls exports and builds one formatted
-Excel P&L workbook per hotel, showing 10 years of Actual vs Budget vs Projected
-with large variances highlighted.
+Excel P&L workbook per hotel, showing Actual vs Budget vs Projected for every
+year you have a statement for, with large variances highlighted.
 
     python hotel_pl_tool.py --input "C:\\path\\to\\statements" --output "C:\\path\\out"
 
@@ -34,7 +34,6 @@ from openpyxl.utils import get_column_letter as gcl
 # --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
-YEARS_BACK = 10                 # only used when --pad is passed
 VAR_PCT = 0.10                  # flag when |actual-budget| / budget exceeds this
 VAR_MIN = 5000                  # ...and the dollar swing exceeds this
 
@@ -327,13 +326,9 @@ def _sheet_header(ws, hotel, title, note):
     ws.sheet_view.showGridLines = False
 
 
-def build_workbook(hotel, per_year, out_path: Path, sources=None, pad=False):
-    years = sorted(per_year)
-    if pad:
-        last = max(years)
-        span = list(range(last - YEARS_BACK + 1, last + 1))
-    else:
-        span = years
+def build_workbook(hotel, per_year, out_path: Path, sources=None):
+    # only the years we actually have a statement for - never zero-filled
+    years = span = sorted(per_year)
 
     data = defaultdict(dict)
     order = OrderedDict()          # key -> (page, section, label, is_total)
@@ -348,7 +343,7 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None, pad=False):
     # ---- Summary ---------------------------------------------------------
     ws = wb.create_sheet("Summary")
     _sheet_header(ws, hotel, "SUMMARY",
-                  f"Actual vs Budget for every year you have a statement for. "
+                  f"One column block per year you have a statement for. "
                   f"Variance highlights when the gap tops {VAR_PCT:.0%} and ${VAR_MIN:,}. Charts are below.")
     _year_header(ws, span, 4)
     rows, used = [], set()
@@ -445,8 +440,6 @@ def main():
     ap = argparse.ArgumentParser(description="Build hotel P&L workbooks from operating statements.")
     ap.add_argument("--input", required=True, help="folder containing .xls operating statements")
     ap.add_argument("--output", default=None, help="output folder (default: alongside input)")
-    ap.add_argument("--pad", action="store_true",
-                    help="pad out to 10 year columns, zero-filling years with no file")
     a = ap.parse_args()
 
     src = Path(a.input)
@@ -472,11 +465,9 @@ def main():
     for hotel, per_year in hotels.items():
         safe = re.sub(r"[^\w\- ]", "", hotel).strip() or "Hotel"
         dest = out / f"{safe} - P&L.xlsx"
-        span = build_workbook(hotel, per_year, dest, srcmap[hotel], a.pad)
-        missing = [y for y in span if y not in per_year]
-        print(f"\n{hotel}: {span[0]}-{span[-1]}  ->  {dest.name}")
-        print(f"  years with data : {sorted(per_year)}")
-        print(f"  zero-filled     : {missing if missing else 'none'}")
+        span = build_workbook(hotel, per_year, dest, srcmap[hotel])
+        print(f"\n{hotel}: {len(span)} year(s)  ->  {dest.name}")
+        print(f"  years included : {span}")
 
 
 if __name__ == "__main__":

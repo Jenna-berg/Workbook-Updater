@@ -5512,13 +5512,10 @@ with tab_pl:
                 st.dataframe(pl_df.style.format("{:,.2f}"), use_container_width=True)
 
             st.divider()
-            pl_pad = st.checkbox(
-                "Pad out to 10 year columns (zero-fill years with no statement)",
-                value=False, key="pl_pad")
             if st.button("Build P&L Workbook", key="pl_build", type="primary"):
                 try:
                     buf = io.BytesIO()
-                    PL.build_workbook(hotel_pick, per_year, buf, {}, pl_pad)
+                    PL.build_workbook(hotel_pick, per_year, buf, {})
                     safe_name = re.sub(r"[^A-Za-z0-9 -]", "", hotel_pick).strip() or "Hotel"
                     st.download_button(
                         "Download P&L Workbook",
