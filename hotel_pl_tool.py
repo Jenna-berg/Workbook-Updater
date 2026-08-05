@@ -234,14 +234,10 @@ def _write_grid(ws, rows, years, data, start_row, first_col=2, at=None):
             for cell in (a, b, p, v):
                 cell.number_format = fmt
                 cell.font = F_TOT if is_total else F_LBL
-                if band:
-                    cell.fill = FILL_ALT
             p.font = F_INPB if is_total else F_INP
             if is_total:
                 for cell in (a, b, p, v):
                     cell.border = Border(top=hair)
-        if band:
-            lc.fill = FILL_ALT
         if at is not None:
             at.setdefault(label.strip().lower(), r)
         band = not band
@@ -345,7 +341,7 @@ def _sheet_header(ws, hotel, title):
     ws["A1"] = f"{hotel}  -  {title}"
     ws["A1"].font = F_TITLE
     ws.column_dimensions["A"].width = 44
-    ws.sheet_view.showGridLines = False
+    ws.sheet_view.showGridLines = True
 
 
 def build_workbook(hotel, per_year, out_path: Path, sources=None):
