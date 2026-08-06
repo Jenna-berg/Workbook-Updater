@@ -2628,7 +2628,9 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
 
 
 def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name):
-    """Fill one ROB sheet tab with historical data."""
+    """Fill one ROB sheet tab with historical data.
+    Preserves formulas from master template — only overwrites cells with values.
+    """
     from openpyxl.utils import get_column_letter
 
     target_idx  = target_month.month - 1   # 0-based (Jul = 6)
@@ -2674,6 +2676,9 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                 for dr in data_offsets:
                     r = block_start + dr
                     for c in [2, 3, 4, 5]:
+                        # Skip if master template has a formula in this cell
+                        if is_formula(str(new_ws.cell(r, c).value)):
+                            continue
                         v = prev_ws.cell(r, c).value
                         if v is not None and not is_formula(str(v)) and not is_datelike(v):
                             new_ws.cell(r, c).value = v
@@ -2681,6 +2686,9 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                 for dr in data_offsets:
                     r = block_start + dr
                     for c in [2, 3, 4, 5]:
+                        # Skip if master template has a formula in this cell
+                        if is_formula(str(new_ws.cell(r, c).value)):
+                            continue
                         col_ltr = get_column_letter(c)
                         new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
 
@@ -2695,12 +2703,18 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                     for dr in data_offsets:
                         r = block_start + dr
                         for ly_col, new_col in ly_to_new.items():
+                            # Skip if master template has a formula in this cell
+                            if is_formula(str(new_ws.cell(r, new_col).value)):
+                                continue
                             v = ly_ws.cell(r, ly_col).value
                             if v is not None and not is_formula(str(v)) and not is_datelike(v):
                                 new_ws.cell(r, new_col).value = v
                     ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
                     for dr in [4, 5, 6]:
                         r = block_start + dr
+                        # Skip if master template has a formula in this cell
+                        if is_formula(str(new_ws.cell(r, 8).value)):
+                            continue
                         v = ly_ws.cell(r, ly_sec_col).value
                         if v is not None and not is_formula(str(v)) and not is_datelike(v):
                             new_ws.cell(r, 8).value = v
@@ -2708,6 +2722,9 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                 for dr in data_offsets:
                     r = block_start + dr
                     for c in [2, 3, 4, 5]:
+                        # Skip if master template has a formula in this cell
+                        if is_formula(str(new_ws.cell(r, c).value)):
+                            continue
                         col_ltr = get_column_letter(c)
                         new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
 
@@ -2720,12 +2737,18 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
             for dr in data_offsets:
                 r = block_start + dr
                 for ly_col, new_col in ly_to_new.items():
+                    # Skip if master template has a formula in this cell
+                    if is_formula(str(new_ws.cell(r, new_col).value)):
+                        continue
                     v = ly_ws.cell(r, ly_col).value
                     if v is not None and not is_formula(str(v)) and not is_datelike(v):
                         new_ws.cell(r, new_col).value = v
             ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
             for dr in [4, 5, 6]:
                 r = block_start + dr
+                # Skip if master template has a formula in this cell
+                if is_formula(str(new_ws.cell(r, 8).value)):
+                    continue
                 v = ly_ws.cell(r, ly_sec_col).value
                 if v is not None and not is_formula(str(v)) and not is_datelike(v):
                     new_ws.cell(r, 8).value = v
