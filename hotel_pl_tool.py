@@ -36,6 +36,10 @@ from openpyxl.utils import get_column_letter as gcl
 # --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
+# bump this whenever the output format changes - the app shows it, so you
+# can tell at a glance whether Streamlit Cloud is running the new build
+__version__ = "2026-08-06 · CC palette, per-tab charts, hidden feed"
+
 MAX_YEARS = 10                  # keep at most this many years, most recent first
 VAR_PCT = 0.10                  # flag when |actual-budget| / budget exceeds this
 VAR_MIN = 5000                  # ...and the dollar swing exceeds this

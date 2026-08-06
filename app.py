@@ -5382,6 +5382,7 @@ with tab_pl:
     )
 
     import hotel_pl_tool as PL
+    st.caption("Builder version: **{}**".format(getattr(PL, "__version__", "unknown")))
 
     pl_files = st.file_uploader(
         "Operating statements (.xls)", type=["xls"],
