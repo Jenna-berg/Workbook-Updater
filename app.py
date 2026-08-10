@@ -239,6 +239,14 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
     current_month = today.month
     current_year = today.year
     changes = []
+    # Rows per month block, read off this sheet rather than assumed — hotels
+    # with a Permanent-rooms section use 11-row blocks, not 8, and every row
+    # below is relative to it.
+    block_step = rob_block_step(ws)
+    # Last writable row = the final row of the Dec block. For the usual 8-row
+    # layout this is 99, so `>= 100` behaves exactly as the old hardcoded
+    # guard did; an 11-row sheet correctly allows through row 135.
+    max_data_row = 4 + block_step * 12
 
     # E4 = as-of date
     changes.append({
@@ -260,7 +268,7 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
             continue
 
         month_index = month - 1
-        block_start = 4 + 8 * month_index
+        block_start = 4 + block_step * month_index
 
         rev     = safe_float(row[5])
         rms     = safe_float(row[1])
@@ -293,8 +301,8 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
 
         for r, c, label, val, is_formula_write in entries:
             skip = None
-            if r >= 100:
-                skip = "row≥100"
+            if r >= max_data_row:
+                skip = f"row≥{max_data_row}"
             elif not is_formula_write and is_formula(ws.cell(r, c).value):
                 skip = "formula"
             changes.append({"row": r, "col": c, "label": label, "month": month,
@@ -353,6 +361,81 @@ def _is_done_color(rgb_value) -> bool:
     return isinstance(rgb_value, str) and rgb_value[-6:].upper() == DONE_TAB_HEX
 
 
+_MONTH_LABELS = {m.lower(): i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+_MONTH_LABELS.update({m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"])})
+ROB_DEFAULT_BLOCK_STEP = 8
+
+
+def rob_block_step(ws, default=ROB_DEFAULT_BLOCK_STEP):
+    """Rows per month block on a ROB week tab, read off the sheet.
+
+    Most ROBs use 8 rows per month (Revenue/Room Nights/ADR/Group x3/Pickup),
+    but hotels with a Permanent-rooms section (airline crew contracts) use 11
+    — they carry three extra rows (Perm Rms Sold / Perm Rm Rev / Perm ADR).
+    Assuming 8 everywhere makes every row calculation land inside the wrong
+    month on those sheets: on an 11-row ROB the "August" block computes to
+    row 60, which is actually inside June.
+
+    Derived from the Jan/Feb month labels in column A and cross-checked
+    against Mar, so a sheet that doesn't look like a ROB falls back to the
+    historical constant rather than guessing.
+    """
+    found = {}
+    for r in range(1, 200):
+        v = ws.cell(r, 1).value
+        if not isinstance(v, str):
+            continue
+        idx = _MONTH_LABELS.get(v.strip().lower())
+        if idx is not None and idx not in found:
+            found[idx] = r
+    if 0 in found and 1 in found:
+        step = found[1] - found[0]
+        if 2 in found and found[2] - found[1] != step:
+            return default            # spacing isn't uniform — don't trust it
+        if 4 <= step <= 20:
+            return step
+    return default
+
+
+def _rob_week_taken_reason(ws, block_start):
+    """Why this week tab is unavailable, or None if it's free to write to.
+
+    A zero is not data. These templates render empty currency cells as "$ -"
+    (a literal 0), so testing `isinstance(v, (int, float))` alone counts an
+    untouched month as filled and silently skips the tab.
+    """
+    tc = ws.sheet_properties.tabColor
+    if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+        return "tab marked done (green)"
+    rev = ws.cell(block_start + 1, 5).value
+    rms = ws.cell(block_start + 2, 5).value
+
+    def filled(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0
+
+    if filled(rev) or filled(rms):
+        return (f"already has this month's data "
+                f"(E{block_start+1}={rev!r}, E{block_start+2}={rms!r})")
+    return None
+
+
+def rob_week_status(wb, sheet_names):
+    """[(sheet_name, reason_or_None), ...] — why each week tab was passed over.
+    Purely diagnostic; drives the 'why did it skip a week' caption in the UI.
+    """
+    month = datetime.date.today().month
+    out = []
+    for name in sheet_names:
+        ws = wb[name]
+        block_start = 4 + rob_block_step(ws) * (month - 1)
+        out.append((name, _rob_week_taken_reason(ws, block_start)))
+    return out
+
+
 def first_uncolored_sheet(wb, sheet_names):
     """Return the first ROB week tab that is neither marked done (our green)
     nor already holding real data in this month's block.
@@ -366,18 +449,12 @@ def first_uncolored_sheet(wb, sheet_names):
     overwritten because its tab color didn't match). Checking actual data in
     the cells this month's update is about to write closes that gap.
     """
-    today = datetime.date.today()
-    block_start = 4 + 8 * (today.month - 1)
+    month = datetime.date.today().month
     for name in sheet_names:
         ws = wb[name]
-        tc = ws.sheet_properties.tabColor
-        if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
-            continue
-        rev = ws.cell(block_start + 1, 5).value
-        rms = ws.cell(block_start + 2, 5).value
-        if isinstance(rev, (int, float)) or isinstance(rms, (int, float)):
-            continue
-        return name
+        block_start = 4 + rob_block_step(ws) * (month - 1)
+        if _rob_week_taken_reason(ws, block_start) is None:
+            return name
     return sheet_names[-1]  # fallback: last sheet
 
 
@@ -4358,6 +4435,10 @@ if test_mode:
 
             sheet_choice = st.selectbox("Week tab", ROB_SHEETS, key="rob_sheet")
             st.caption(f"Auto-detected next tab: **{auto_sheet}**")
+            _passed = [f"{n} — {why}" for n, why in rob_week_status(wb, ROB_SHEETS)
+                       if why and n != auto_sheet]
+            if _passed:
+                st.caption("Skipped: " + "; ".join(_passed))
     
             if st.button("Preview Changes", key="rob_preview"):
                 ws = wb[sheet_choice]
@@ -4922,6 +5003,12 @@ with tab_weekly:
                 sheet    = auto or avail[0]
                 changes  = build_rob_change_plan(df, wb[sheet], grp_npu_rev_override=grp_npu_rev_override)
                 warnings = []
+                # Say which weeks were passed over and why — a silently skipped
+                # week tab is otherwise invisible until someone spots the gap.
+                _passed = [f"{n} ({why})" for n, why in rob_week_status(wb, avail)
+                           if why and n != sheet]
+                if _passed:
+                    warnings.append(f"Writing to '{sheet}'. Skipped: " + "; ".join(_passed))
             elif wb_type == "Strategy Report":
                 avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
                 auto     = first_undone_strategy_sheet(wb, avail)
