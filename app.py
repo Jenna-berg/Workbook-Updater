@@ -2714,31 +2714,60 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
     prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
     # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
     ly_to_new    = {3: 2, 4: 3, 5: 4}
-    data_offsets = [1, 2, 3, 4, 5, 6, 7]  # offset 0 (date header) handled separately
+    # Rows per month block, read off each sheet rather than assumed (8 for most
+    # hotels, 11 where there's a Permanent-rooms section). Last year's workbook
+    # is measured separately so a template change between years can't shift the
+    # rows we read from.
+    step         = rob_block_step(new_ws)
+    ly_step      = rob_block_step(ly_ws) if ly_ws is not None else step
+    data_offsets = list(range(1, step))    # offset 0 (date header) handled separately
 
-    # ── Build as-of dates once from LY ROB (same for every month block) ─────
-    # LY ROB cols 3,4,5 hold the prior 3 years' reporting dates → new cols 2,3,4
-    # Col 5 (current year) = the 1st of the target month
+    # ── As-of dates for this week tab ──────────────────────────────────────
+    # Taken from row 4 of THIS sheet's counterpart in last year's ROB, so
+    # AUG2026 'wk two' gets its 2023/2024/2025 reporting dates from AUG2025
+    # 'wk two'. Each week was reported roughly seven days apart, so these must
+    # never be shared between tabs.
+    #
+    # Row 4 specifically: it holds the literal dates, while every month block
+    # below it chains upward (=B4, =B52, ...). Reading a lower block instead
+    # picks up the chain formula itself on most sheets — and on some it picks
+    # up whatever else is parked in that cell (one real file has a revenue
+    # figure sitting in the Aug block's date position on 'wk two'). Requiring
+    # a real date type keeps that kind of stray number out of the header.
+    #
+    # Col 5 (current year) is a placeholder; the weekly update stamps the real
+    # as-of date when it runs.
     as_of_dates = {}
     if ly_ws:
-        ref_row = 4 + 8 * target_idx   # any block works; use target month block
         for ly_col, new_col in ly_to_new.items():
-            v = ly_ws.cell(ref_row, ly_col).value
-            if v is not None and not is_formula(str(v)):
+            v = ly_ws.cell(4, ly_col).value
+            # A never-used week tab carries Excel's zero date (1899-12-30),
+            # which is a real datetime and would otherwise be copied across as
+            # though it were a reporting date.
+            if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
                 as_of_dates[new_col] = v
     as_of_dates[5] = datetime.datetime(target_month.year, target_month.month, target_month.day)
 
     for month_idx in range(12):
-        block_start = 4 + 8 * month_idx
+        block_start = 4 + step * month_idx
 
-        # ── Date header row (offset 0): always write from computed as_of_dates ──
-        if is_wk_one:
-            for col, date_val in as_of_dates.items():
-                new_ws.cell(block_start, col).value = date_val
-        else:
-            for col in as_of_dates:
-                col_ltr = get_column_letter(col)
-                new_ws.cell(block_start, col).value = f"='{wk_one_sheet_name}'!{col_ltr}{block_start}"
+        # ── Date header row (offset 0) ─────────────────────────────────────
+        # Weeks 2+ used to get ='wk one'!<col><row> here, which forced every
+        # week tab to display wk one's reporting dates.
+        #
+        # Row 4 always gets the real date. Month blocks below it keep a
+        # same-sheet chain (=B4, =SUM(B12)) because that correctly carries
+        # THIS tab's date down the sheet — but a cross-sheet reference is
+        # overwritten, since pointing at another week's tab reintroduces the
+        # very problem being fixed (one real template chains its lower blocks
+        # to ='wk one'!B11).
+        for col, date_val in as_of_dates.items():
+            cell = new_ws.cell(block_start, col)
+            cur = str(cell.value) if cell.value is not None else ""
+            same_sheet_chain = is_formula(cur) and "!" not in cur
+            if block_start != 4 and same_sheet_chain:
+                continue
+            cell.value = date_val
 
         # ── Data rows (offsets 1–7) ───────────────────────────────────────────
         if month_idx < prev_idx:
