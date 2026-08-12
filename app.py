@@ -5590,69 +5590,6 @@ with tab_pl:
             _pl_metric(mcols[2], "Net Income {}".format(latest), "Net Income or Loss")
             _pl_metric(mcols[3], "ADR {}".format(latest), "A.D.R.", money=False)
 
-            st.subheader("Year over year")
-            if len(years) < 2:
-                st.caption("Only one year loaded, so each chart shows a single point. "
-                           "Upload more years to see the trend.")
-
-            def _dotline(frame, title, y_title="$"):
-                """Line + dot chart drawn from a raw Vega-Lite spec.
-
-                Deliberately does NOT use altair: altair 5.5 fails to import on
-                Python 3.14 (TypedDict closed=True), and st.line_chart routes
-                through it too. st.vega_lite_chart takes a plain dict, and
-                Streamlit only imports altair lazily, so this path never touches
-                it.
-                """
-                long = frame.reset_index().melt(
-                    "Year", var_name="Series", value_name="Value").dropna(subset=["Value"])
-                spec = {
-                    "title": title,
-                    "height": 300,
-                    "mark": {"type": "line", "point": {"size": 80, "filled": True}},
-                    "encoding": {
-                        "x": {"field": "Year", "type": "ordinal", "title": None},
-                        "y": {"field": "Value", "type": "quantitative",
-                              "title": y_title, "axis": {"format": "~s"}},
-                        "color": {"field": "Series", "type": "nominal", "title": None,
-                                  "legend": {"orient": "bottom"}},
-                        "tooltip": [
-                            {"field": "Year", "type": "ordinal"},
-                            {"field": "Series", "type": "nominal"},
-                            {"field": "Value", "type": "quantitative", "format": ",.0f"},
-                        ],
-                    },
-                }
-                st.vega_lite_chart(long, spec, use_container_width=True)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                have = [c for c in ["Total Revenue", "Total Revenue (Budget)"]
-                        if c in pl_df.columns]
-                if have:
-                    _dotline(pl_df[have].rename(columns={
-                        "Total Revenue": "Actual",
-                        "Total Revenue (Budget)": "Budget"}),
-                        "Total Revenue - Actual vs Budget")
-            with c2:
-                have = [c for c in ["Room", "Food & Beverage", "Miscellaneous",
-                                    "Rental Income"] if c in pl_df.columns]
-                if have:
-                    _dotline(pl_df[have], "Revenue by Department")
-
-            c3, c4 = st.columns(2)
-            with c3:
-                have = [c for c in ["Operating Profit or Loss", "Net Income or Loss"]
-                        if c in pl_df.columns]
-                if have:
-                    _dotline(pl_df[have].rename(columns={
-                        "Operating Profit or Loss": "Operating Profit",
-                        "Net Income or Loss": "Net Income"}), "Profit")
-            with c4:
-                have = [c for c in ["A.D.R.", "REV PAR"] if c in pl_df.columns]
-                if have:
-                    _dotline(pl_df[have], "ADR & RevPAR")
-
             with st.expander("Show the underlying numbers"):
                 st.dataframe(pl_df.style.format("{:,.2f}"), use_container_width=True)
 

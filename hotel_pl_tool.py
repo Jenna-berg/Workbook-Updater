@@ -130,6 +130,11 @@ COUNT = '#,##0'
 COUNT_LINES = {"rooms available", "rooms sold"}
 PCT_LINES = {"occupancy"}
 W_LABEL, W_DATA = 46.3, 13
+
+# each year is three sections of two columns, matching the operating statement:
+#   YTD $  |  % of revenue  |  per occupied room     (Actual and Budget in each)
+SECTIONS = [("YTD", MONEY), ("%", PCT), ("YTD POR", RATIO)]
+COLS_PER_YEAR = 6
 H_TITLE, H_BAND = 18.75, 15.75
 
 
@@ -241,31 +246,40 @@ def parse_statement(path=None, *, data: bytes = None, name: str = ""):
 # workbook writing
 # --------------------------------------------------------------------------
 def _year_header(ws, years, start_row, first_col=2):
-    """Year banner over Actual / Budget / Projected / Var, both rows navy."""
-    ws.row_dimensions[start_row].height = H_BAND
-    ws.row_dimensions[start_row + 1].height = H_BAND
-    hc = ws.cell(row=start_row + 1, column=1)
-    hc.fill = FILL_NAVY
+    """Three header rows: the year, then YTD / % / YTD POR, then Actual|Budget."""
+    for rr in (start_row, start_row + 1, start_row + 2):
+        ws.row_dimensions[rr].height = H_BAND
+        ws.cell(row=rr, column=1).fill = FILL_NAVY
     for i, yr in enumerate(years):
-        c0 = first_col + i * 4
-        ws.merge_cells(start_row=start_row, start_column=c0,
-                       end_row=start_row, end_column=c0 + 3)
-        for j in range(4):
-            ws.cell(row=start_row, column=c0 + j).fill = FILL_NAVY
-        cell = ws.cell(row=start_row, column=c0, value=yr)
-        cell.font, cell.fill = F_YEAR, FILL_NAVY
-        cell.alignment = Alignment(horizontal="center")
-        cell.number_format = '0'
-        for j, h in enumerate(["Actual", "Budget", "Projected", "Var vs Bud"]):
-            c = ws.cell(row=start_row + 1, column=c0 + j, value=h)
-            c.font, c.fill = F_HDR, FILL_NAVY
-            c.alignment = Alignment(horizontal="left")
-            ws.column_dimensions[gcl(c0 + j)].width = W_DATA
+        y0 = first_col + i * COLS_PER_YEAR
+        ws.merge_cells(start_row=start_row, start_column=y0,
+                       end_row=start_row, end_column=y0 + COLS_PER_YEAR - 1)
+        for j in range(COLS_PER_YEAR):
+            ws.cell(row=start_row, column=y0 + j).fill = FILL_NAVY
+        yc = ws.cell(row=start_row, column=y0, value=yr)
+        yc.font, yc.fill = F_YEAR, FILL_NAVY
+        yc.alignment = Alignment(horizontal="center")
+        yc.number_format = '0'
+
+        for k, (name, _fmt) in enumerate(SECTIONS):
+            c0 = y0 + k * 2
+            ws.merge_cells(start_row=start_row + 1, start_column=c0,
+                           end_row=start_row + 1, end_column=c0 + 1)
+            for j in (0, 1):
+                ws.cell(row=start_row + 1, column=c0 + j).fill = FILL_NAVY
+            sc = ws.cell(row=start_row + 1, column=c0, value=name)
+            sc.font, sc.fill = F_HDR, FILL_NAVY
+            sc.alignment = Alignment(horizontal="center")
+            for j, h in enumerate(("Actual", "Budget")):
+                hc = ws.cell(row=start_row + 2, column=c0 + j, value=h)
+                hc.font, hc.fill = F_HDR, FILL_NAVY
+                hc.alignment = Alignment(horizontal="right")
+                ws.column_dimensions[gcl(c0 + j)].width = W_DATA
 
 
-def _write_grid(ws, rows, years, data, start_row, first_col=2, at=None):
-    """rows: list of (key, label, is_total). data: {year: {key: (act, bud)}}
-    `at` (optional dict) is filled with label.lower() -> row for chart wiring."""
+def _write_grid(ws, rows, years, data, start_row, first_col=2, at=None,
+                rowmap=None):
+    """rows: (key, label, is_total). Each year gets YTD $, % and POR, Actual+Budget."""
     r = start_row
     for key, label, is_total in rows:
         if key is None:                                   # section band
@@ -274,8 +288,8 @@ def _write_grid(ws, rows, years, data, start_row, first_col=2, at=None):
             r += 1
             continue
         low = label.strip().lower()
-        fmt = (PCT if low in PCT_LINES else COUNT if low in COUNT_LINES
-               else RATIO if low in RATIO_LINES else MONEY)
+        ytd_fmt = (PCT if low in PCT_LINES else COUNT if low in COUNT_LINES
+                   else RATIO if low in RATIO_LINES else MONEY)
         lc = ws.cell(row=r, column=1, value=label)
         if is_total:
             lc.font, lc.fill = F_TOTL, FILL_TEAL
@@ -283,148 +297,57 @@ def _write_grid(ws, rows, years, data, start_row, first_col=2, at=None):
         else:
             lc.font = F_LBL
         for i, yr in enumerate(years):
-            c0 = first_col + i * 4
-            act, bud = (data.get(yr, {}).get(key, (0.0,) * 6))[:2]
-            a = ws.cell(row=r, column=c0, value=act)
-            b = ws.cell(row=r, column=c0 + 1, value=bud)
-            p = ws.cell(row=r, column=c0 + 2, value=None)      # you fill this in
-            v = ws.cell(row=r, column=c0 + 3,
-                        value=f"={gcl(c0)}{r}-{gcl(c0+1)}{r}")
-            for cell in (a, b, p, v):
-                cell.number_format = fmt
+            y0 = first_col + i * COLS_PER_YEAR
+            vals = data.get(yr, {}).get(key, (0.0,) * 6)   # act,bud,pct,bpct,por,bpor
+            for j in range(6):
+                cell = ws.cell(row=r, column=y0 + j, value=vals[j])
+                sec = j // 2
+                cell.number_format = ytd_fmt if sec == 0 else SECTIONS[sec][1]
                 cell.font = F_TOT if is_total else F_LBL
                 if is_total:
                     cell.fill = FILL_PALE
         if at is not None:
             at.setdefault(low, r)
+        if rowmap is not None:
+            rowmap.append((r, key))
         r += 1
     return r
 
 
-def _apply_variance_rules(ws, years, first_data_row, last_row, first_col=2):
-    for i in range(len(years)):
-        c0 = first_col + i * 4
-        var, bud = gcl(c0 + 3), gcl(c0 + 1)
-        rng = f"{var}{first_data_row}:{var}{last_row}"
-        over = (f'=AND({bud}{first_data_row}<>0,'
-                f'ABS({var}{first_data_row})>{VAR_MIN},'
-                f'ABS({var}{first_data_row}/{bud}{first_data_row})>{VAR_PCT},'
-                f'{var}{first_data_row}<0)')
-        under = over.replace(f'{var}{first_data_row}<0)', f'{var}{first_data_row}>0)')
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[over[1:]], fill=FILL_BAD))
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[under[1:]], fill=FILL_GOOD))
+def _apply_flag_rules(ws, years, rowmap, order, first_col=2, threshold=FLAG_PCT):
+    """Shade the Actual cell when a green-marked line is off budget.
 
-
-
-def _fix_styles(raw: bytes) -> bytes:
-    """Repair two things openpyxl gets wrong in styles.xml.
-
-    1. It writes the default fill as a bare <patternFill/> with no patternType.
-       Excel requires fill 0 to be patternType="none"; without it the cell is
-       treated as a pattern fill with no colour and renders as an opaque white
-       block that paints over the gridlines. That is the "white boxes with no
-       outline" artefact.
-    2. It pads 6-digit colours to 00RRGGBB - a 00 ALPHA channel, i.e. fully
-       transparent. Excel's own files use FF.
+    Only the section its colour nominated is shaded - a line marked green in the
+    % column is judged on %, not on dollars. PCT_PAYROLL lines need total payroll
+    to evaluate, so they are flagged on the Summary instead.
     """
-    zin = zipfile.ZipFile(io.BytesIO(raw))
-    parts = {n: zin.read(n) for n in zin.namelist()}
-    # empty cells must not carry t="n" - Excel omits the type for numbers, and a
-    # numeric cell with no <v> is what makes the blank Projected column render as
-    # a white block instead of an ordinary empty cell
-    for name in parts:
-        if name.startswith("xl/worksheets/sheet"):
-            sx = parts[name].decode("utf8")
-            sx = sx.replace(' t="n"', "")
-            parts[name] = sx.encode("utf8")
-    st = parts["xl/styles.xml"].decode("utf8")
-    # any dxf solid fill missing bgColor would render white over the gridlines
-    def _dxf_bg(m):
-        block = m.group(0)
-        if "bgColor" in block:
-            return block
-        fg = re.search(r'<fgColor rgb="([0-9A-Fa-f]{8})"', block)
-        if not fg:
-            return block
-        return block.replace("</patternFill>",
-                             '<bgColor rgb="%s"/></patternFill>' % fg.group(1))
-    st = re.sub(r"<dxf>.*?</dxf>", _dxf_bg, st, flags=re.S)
-    st = re.sub(r"<patternFill\s*/>", '<patternFill patternType="none"/>', st)
-    st = re.sub(r'rgb="00([0-9A-Fa-f]{6})"',
-                lambda m: 'rgb="FF%s"' % m.group(1), st)
-    parts["xl/styles.xml"] = st.encode("utf8")
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
-        for n in zin.namelist():
-            zo.writestr(n, parts[n])
-    return out.getvalue()
+    SEC = {"YTD": 0, "PCT": 1, "POR": 2}
+    buckets = {}
+    for row, key in rowmap:
+        ln = order.get(key)
+        sp = SPEC.get(ln.spec_key) if ln is not None else None
+        if not sp or not sp["flag"]:
+            continue
+        sec = SEC.get(sp["basis"])
+        if sec is None:
+            continue
+        for i in range(len(years)):
+            buckets.setdefault((i, sec), []).append(row)
 
-
-
-def _axes(chart, money=True):
-    """Zero-based, labelled, dollar-formatted axes.
-
-    Two things openpyxl gets wrong by default: it leaves `delete` unset, so Excel
-    hides the axis labels entirely, and it lets the value axis auto-scale. On a
-    19.2M-vs-20.1M comparison auto-scaling starts the axis near 18M and turns a
-    4.6% miss into a bar half the height of its neighbour. Anchoring at zero
-    makes the bars proportional to the actual numbers.
-    """
-    from openpyxl.chart.axis import ChartLines
-    chart.y_axis.delete = False
-    chart.x_axis.delete = False
-    chart.y_axis.scaling.min = 0            # <- bars now read to scale
-    chart.y_axis.numFmt = '"$"#,##0'      # the $ on the tick labels is enough
-    chart.y_axis.majorGridlines = ChartLines()
-    chart.visible_cells_only = False       # feed rows are hidden - still plot them
-    chart.display_blanks = "gap"
-
-
-
-def _tab_chart(ws, years, at, label, title, feed_row, anchor):
-    """One Actual-vs-Budget bar chart for this tab's headline line.
-
-    Values are copied out of the grid as literals - a feed of formulas would
-    render as an empty chart, because openpyxl cannot write cached results.
-    """
-    from openpyxl.chart import BarChart, Reference
-
-    row = at.get(label.lower())
-    if row is None:
-        return
-    hdr = feed_row
-    hc = ws.cell(row=hdr, column=1, value="CHART DATA")
-    hc.font, hc.fill = F_SECT, FILL_NAVY
-    for j, t in enumerate(["Year", "Actual", "Budget"]):
-        c = ws.cell(row=hdr + 1, column=1 + j, value=t)
-        c.font, c.fill = F_HDR, FILL_NAVY
-    for i, yr in enumerate(years):
-        c0 = 2 + i * 4
-        r = hdr + 2 + i
-        ws.cell(row=r, column=1, value=yr).number_format = '0'
-        ws.cell(row=r, column=1).font = F_LBL
-        for j, src in enumerate((c0, c0 + 1)):
-            v = ws.cell(row=row, column=src).value
-            c = ws.cell(row=r, column=2 + j,
-                        value=v if isinstance(v, (int, float)) else 0)
-            c.number_format, c.font = MONEY, F_LBL
-
-    for rr in range(hdr, hdr + 2 + len(years)):
-        ws.row_dimensions[rr].hidden = True
-
-    first, last = hdr + 2, hdr + 1 + len(years)
-    ch = BarChart()
-    ch.type = "col"
-    ch.title = title
-    ch.height, ch.width = 8.5, 17
-    _axes(ch)
-    ch.legend.position = "b"
-    for ci in (2, 3):
-        ch.add_data(Reference(ws, min_col=ci, min_row=first - 1, max_row=last),
-                    titles_from_data=True)
-    ch.set_categories(Reference(ws, min_col=1, min_row=first, max_row=last))
-    ws.add_chart(ch, anchor)
-
+    for (i, sec), rowlist in buckets.items():
+        c0 = first_col + i * COLS_PER_YEAR + sec * 2
+        act, bud = gcl(c0), gcl(c0 + 1)
+        rowlist.sort()
+        anchor = rowlist[0]
+        sqref = " ".join(f"{act}{r}" for r in rowlist)
+        base = (f'AND(${bud}{anchor}<>0,'
+                f'ABS((${act}{anchor}-${bud}{anchor})/${bud}{anchor})>{threshold}')
+        ws.conditional_formatting.add(
+            sqref, FormulaRule(formula=[base + f',${act}{anchor}>${bud}{anchor})'],
+                               fill=FILL_BAD))
+        ws.conditional_formatting.add(
+            sqref, FormulaRule(formula=[base + f',${act}{anchor}<${bud}{anchor})'],
+                               fill=FILL_GOOD))
 
 
 def _off_budget(basis, vals, payroll):
@@ -544,86 +467,43 @@ def _off_budget_block(ws, start_row, years, data, order, threshold=FLAG_PCT):
     return r
 
 
-def _summary_value(data, order, yr, label, budget=False):
-    """Look up one Summary-page line for one year. Returns a real number."""
-    for key, ln in order.items():
-        if ln.page == "Summary" and ln.label.lower() == label.lower():
-            v = data.get(yr, {}).get(key, (0.0,) * 6)
-            return v[1] if budget else v[0]
-    return 0.0
 
+def _fix_styles(raw: bytes) -> bytes:
+    """Repair what openpyxl gets wrong in the saved file.
 
-def _add_charts(ws, years, data, order, start_row):
-    """Chart-feed block plus the charts.
-
-    The feed holds LITERAL numbers, not formulas. openpyxl cannot write cached
-    formula results, and an Excel chart plots the cached value - so a feed built
-    from formulas renders as a completely empty chart.
+    1. Default fill is written as a bare <patternFill/> with no patternType.
+       Excel then paints those cells solid white, over the gridlines.
+    2. Six-digit colours are padded to 00RRGGBB - a transparent alpha channel.
+    3. Empty cells are tagged t="n" (numeric) with no value.
+    4. Differential (conditional-format) fills need bgColor, not just fgColor,
+       or Excel renders the highlight as white.
     """
-    from openpyxl.chart import BarChart, LineChart, Reference
-    from openpyxl.chart.marker import Marker
+    zin = zipfile.ZipFile(io.BytesIO(raw))
+    parts = {n: zin.read(n) for n in zin.namelist()}
+    for name in parts:
+        if name.startswith("xl/worksheets/sheet"):
+            parts[name] = parts[name].decode("utf8").replace(' t="n"', "").encode("utf8")
+    st = parts["xl/styles.xml"].decode("utf8")
 
-    METRICS = [("Total Revenue", "Total Revenue", False),
-               ("Room", "Room", False),
-               ("Food & Beverage", "Food & Beverage", False),
-               ("Miscellaneous", "Miscellaneous", False),
-               ("Rental Income", "Rental Income", False),
-               ("Operating Profit", "Operating Profit or Loss", False),
-               ("Net Income", "Net Income or Loss", False),
-               ("Total Revenue Budget", "Total Revenue", True)]
-
-    hdr = start_row
-    hc = ws.cell(row=hdr, column=1, value="CHART DATA")
-    hc.font, hc.fill = F_SECT, FILL_NAVY
-    yc = ws.cell(row=hdr + 1, column=1, value="Year")
-    yc.font, yc.fill = F_HDR, FILL_NAVY
-    for j, (title, _lab, _b) in enumerate(METRICS):
-        c = ws.cell(row=hdr + 1, column=2 + j, value=title)
-        c.font, c.fill = F_HDR, FILL_NAVY
-        c.alignment = Alignment(horizontal="left", wrap_text=True)
-        ws.column_dimensions[gcl(2 + j)].width = 15
-
-    for i, yr in enumerate(years):
-        r = hdr + 2 + i
-        ws.cell(row=r, column=1, value=yr).number_format = '0'
-        ws.cell(row=r, column=1).font = F_LBL
-        for j, (title, label, is_bud) in enumerate(METRICS):
-            cell = ws.cell(row=r, column=2 + j,
-                           value=_summary_value(data, order, yr, label, is_bud))
-            cell.number_format, cell.font = MONEY, F_LBL
-
-    for rr in range(hdr, hdr + 2 + len(years)):
-        ws.row_dimensions[rr].hidden = True
-
-    first, last = hdr + 2, hdr + 1 + len(years)
-    cats = Reference(ws, min_col=1, min_row=first, max_row=last)
-    anchor_row = last + 2
-    single = len(years) < 2          # one data point cannot draw a line
-
-    def place(chart, title, col_idxs, anchor, stacked=False):
-        chart.title = title
-        chart.height, chart.width = 8.5, 17
-        _axes(chart)
-        chart.legend.position = "b"
-        for ci in col_idxs:
-            chart.add_data(Reference(ws, min_col=ci, min_row=first - 1, max_row=last),
-                           titles_from_data=True)
-        chart.set_categories(cats)
-        if isinstance(chart, BarChart):
-            chart.type = "col"
-            if stacked:
-                chart.grouping, chart.overlap = "stacked", 100
-        else:
-            for ser in chart.series:          # markers, so single points show
-                ser.marker = Marker(symbol="circle", size=7)
-                ser.smooth = False
-        ws.add_chart(chart, anchor)
-
-    place(BarChart(), "TOTAL REVENUE  -  ACTUAL vs BUDGET", [2, 9], f"A{anchor_row}")
-    place(BarChart(), "REVENUE MIX BY DEPARTMENT", [3, 4, 5, 6],
-          f"K{anchor_row}", stacked=True)
-    place(BarChart() if single else LineChart(),
-          "OPERATING PROFIT & NET INCOME", [7, 8], f"A{anchor_row + 18}")
+    def _dxf_bg(m):
+        block = m.group(0)
+        if "bgColor" in block:
+            return block
+        fg = re.search(r'<fgColor rgb="([0-9A-Fa-f]{8})"', block)
+        if not fg:
+            return block
+        return block.replace("</patternFill>",
+                             '<bgColor rgb="%s"/></patternFill>' % fg.group(1))
+    st = re.sub(r"<dxf>.*?</dxf>", _dxf_bg, st, flags=re.S)
+    st = re.sub(r"<patternFill\s*/>", '<patternFill patternType="none"/>', st)
+    st = re.sub(r'rgb="00([0-9A-Fa-f]{6})"',
+                lambda m: 'rgb="FF%s"' % m.group(1), st)
+    parts["xl/styles.xml"] = st.encode("utf8")
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+        for n in zin.namelist():
+            zo.writestr(n, parts[n])
+    return out.getvalue()
 
 
 def _sheet_header(ws, hotel, title):
@@ -664,9 +544,10 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
                     rows.append((key, ln.label, ln.is_total))
                     used.add(key)
                     break
-    at = {}
-    end = _write_grid(ws, rows, span, data, 6, at=at)
-    _apply_variance_rules(ws, span, 6, end - 1)
+    at, rmap = {}, []
+    end = _write_grid(ws, rows, span, data, 7, at=at, rowmap=rmap)
+    _apply_flag_rules(ws, span, rmap, order)
+    
 
     # margins, computed off the rows just written
     mc = ws.cell(row=end + 1, column=1, value="MARGINS")
@@ -684,9 +565,8 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
                 cell = ws.cell(row=r, column=2 + i * 4 + j,
                                value=f'=IF({c}{rev}=0,"",{c}{src}/{c}{rev})')
                 cell.number_format, cell.font = '0.0%', F_LBL
-    ws.freeze_panes = "A6"
-    off_end = _off_budget_block(ws, end + 5, span, data, order)
-    _add_charts(ws, span, data, order, off_end + 2)
+    ws.freeze_panes = "A7"
+    _off_budget_block(ws, end + 2, span, data, order)
 
     # ---- department tabs -------------------------------------------------
     tabs = OrderedDict()
@@ -694,14 +574,6 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
         tab = TAB_MAP.get(ln.page)
         if tab:
             tabs.setdefault(tab, []).append((key, ln))
-    HEADLINE = {"Rooms": ("Total Room Revenue", "ROOM REVENUE  -  ACTUAL vs BUDGET"),
-                "Food": ("Total Food Revenue", "FOOD REVENUE  -  ACTUAL vs BUDGET"),
-                "Beverage": ("Total Beverage Revenue",
-                             "BEVERAGE REVENUE  -  ACTUAL vs BUDGET"),
-                "Miscellaneous": ("Total Miscellaneous Revenue",
-                                  "MISC REVENUE  -  ACTUAL vs BUDGET"),
-                "Undistributed": ("Total A& G Expenses",
-                                  "A&G EXPENSES  -  ACTUAL vs BUDGET")}
     for tab in ["Rooms", "Food", "Beverage", "Miscellaneous", "Undistributed"]:
         items = tabs.get(tab, [])
         ws = wb.create_sheet(tab)
@@ -714,13 +586,11 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
                 rows.append((None, ln.section, False))
                 cur = ln.section
             rows.append((key, ln.label, ln.is_total))
-        at_tab = {}
-        end = _write_grid(ws, rows, span, data, 6, at=at_tab)
-        _apply_variance_rules(ws, span, 6, max(end - 1, 6))
-        ws.freeze_panes = "A6"
-        lab, ttl = HEADLINE[tab]
-        _tab_chart(ws, span, at_tab, lab, ttl, end + 2,
-                   f"{gcl(2 + len(span) * 4 + 1)}7")
+        at_tab, rmap = {}, []
+        end = _write_grid(ws, rows, span, data, 7, at=at_tab, rowmap=rmap)
+        _apply_flag_rules(ws, span, rmap, order)
+        
+        ws.freeze_panes = "A7"
 
     # ---- Fixed Expenses --------------------------------------------------
     ws = wb.create_sheet("Fixed Expenses")
@@ -731,31 +601,23 @@ def build_workbook(hotel, per_year, out_path: Path, sources=None):
     for key, ln in order.items():
         if ln.label.lower() in fx and ln.page == "Non-Operating Expenses":
             rows.append((key, ln.label, False))
-    end = _write_grid(ws, rows, span, data, 6)
+    rmap = []
+    end = _write_grid(ws, rows, span, data, 7, rowmap=rmap)
+    _apply_flag_rules(ws, span, rmap, order)
     tot = end
     tl = ws.cell(row=tot, column=1, value="TOTAL FIXED EXPENSES")
     tl.font, tl.fill = F_TOTL, FILL_TEAL
     ws.row_dimensions[tot].height = H_BAND
     for i in range(len(span)):
-        c0 = 2 + i * 4
-        for j in range(4):
-            col = gcl(c0 + j)
-            c = ws.cell(row=tot, column=c0 + j,
-                        value=f"=SUM({col}7:{col}{tot-1})")
-            c.number_format, c.font, c.fill = MONEY, F_TOT, FILL_PALE
-    _apply_variance_rules(ws, span, 6, tot)
-    ws.freeze_panes = "A6"
-    fx_at = {"total fixed expenses": tot}
-    for i in range(len(span)):                  # the SUM row holds formulas, so
-        c0 = 2 + i * 4                          # bake literals for the chart feed
-        for j in (0, 1):
-            ws.cell(row=tot, column=c0 + j).value = sum(
-                ws.cell(row=rr, column=c0 + j).value or 0
-                for rr in range(7, tot)
-                if isinstance(ws.cell(row=rr, column=c0 + j).value, (int, float)))
-    _tab_chart(ws, span, fx_at, "total fixed expenses",
-               "FIXED EXPENSES  -  ACTUAL vs BUDGET", tot + 3,
-               f"{gcl(2 + len(span) * 4 + 1)}7")
+        y0 = 2 + i * COLS_PER_YEAR
+        for j in range(COLS_PER_YEAR):
+            col = gcl(y0 + j)
+            c = ws.cell(row=tot, column=y0 + j,
+                        value=f"=SUM({col}8:{col}{tot-1})")
+            c.number_format = MONEY if j < 2 else SECTIONS[j // 2][1]
+            c.font, c.fill = F_TOT, FILL_PALE
+    
+    ws.freeze_panes = "A7"
 
     for s in wb.worksheets:
         s.sheet_properties.tabColor = GREEN if s.title != "Summary" else "1C1C1C"
