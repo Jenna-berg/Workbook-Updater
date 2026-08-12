@@ -193,21 +193,27 @@ def parse_statement(path=None, *, data: bytes = None, name: str = ""):
         book = xlrd.open_workbook(str(path), on_demand=False)
     sh = book.sheet_by_index(0)
 
+    # The header block is not always in the same column - Memphis puts it in G,
+    # Myrtle Beach in F - so scan every column of the first few rows.
     hotel, year, asof = None, None, (0, 0)
+    fallback = None
     for r in range(min(sh.nrows, 12)):
-        g = str(_txt(sh, r, 6))
-        if "Property:" in g and "Operating" in g and hotel is None:
-            hotel = g.split("Property:")[-1].strip()
-        m = re.search(r"As of\s+(\d{1,2})/(\d{1,2})/(\d{4})", g)
-        if m:
-            asof = (int(m.group(1)), int(m.group(2)))
-            year = int(m.group(3))
-    if hotel is None:
-        for r in range(min(sh.nrows, 12)):
-            g = str(_txt(sh, r, 6))
+        for c in range(sh.ncols):
+            g = _txt(sh, r, c)
+            if not isinstance(g, str) or not g:
+                continue
             if "Property:" in g:
-                hotel = g.split("Property:")[-1].strip()
-                break
+                name = g.split("Property:")[-1].strip()
+                if "Operating" in g and hotel is None:
+                    hotel = name                    # the operating entity names the hotel
+                elif fallback is None:
+                    fallback = name
+            m = re.search(r"As of\s+(\d{1,2})/(\d{1,2})/(\d{4})", g)
+            if m:
+                asof = (int(m.group(1)), int(m.group(2)))
+                year = int(m.group(3))
+    if hotel is None:
+        hotel = fallback
     if hotel is None or year is None:
         raise ValueError(f"{path.name}: could not read hotel name / year from header")
     hotel = re.sub(r"\s+", " ", hotel).strip()   # header spacing varies between exports
