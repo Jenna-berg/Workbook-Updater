@@ -404,9 +404,19 @@ def rob_block_step(ws, default=ROB_DEFAULT_BLOCK_STEP):
 def _rob_week_taken_reason(ws, block_start):
     """Why this week tab is unavailable, or None if it's free to write to.
 
+    Two things this has to get right, both confirmed against real files:
+
     A zero is not data. These templates render empty currency cells as "$ -"
     (a literal 0), so testing `isinstance(v, (int, float))` alone counts an
     untouched month as filled and silently skips the tab.
+
+    A formula usually IS data. Weeks are routinely reconciled by hand into an
+    expression — real examples are '=294767+55017+2028' and
+    '=320153-11611+6135' sitting in the Revenue cell of an already-completed
+    week. Treating only literal numbers as data marks those weeks available
+    and overwrites the reconciliation. The exception is a bare cross-sheet
+    reference like ="wk one"!E82, which is the template's own placeholder
+    mirroring week one rather than this week's figures.
     """
     tc = ws.sheet_properties.tabColor
     if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
@@ -415,7 +425,13 @@ def _rob_week_taken_reason(ws, block_start):
     rms = ws.cell(block_start + 2, 5).value
 
     def filled(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0
+        if isinstance(v, bool) or v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return v != 0
+        if is_formula(str(v)):
+            return "!" not in str(v)   # cross-sheet mirror = still a placeholder
+        return False
 
     if filled(rev) or filled(rms):
         return (f"already has this month's data "
