@@ -5,6 +5,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 import io
 import csv
 import re
+import collections
 import zipfile
 import datetime
 import hashlib
@@ -212,6 +213,115 @@ def parse_bob_source(uploaded_file) -> pd.DataFrame:
     return parse_csv(file_bytes)
 
 
+# ── Hilton portfolio source files ────────────────────────────────────────────
+# Two exports feed a Hilton run, and neither can produce the ROB on its own:
+#
+#   SRP Activity      one sheet covering every Hilton property, stay-level,
+#                     identified by 'Property - InnCode'
+#   Group Wash        one file PER hotel, group-block level, per occupancy date
+#
+# Group has to come from the Wash report, not from SRP's own 'convention' SRP
+# Type — that flag badly undercounts group at some properties (Kansas City
+# September: 270 rooms by SRP against 1,017 by Wash). So the ROB totals are
+# assembled as SRP transient + Wash pick-up rather than taken from SRP whole.
+
+WASH_PERM_SEGMENT = "PERM"   # Market Segment marking the airline/crew blocks
+
+
+def _find_header_row(df_raw, first_col_name, limit=40):
+    """Row index of the header inside a raw (header=None) export.
+
+    These exports print a filter block above the table and the number of
+    filters varies between pulls — the same report has landed on row 11 and
+    row 13 — so the header position must be found, never assumed.
+    """
+    col0 = df_raw[0].astype(str).str.strip()
+    hits = df_raw.index[col0 == first_col_name]
+    if len(hits) == 0:
+        raise ValueError(f"Could not find a '{first_col_name}' header row in the export")
+    return int(hits[0])
+
+
+def _spread_stay(arrival, nights):
+    """Yield each occupancy date of a stay. A stay is booked once but occupies
+    a room on every night of its span, and month totals are by occupancy — a
+    stay arriving 30 Aug for five nights puts two nights in August and three
+    in September, not five in August."""
+    for i in range(int(nights)):
+        yield (arrival + datetime.timedelta(days=i)).date()
+
+
+def parse_srp_activity(file_like):
+    """SRP Activity export → {inncode: {(year, month): {seg: [nights, revenue]}}}
+
+    seg is 'TOT', 'GRP', 'PRM' or 'TRN' (transient = everything that is
+    neither group nor permanent). Only TRN is ultimately used for the ROB,
+    since group and permanent come from the Wash report, but the rest is kept
+    for reconciliation display.
+    """
+    raw = pd.read_excel(file_like, sheet_name=0, header=None)
+    hr = _find_header_row(raw, "Stay ID")
+    df = pd.read_excel(file_like, sheet_name=0, header=hr)
+    df = df[df["Stay ID"].notna()]
+
+    out = collections.defaultdict(
+        lambda: collections.defaultdict(
+            lambda: collections.defaultdict(lambda: [0, 0.0])))
+    for rec in df.to_dict("records"):
+        nights = int(safe_float(rec.get("Room Nights")) or 0)
+        if nights <= 0:
+            continue
+        arrival = rec.get("Arrival Date")
+        if not isinstance(arrival, (datetime.datetime, datetime.date)):
+            continue
+        per = (safe_float(rec.get("Room Revenue *")) or 0.0) / nights
+        is_perm = str(rec.get("MCAT", "")).strip().lower() == "permanent"
+        is_grp = str(rec.get("SRP Type", "")).strip().lower() == "convention" and not is_perm
+        kind = "PRM" if is_perm else ("GRP" if is_grp else "TRN")
+        inn = str(rec.get("Property - InnCode", "")).strip().upper()
+        for d in _spread_stay(arrival, nights):
+            b = out[inn][(d.year, d.month)]
+            b["TOT"][0] += 1;   b["TOT"][1] += per
+            b[kind][0] += 1;    b[kind][1] += per
+    return out
+
+
+def parse_group_wash(file_like):
+    """Individual Group Wash export → {(year, month): {seg: {...}}}
+
+    seg is 'GRP' (Market Segment != PERM) or 'PRM' (== PERM); each holds
+    pu_rooms / pu_rev / av_rooms / av_rev.
+
+    'Pick Up' is what has actually been reserved out of the block and belongs
+    in the ROB's column E. 'Available Block' is the unpicked remainder and
+    belongs in column G ('not p/u'). Market Segment is the discriminator, not
+    Forecast Group — one real property has a block named 'Group_PERM_SMRF'
+    whose segment is SMRF, i.e. ordinary group business despite the name.
+    """
+    raw = pd.read_excel(file_like, sheet_name=0, header=None)
+    hr = _find_header_row(raw, "Group Code")
+    df = pd.read_excel(file_like, sheet_name=0, header=hr)
+    df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
+
+    out = collections.defaultdict(
+        lambda: collections.defaultdict(
+            lambda: {"pu_rooms": 0.0, "pu_rev": 0.0, "av_rooms": 0.0, "av_rev": 0.0}))
+    for rec in df.to_dict("records"):
+        occ = rec.get("Occupancy Date")
+        if not isinstance(occ, (datetime.datetime, datetime.date)):
+            continue
+        pu = safe_float(rec.get("Pick Up")) or 0.0
+        av = safe_float(rec.get("Available Block")) or 0.0
+        rate = safe_float(rec.get("Rate")) or 0.0
+        seg = "PRM" if str(rec.get("Market Segment", "")).strip().upper() == WASH_PERM_SEGMENT else "GRP"
+        b = out[(occ.year, occ.month)][seg]
+        b["pu_rooms"] += pu
+        b["pu_rev"] += pu * rate
+        b["av_rooms"] += av
+        b["av_rev"] += av * rate
+    return out
+
+
 # ── ROB Update ───────────────────────────────────────────────────────────────
 
 ROB_SHEETS = ["wk one", "wk two", "wk three", "wk four", "wk five", "wk six"]
@@ -225,6 +335,72 @@ def find_secondary_col(ws, block_start):
         if isinstance(cell.value, str) and "variance" in cell.value.strip().lower():
             candidates.append(cell.column)
     return min(candidates) if candidates else None
+
+
+def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
+    """ROB changes for one Hilton hotel from the two Hilton exports.
+
+    srp_months  — parse_srp_activity()[inncode]
+    wash_months — parse_group_wash() for that same hotel
+
+    Column E takes what is on the books, column G ('not p/u') the unpicked
+    remainder of the group blocks. Totals are assembled rather than lifted
+    from SRP: transient comes from SRP, group and permanent from the Wash
+    report's pick-up, because SRP's own 'convention' flag undercounts group.
+
+    Rows are located by label, and any cell already holding a formula is left
+    alone — weeks get reconciled by hand into expressions like '=294767+55017'
+    and those must not be flattened.
+    """
+    as_of = as_of or datetime.date.today()
+    blocks = rob_month_blocks(ws)
+    changes = []
+
+    def put(row, col, label, value, month):
+        if row is None or value is None:
+            return
+        if is_formula(ws.cell(row, col).value):
+            changes.append({"row": row, "col": col, "label": label, "month": month,
+                            "new_value": value, "skip_reason": "formula"})
+            return
+        changes.append({"row": row, "col": col, "label": label, "month": month,
+                        "new_value": value, "skip_reason": None})
+
+    changes.append({"row": 4, "col": 5, "label": "As-of date", "month": None,
+                    "new_value": as_of, "skip_reason": None})
+
+    for mi, labels in sorted(blocks.items()):
+        month = mi + 1
+        if month < as_of.month:
+            continue                      # never rewrite a closed month
+        key = (as_of.year, month)
+        s = srp_months.get(key) or {}
+        w = wash_months.get(key) or {}
+        trn = s.get("TRN", [0, 0.0])
+        g = w.get("GRP", {})
+        p = w.get("PRM", {})
+
+        g_pu_r, g_pu_v = g.get("pu_rooms", 0.0), g.get("pu_rev", 0.0)
+        p_pu_r, p_pu_v = p.get("pu_rooms", 0.0), p.get("pu_rev", 0.0)
+
+        tot_rooms = trn[0] + g_pu_r + p_pu_r
+        tot_rev = trn[1] + g_pu_v + p_pu_v
+        if not (tot_rooms or g_pu_r or p_pu_r):
+            continue                      # nothing on the books for this month
+
+        L = labels.get
+        put(L("revenue"),        5, "Revenue",        round(tot_rev, 2), month)
+        put(L("room nights"),    5, "Room Nights",    int(round(tot_rooms)), month)
+        put(L("group rms sold"), 5, "Group Rms sold", int(round(g_pu_r)), month)
+        put(L("group rm rev"),   5, "Group Rm Rev",   round(g_pu_v, 2), month)
+        put(L("group rms sold"), 7, "Group not p/u rms", int(round(g.get("av_rooms", 0.0))), month)
+        put(L("group rm rev"),   7, "Group not p/u rev", round(g.get("av_rev", 0.0), 2), month)
+        if L("perm rms sold"):
+            put(L("perm rms sold"), 5, "Perm Rms Sold", int(round(p_pu_r)), month)
+            put(L("perm rm rev"),   5, "Perm Rm Rev",   round(p_pu_v, 2), month)
+            put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p.get("av_rooms", 0.0))), month)
+            put(L("perm rm rev"),   7, "Perm not p/u rev", round(p.get("av_rev", 0.0), 2), month)
+    return changes
 
 
 def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
@@ -437,6 +613,45 @@ def _rob_week_taken_reason(ws, block_start):
         return (f"already has this month's data "
                 f"(E{block_start+1}={rev!r}, E{block_start+2}={rms!r})")
     return None
+
+
+def rob_month_blocks(ws):
+    """{month_index: {row_label_lower: row_number}} for a ROB week tab.
+
+    Locates every row by its column-A label instead of by a fixed offset from
+    the block start. Offsets are not safe to assume even within one workbook:
+    a real file has 'wk one' on 11-row blocks with Perm at offsets 7/8 while
+    'wk two'..'wk six' are 12-row with Perm at 8/9, so an offset that is right
+    on one tab writes into the wrong row on the next.
+
+    Labels are lower-cased and whitespace-collapsed, e.g. 'revenue',
+    'room nights', 'group rms sold', 'group rm rev', 'perm rms sold',
+    'perm rm rev', 'adr', 'pickup wow'.
+    """
+    starts = {}
+    for r in range(1, 260):
+        v = ws.cell(r, 1).value
+        if not isinstance(v, str):
+            continue
+        s = v.strip()
+        # month header cells hold just the month name — guard against a long
+        # sentence that merely begins with one
+        if len(s) <= 12 and s[:3].lower() in _MONTH_LABELS:
+            starts.setdefault(_MONTH_LABELS[s[:3].lower()], r)
+    ordered = sorted(starts.items(), key=lambda kv: kv[1])
+    if not ordered:
+        return {}
+    span = (ordered[1][1] - ordered[0][1]) if len(ordered) > 1 else ROB_DEFAULT_BLOCK_STEP
+    out = {}
+    for n, (mi, r0) in enumerate(ordered):
+        end = ordered[n + 1][1] if n + 1 < len(ordered) else r0 + span
+        labels = {}
+        for r in range(r0 + 1, end):
+            v = ws.cell(r, 1).value
+            if isinstance(v, str) and v.strip():
+                labels.setdefault(re.sub(r"\s+", " ", v.strip().lower()), r)
+        out[mi] = labels
+    return out
 
 
 def rob_week_status(wb, sheet_names):
@@ -2121,6 +2336,106 @@ def get_hotels_from_drive():
         return []
 
 WORKBOOK_TYPES = ["ROB", "Strategy Report", "Forecast"]
+
+# ── Portfolios ───────────────────────────────────────────────────────────────
+# Hotels are discovered from Drive folder names, which carry no notion of
+# grouping, so membership is declared here. Each portfolio's data arrives in a
+# different export, which is why they get separate tabs rather than one list.
+#
+# Matching is on keywords, not exact names: Drive folder naming is
+# inconsistent for the same hotel and two properties are filed under a
+# different name entirely (Long Beach as ALLEGRIA, Westerly as Pleasant View
+# Inn). Keep keywords distinctive enough not to collide.
+PORTFOLIOS = ["Stay In Touch", "Hilton", "IHG"]
+
+PORTFOLIO_HOTELS = {
+    "Stay In Touch": {
+        "Wolfeboro":      ["WOLF"],
+        "Harbor Hotel":   ["HARBOR"],
+        "Foxberry":       ["FOXBER", "FOXBUR"],
+        "Tybee":          ["TYBEE"],
+        "Provincetown Inn": ["PROVINCETOWN INN", "PTOWN INN"],
+        "Middletown":     ["MIDDLETOWN"],
+        "Brass Key":      ["BRASS"],
+        "Long Beach":     ["LONG BEACH", "ALLEGRIA"],
+        "Westerly":       ["WESTERLY", "PLEASANT VIEW"],
+        "Crown Point":    ["CROWN", "CROWNE"],
+        "Ashworth":       ["ASHWORTH", "HAMPTON BEACH"],
+        "Anchor Inn":     ["ANCHOR"],
+        "Surfside":       ["SURFSIDE"],
+        "1620":           ["1620", "PLYMOUTH"],
+    },
+    "Hilton": {
+        "Northbrook":     ["NORTHBROOK"],
+        "Andover":        ["ANDOVER"],
+        "Ann Arbor":      ["ANN ARBOR"],
+        "Silver Spring":  ["SILVER SPRING"],
+        "Mesa":           ["MESA"],
+        "Littleton":      ["LITTLETON"],
+        "Nashua":         ["NASHUA"],
+        "Kansas City":    ["KANSAS"],
+        "Memphis":        ["MEMPHIS"],
+    },
+    "IHG": {
+        "Salem":          ["SALEM"],
+        "Manchester":     ["MANCHESTER"],
+        "Weirton":        ["WEIRTON"],
+    },
+}
+
+# Property codes as they appear in the SRP Activity export's 'Property -
+# InnCode' column, which is how one shared export gets split per hotel.
+# Confirmed from real exports; the three blanks have not appeared in one yet.
+HILTON_INNCODES = {
+    "Littleton":     "LTNNH",
+    "Nashua":        "ASHSS",
+    "Ann Arbor":     "ARBAA",
+    "Mesa":          "MESWH",
+    "Kansas City":   "MCIAP",
+    "Memphis":       "MEMPH",
+    # "Northbrook":  "?",   not yet seen in an export
+    # "Andover":     "?",
+    # "Silver Spring": "?",
+}
+
+# Hilton properties do not run a Strategy Report.
+PORTFOLIO_WORKBOOKS = {
+    "Stay In Touch": WORKBOOK_TYPES,
+    "Hilton":        ["ROB", "Forecast"],
+    "IHG":           WORKBOOK_TYPES,
+}
+
+
+def portfolio_of(hotel_display_name):
+    """Which portfolio a Drive-discovered hotel belongs to, or None."""
+    up = (hotel_display_name or "").upper()
+    for pf, members in PORTFOLIO_HOTELS.items():
+        for kws in members.values():
+            if any(k in up for k in kws):
+                return pf
+    return None
+
+
+def hotels_in_portfolio(portfolio, discovered):
+    """[(display_name, folder_id)] from `discovered` belonging to `portfolio`,
+    ordered as declared above so the checkbox list is stable between runs.
+    Hotels that are declared but have no matching Drive folder are dropped —
+    surface those separately rather than showing an entry that cannot run."""
+    members = PORTFOLIO_HOTELS.get(portfolio, {})
+    out = []
+    for kws in members.values():
+        for name, fid in discovered:
+            if any(k in name.upper() for k in kws) and (name, fid) not in out:
+                out.append((name, fid))
+    return out
+
+
+def portfolio_hotels_missing(portfolio, discovered):
+    """Declared hotels with no matching Drive folder."""
+    members = PORTFOLIO_HOTELS.get(portfolio, {})
+    names = [n.upper() for n, _ in discovered]
+    return [label for label, kws in members.items()
+            if not any(any(k in n for k in kws) for n in names)]
 
 # Maps workbook type → partial filename keyword to search for in Drive
 WORKBOOK_KEYWORDS = {
@@ -4448,6 +4763,145 @@ if st.session_state.get("view") == "admin_settings" and st.session_state.get("is
     render_admin_settings(_admin_svc, _users_file_id, _users_err)
     st.stop()
 
+def render_hilton_update(hotels):
+    """Hilton portfolio run.
+
+    Differs from the other portfolios in two ways. Several properties are run
+    at once, because a single SRP Activity export covers all of them and gets
+    split by 'Property - InnCode'. And group figures come from a per-hotel
+    Group Wash export rather than from the booking data, so each selected
+    hotel needs its own wash file.
+
+    Hilton properties do not run a Strategy Report.
+    """
+    if not hotels:
+        st.info("No Hilton properties found in Drive.")
+        return
+
+    st.caption(
+        "One SRP Activity export covers every property; each hotel also needs its "
+        "own Group Wash export. Group and Permanent figures come from the Wash "
+        "report — the booking export supplies only the transient remainder."
+    )
+
+    with st.container(border=True):
+        st.markdown("**Properties to run**")
+        cols = st.columns(3)
+        selected = []
+        for i, (name, fid) in enumerate(hotels):
+            with cols[i % 3]:
+                if st.checkbox(name, key=f"hil_sel_{fid}"):
+                    selected.append((name, fid))
+
+        wb_sels = st.pills(
+            "Workbooks to update",
+            PORTFOLIO_WORKBOOKS["Hilton"],
+            selection_mode="multi",
+            default=PORTFOLIO_WORKBOOKS["Hilton"],
+            key="hil_wb",
+        ) or []
+
+        srp_file = st.file_uploader(
+            "SRP Activity — all Hilton properties (one file)",
+            type=["xlsx"], key="hil_srp")
+
+        wash_files = {}
+        if selected:
+            st.markdown("**Group Wash report — one per property**")
+            wcols = st.columns(2)
+            for i, (name, fid) in enumerate(selected):
+                with wcols[i % 2]:
+                    wash_files[name] = st.file_uploader(
+                        name, type=["xlsx"], key=f"hil_wash_{fid}")
+
+    if not selected:
+        st.info("Select at least one property.")
+        return
+    if not srp_file:
+        st.info("Upload the SRP Activity export to continue.")
+        return
+
+    try:
+        srp = parse_srp_activity(srp_file)
+    except Exception as e:
+        st.error(f"Could not read the SRP Activity export: {e}")
+        return
+
+    st.success(f"SRP Activity: {len(srp)} properties — {', '.join(sorted(srp))}")
+
+    missing_wash = [n for n, _ in selected if not wash_files.get(n)]
+    if missing_wash:
+        st.info(f"Waiting on Group Wash report for: {', '.join(missing_wash)}")
+        return
+
+    if not st.button("Preview changes", key="hil_preview", type="primary"):
+        return
+
+    svc = get_drive_service()
+    for name, fid in selected:
+        st.divider()
+        st.subheader(name)
+        try:
+            wash = parse_group_wash(wash_files[name])
+        except Exception as e:
+            st.error(f"{name}: could not read the Group Wash report — {e}")
+            continue
+
+        inn = _match_inncode(name, srp)
+        if not inn:
+            st.error(
+                f"{name}: no matching 'Property - InnCode' in the SRP export. "
+                f"Codes present: {', '.join(sorted(srp))}. "
+                f"Add it to HILTON_INNCODES so the split knows which rows belong here."
+            )
+            continue
+
+        for wb_type in wb_sels:
+            result, err = resolve_drive_workbook(svc, fid, name, wb_type)
+            if err or not result:
+                st.error(f"{name} — {wb_type}: {err}")
+                continue
+            file_id, file_name = result
+            wb = openpyxl.load_workbook(io.BytesIO(drive_download(svc, file_id)),
+                                        data_only=False)
+            if wb_type != "ROB":
+                st.caption(f"{wb_type}: {file_name} — Forecast ingest not wired up yet.")
+                continue
+
+            avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+            sheet = first_uncolored_sheet(wb, avail)
+            changes = build_hilton_rob_plan(srp.get(inn, {}), wash, wb[sheet])
+            passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                      if w and n != sheet]
+            st.caption(f"{file_name} → **{sheet}** (InnCode {inn})"
+                       + ("  ·  skipped " + "; ".join(passed) if passed else ""))
+            writes = [c for c in changes if not c["skip_reason"]]
+            skips = [c for c in changes if c["skip_reason"]]
+            st.dataframe(pd.DataFrame([
+                {"row": c["row"],
+                 "col": get_column_letter(c["col"]),
+                 "field": c["label"],
+                 "month": c["month"],
+                 "value": c["new_value"]}
+                for c in writes]), use_container_width=True, hide_index=True)
+            if skips:
+                st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
+
+
+def _match_inncode(hotel_name, srp):
+    """Map a Drive hotel name to the InnCode used in the SRP export."""
+    code = HILTON_INNCODES.get(hotel_name)
+    if code and code in srp:
+        return code
+    up = hotel_name.upper()
+    for label, kws in PORTFOLIO_HOTELS["Hilton"].items():
+        if any(k in up for k in kws):
+            c = HILTON_INNCODES.get(label)
+            if c and c in srp:
+                return c
+    return None
+
+
 # ── Manual upload (test mode only) ───────────────────────────────────────────
 if test_mode:
  with st.expander("Manual Upload", expanded=False):
@@ -4783,9 +5237,28 @@ with tab_weekly:
         st.write("")
         st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
-    hotels = get_hotels_from_drive()
+    all_discovered = get_hotels_from_drive()
+
+    # Each portfolio's data arrives in a different export, so they get their own
+    # tab rather than sharing one hotel list.
+    portfolio = st.radio("Portfolio", PORTFOLIOS, horizontal=True, key="drive_portfolio")
+
+    hotels = hotels_in_portfolio(portfolio, all_discovered)
     hotel_names = [h[0] for h in hotels]
     hotel_id_map = {h[0]: h[1] for h in hotels}
+    allowed_wbs = PORTFOLIO_WORKBOOKS[portfolio]
+
+    missing = portfolio_hotels_missing(portfolio, all_discovered)
+    if missing:
+        st.warning(
+            f"No Drive folder found for: {', '.join(missing)} — "
+            f"they won't appear below. A hotel is only discovered if its folder "
+            f"contains a 'REVENUE REPORTS' subfolder shared with the service account."
+        )
+
+    if portfolio == "Hilton":
+        render_hilton_update(hotels)
+        st.stop()
 
     start_new_month = False
     with st.container(border=True):
@@ -4800,9 +5273,9 @@ with tab_weekly:
         with col_w:
             wb_sels = st.pills(
                 "Workbooks to update",
-                WORKBOOK_TYPES,
+                allowed_wbs,
                 selection_mode="multi",
-                default=WORKBOOK_TYPES,
+                default=allowed_wbs,
                 key="drive_wb",
             ) or []
 
