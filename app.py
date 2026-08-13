@@ -6045,18 +6045,108 @@ if test_mode:
                         )
     
 # ── Main menu ────────────────────────────────────────────────────────────────
-# Two sections rather than one flat row of tools. The tab objects are created
-# inside their section but used further down at module level — a Streamlit tab
-# is bound to its position on the page, not to the block that made it, so the
-# tool bodies below stay exactly where they are.
-main_revenue, main_financial = st.tabs(["📈  Revenue Management", "💵  Financial Tools"])
+# A landing page of two cards, then that section's tools as tabs.
+#
+# Streamlit runs the whole script top to bottom on every interaction, so the
+# tool bodies further down execute whichever section is open. The ones that
+# belong to the section you are NOT in are pointed at a placeholder, which is
+# emptied at the end of the file — they run, as they always have, but nothing
+# of theirs reaches the page.
+SECTION_REVENUE = "Revenue Management"
+SECTION_FINANCIAL = "Financial Tools"
 
-with main_revenue:
+_section = st.session_state.get("main_section")
+
+if _section not in (SECTION_REVENUE, SECTION_FINANCIAL):
+    st.markdown(
+        """
+        <style>
+          div[data-testid="stButton"] > button {
+              height: 200px;
+              border: 2px solid #d6dce4;
+              border-radius: 14px;
+              background: #ffffff;
+              color: #1F3864;
+              transition: border-color .15s, box-shadow .15s, transform .15s,
+                          background .15s;
+          }
+          /* Streamlit renders each blank-line-separated part of the label as
+             its own <p>, so the icon, title and subtitle can be sized apart. */
+          div[data-testid="stButton"] > button p {
+              color: #1F3864;
+              margin: 0;
+          }
+          div[data-testid="stButton"] > button p:nth-of-type(1) {
+              font-size: 2.6rem;
+              line-height: 1.5;
+          }
+          div[data-testid="stButton"] > button p:nth-of-type(2) {
+              font-size: 1.3rem;
+              font-weight: 700;
+              line-height: 1.9;
+          }
+          div[data-testid="stButton"] > button p:nth-of-type(3) {
+              font-size: .82rem;
+              font-weight: 400;
+              color: #5a6b8c;
+              line-height: 1.6;
+          }
+          div[data-testid="stButton"] > button:hover {
+              border-color: #1F3864;
+              background: #f4f7fd;
+              transform: translateY(-3px);
+              box-shadow: 0 8px 22px rgba(31,56,100,.18);
+              color: #1F3864;
+          }
+          div[data-testid="stButton"] > button:focus:not(:active) {
+              border-color: #1F3864;
+              color: #1F3864;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.write("")
+    _pad_l, _card_l, _card_r, _pad_r = st.columns([1, 3, 3, 1])
+    with _card_l:
+        if st.button(
+            "📈\n\nRevenue Management\n\nWeekly Update · Ancillary · OOO",
+            key="menu_revenue", use_container_width=True,
+        ):
+            st.session_state["main_section"] = SECTION_REVENUE
+            st.rerun()
+    with _card_r:
+        if st.button(
+            "💵\n\nFinancial Tools\n\nP&L · 1-Year Projection",
+            key="menu_financial", use_container_width=True,
+        ):
+            st.session_state["main_section"] = SECTION_FINANCIAL
+            st.rerun()
+    st.stop()
+
+_back, _title = st.columns([1, 6])
+with _back:
+    if st.button("← Main menu", key="menu_back"):
+        st.session_state.pop("main_section", None)
+        st.rerun()
+with _title:
+    st.markdown(f"#### {_section}")
+
+# Whichever section is not open is built into this placeholder and wiped at the
+# end of the file.
+_offstage = st.empty()
+_offstage_box = _offstage.container()
+
+if _section == SECTION_REVENUE:
     tab_weekly, tab_ancillary, tab_ooo = st.tabs(
         ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
-
-with main_financial:
+    with _offstage_box:
+        tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
+else:
     tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
+    with _offstage_box:
+        tab_weekly, tab_ancillary, tab_ooo = st.tabs(
+            ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
 
 with tab_weekly:
     st.divider()
@@ -6995,3 +7085,9 @@ with tab_projection:
                 "It needs altair, numpy and XlsxWriter — check they installed "
                 "with the rest of requirements.txt."
             )
+
+
+# Everything the inactive section drew went into this placeholder; clear it so
+# only the open section reaches the page. Must stay the last statement in the
+# file — anything added after it would render into the void.
+_offstage.empty()
