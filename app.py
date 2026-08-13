@@ -2763,14 +2763,22 @@ def _strip_dedup_suffix(name):
 
 
 def _is_rev_reports_name(name):
-    """True if a folder name denotes a 'Revenue Reports' folder. Confirmed
-    real naming variants include the full phrase and the abbreviation
-    'REV RPTS' (Hotel 1620's convention, e.g. 'G. JUL2018 REV RPTS HOTEL
-    1620') — a plain 'REVENUE REPORTS' in name_upper substring check misses
-    the abbreviated form entirely, which broke both hotel grouping and
-    workbook resolution for that hotel.
+    """True if a folder name denotes a 'Revenue Reports' folder.
+
+    Either word gets abbreviated independently in real folder names, so all
+    four combinations have to be accepted:
+
+        REVENUE REPORTS   the usual form
+        REV RPTS          Hotel 1620's convention, 'G. JUL2018 REV RPTS HOTEL 1620'
+        REV REPORTS       Salem's, 'SALEM REV REPORTS'
+        REVENUE RPTS      for symmetry
+
+    Matching only the first two hid every hotel filing under the others: the
+    folder is shared and correctly structured, but nothing recognises it as a
+    revenue-reports folder, so the hotel never appears and the failure looks
+    exactly like a permissions problem.
     """
-    return bool(re.search(r'REVENUE REPORTS|REV RPTS', name.upper()))
+    return bool(re.search(r'REV(?:ENUE)?\s+(?:REPORTS|RPTS)', name.upper()))
 
 
 def _extract_hotel_name_from_rev_folder(name):
@@ -3013,6 +3021,62 @@ def hotels_in_portfolio(portfolio, discovered):
         else:
             out.append((label, ""))
     return out
+
+
+@st.cache_data(ttl=300)
+def _all_visible_folders():
+    """Every folder the signed-in account can see, as (name, id).
+
+    Deliberately unfiltered — the point is to separate "the folder isn't shared
+    with me" from "it's shared but I don't recognise it as a hotel", which look
+    identical from the hotel list alone.
+    """
+    try:
+        svc = get_drive_service()
+        out, token = [], None
+        while True:
+            res = svc.files().list(
+                q="mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                fields="nextPageToken, files(id, name)", pageSize=1000,
+                pageToken=token, supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            out.extend((f["name"], f["id"]) for f in res.get("files", []))
+            token = res.get("nextPageToken")
+            if not token:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def render_folder_diagnostic(portfolio, missing):
+    """Say, per missing hotel, whether anything matching it is visible at all."""
+    folders = _all_visible_folders()
+    if not folders:
+        st.error("Couldn't list any folders — the Drive connection itself is "
+                 "failing, so this isn't about one hotel's sharing.")
+        return
+    st.caption(f"Signed in as `{service_account_email() or 'unknown'}`, which can "
+               f"see **{len(folders)}** folders in total.")
+    members = PORTFOLIO_HOTELS.get(portfolio, {})
+    for label in missing:
+        kws = members.get(label, [])
+        hits = [(n, i) for n, i in folders
+                if any(k in n.upper() for k in kws) and not _is_test_folder(n)]
+        if not hits:
+            st.markdown(f"**{label}** — nothing visible with this name. "
+                        f"The folder isn't shared with this account.")
+            continue
+        rev = [n for n, _ in hits if _is_rev_reports_name(n)]
+        st.markdown(
+            f"**{label}** — {len(hits)} folder(s) visible, so it *is* shared. "
+            + ("None of them reads as a revenue-reports folder, which is what "
+               "makes it a hotel." if not rev else
+               "One of them does read as a revenue-reports folder, so this "
+               "should now resolve — press ↺.")
+        )
+        st.code("\n".join(n for n, _ in hits[:12]) or "(none)", language=None)
 
 
 def portfolio_hotels_missing(portfolio, discovered):
@@ -6224,13 +6288,12 @@ with tab_weekly:
         st.warning(
             f"**No Drive folder found for:** {', '.join(missing)}\n\n"
             f"They are still listed below and can be selected, but a run will "
-            f"stop with an error until this is sorted. This app signs in as\n\n"
-            f"`{who}`\n\n"
-            f"so that is the address the folder has to be shared with — sharing "
-            f"with a different service account has no effect here. It also needs "
-            f"a `REVENUE REPORTS` subfolder inside to be recognised as a hotel. "
-            f"Press ↺ after sharing."
+            f"stop with an error until this is sorted. This app signs in as "
+            f"`{who}` — that is the address a folder has to be shared with, and "
+            f"sharing with a different service account has no effect here."
         )
+        with st.expander("Check what the app can actually see"):
+            render_folder_diagnostic(portfolio, missing)
 
     if portfolio == "Hilton":
         render_hilton_update(hotels)
