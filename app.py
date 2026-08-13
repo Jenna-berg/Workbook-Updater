@@ -406,38 +406,115 @@ def parse_ihg_history_forecast(file_like):
             "subtotals": subtotals, "total": total}
 
 
-def build_ihg_rob_plan(parsed, ws, as_of=None):
-    """ROB changes for one IHG hotel from the History and Forecast PDF.
+_BOB_MONTHS = {m.upper(): i + 1 for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
 
-    The report covers only the current month, so only that month's block is
-    touched. The Total row supplies all four figures: Total Occ. is the room
-    nights, Total Hotel Room Revenue the revenue, and the Blocks pair the
-    group rooms and group revenue.
+
+def parse_ihg_business_on_books(file_like):
+    """Business on the Books PDF → {report_date, months: {(year, month): {...}}}
+
+    One page per month, running twelve-odd months out from the report date,
+    each ending in a Total row. Per month it yields rooms, group_rooms,
+    group_rev and total_rev.
+
+    Group rooms is Blk-R + D-Blk. That pair together equals the single
+    'Blocks Deduct Rms.' column of the History and Forecast report over the
+    same span, which is what lets the two reports be used side by side.
+
+    Note the first month is partial — this report starts at the report date,
+    not the 1st — so the current month must come from History and Forecast
+    instead, which covers it end to end.
+    """
+    import pdfplumber
+
+    months, report_date = {}, None
+    with pdfplumber.open(file_like) as pdf:
+        for page in pdf.pages:
+            lines = (page.extract_text() or "").split("\n")
+            if report_date is None and lines:
+                m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$", lines[0].strip())
+                if m:
+                    mm, dd, yy = (int(x) for x in m.groups())
+                    report_date = datetime.date(2000 + yy, mm, dd)
+
+            hdr = next((l for l in lines if "Ind-R" in l and "Blk-R" in l), None)
+            tot = next((l for l in lines if l.strip().startswith("Total ")), None)
+            if not hdr or not tot:
+                continue
+            mh = re.match(r"^([A-Za-z]{3})\s+(\d{2})\b", hdr.strip())
+            if not mh:
+                continue
+            mon = _BOB_MONTHS.get(mh.group(1).upper())
+            if not mon:
+                continue
+            year = 2000 + int(mh.group(2))
+
+            nums = re.findall(r"[\d,]+\.?\d*", tot)
+            if len(nums) < 16:
+                continue
+            v = [_ihg_num(x) for x in nums]
+            # Ind-R Blk-R D-Blk N-Blk T-Rms OOO OOS Turn Avbl Occ%
+            # Ind-Revenue Ind-Avg Blk-Revenue Blk-Avg Total-Revenue Total-Avg
+            months[(year, mon)] = {
+                "rooms":       v[4],
+                "group_rooms": v[1] + v[2],
+                "group_rev":   v[12],
+                "total_rev":   v[14],
+            }
+    if not months:
+        raise ValueError(
+            "No month totals found — is this the Business on the Books report?")
+    return {"report_date": report_date, "months": months}
+
+
+def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
+    """ROB changes for one IHG hotel from the two IHG PDFs.
+
+    History and Forecast covers the current month end to end and supplies it;
+    Business on the Books starts at the report date, so its own current month
+    is partial and is deliberately skipped in favour of that. Every later
+    month comes from Business on the Books.
+
+    Months already closed are never touched, and neither is any cell holding a
+    formula.
     """
     as_of = as_of or parsed.get("report_date") or datetime.date.today()
-    month = as_of.month
     blocks = rob_month_blocks(ws)
-    labels = blocks.get(month - 1)
     changes = [{"row": 4, "col": 5, "label": "As-of date", "month": None,
                 "new_value": as_of, "skip_reason": None}]
-    if not labels:
-        return changes
 
-    t = parsed["total"]
-    for lab, value, name in [
-        ("revenue",        round(t["total_rev"], 2),  "Revenue"),
-        ("room nights",    int(round(t["total_occ"])), "Room Nights"),
-        ("group rms sold", int(round(t["blk_rms"])),  "Group Rms sold"),
-        ("group rm rev",   round(t["blk_rev"], 2),    "Group Rm Rev"),
-    ]:
-        row = labels.get(lab)
-        if row is None:
-            continue
-        changes.append({
-            "row": row, "col": 5, "label": name, "month": month,
-            "new_value": value,
-            "skip_reason": "formula" if is_formula(ws.cell(row, 5).value) else None,
-        })
+    def emit(labels, month, rooms, rev, grp_rooms, grp_rev, source):
+        for lab, value, name in [
+            ("revenue",        round(rev, 2),            "Revenue"),
+            ("room nights",    int(round(rooms)),        "Room Nights"),
+            ("group rms sold", int(round(grp_rooms)),    "Group Rms sold"),
+            ("group rm rev",   round(grp_rev, 2),        "Group Rm Rev"),
+        ]:
+            row = labels.get(lab)
+            if row is None:
+                continue
+            changes.append({
+                "row": row, "col": 5, "label": f"{name} ({source})", "month": month,
+                "new_value": value,
+                "skip_reason": "formula" if is_formula(ws.cell(row, 5).value) else None,
+            })
+
+    cur = blocks.get(as_of.month - 1)
+    if cur:
+        t = parsed["total"]
+        emit(cur, as_of.month, t["total_occ"], t["total_rev"],
+             t["blk_rms"], t["blk_rev"], "H&F")
+
+    if bob:
+        for (year, month), m in sorted(bob["months"].items()):
+            if year != as_of.year or month <= as_of.month:
+                continue          # current month comes from H&F; past is closed
+            labels = blocks.get(month - 1)
+            if not labels:
+                continue
+            emit(labels, month, m["rooms"], m["total_rev"],
+                 m["group_rooms"], m["group_rev"], "BoB")
     return changes
 
 
@@ -5075,9 +5152,11 @@ def render_ihg_update(hotels):
     id_map = {h[0]: h[1] for h in hotels}
 
     st.caption(
-        "Upload the History and Forecast Business Block PDF for the current "
-        "month. The ROB takes its Total row; the Forecast takes the daily rows, "
-        "split into actuals and on-the-books at the report's own Subtotal line."
+        "Two PDFs. History and Forecast covers the current month end to end — "
+        "it fills that month of the ROB and the whole Forecast, split into "
+        "actuals and on-the-books at its own Subtotal line. Business on the "
+        "Books starts at the report date and runs a year out, filling every "
+        "later month of the ROB."
     )
 
     with st.container(border=True):
@@ -5092,19 +5171,33 @@ def render_ihg_update(hotels):
                 default=["ROB", "Forecast"],
                 key="ihg_wb",
             ) or []
-        pdf_file = st.file_uploader(
-            "History and Forecast Business Block (PDF)",
-            type=["pdf"], key=f"ihg_pdf_{hotel_sel}")
+        c1, c2 = st.columns(2)
+        with c1:
+            pdf_file = st.file_uploader(
+                "History and Forecast Business Block (PDF)",
+                type=["pdf"], key=f"ihg_pdf_{hotel_sel}")
+        with c2:
+            bob_file = st.file_uploader(
+                "Business on the Books (PDF)",
+                type=["pdf"], key=f"ihg_bob_{hotel_sel}")
 
     if not pdf_file:
-        st.info("Upload the PDF to continue.")
+        st.info("Upload the History and Forecast PDF to continue.")
         return
 
     try:
         parsed = parse_ihg_history_forecast(pdf_file)
     except Exception as e:
-        st.error(f"Could not read the PDF: {e}")
+        st.error(f"Could not read the History and Forecast PDF: {e}")
         return
+
+    bob = None
+    if bob_file:
+        try:
+            bob = parse_ihg_business_on_books(bob_file)
+        except Exception as e:
+            st.error(f"Could not read the Business on the Books PDF: {e}")
+            return
 
     past = [d for d in parsed["days"] if d["is_past"]]
     future = [d for d in parsed["days"] if not d["is_past"]]
@@ -5114,6 +5207,26 @@ def render_ihg_update(hotels):
         f"({len(past)} completed, {len(future)} on the books). "
         f"Month total {t['total_occ']:,.0f} rooms / ${t['total_rev']:,.2f}."
     )
+
+    if bob:
+        # The two reports overlap from the report date to month end; if they
+        # disagree there they were pulled at different moments and the ROB
+        # would mix them.
+        cur = bob["months"].get((parsed["report_date"].year, parsed["report_date"].month))
+        sub = parsed["subtotals"][1] if len(parsed["subtotals"]) > 1 else None
+        if cur and sub and abs(cur["total_rev"] - sub["total_rev"]) > 1:
+            st.warning(
+                f"The two reports disagree over their overlapping dates "
+                f"(Business on the Books ${cur['total_rev']:,.2f} vs History and "
+                f"Forecast ${sub['total_rev']:,.2f}). They were probably pulled at "
+                f"different times — re-pull both together for a clean run."
+            )
+        st.success(
+            f"Business on the Books — {len(bob['months'])} months, "
+            f"{sum(1 for m in bob['months'].values() if m['rooms'])} with business on them."
+        )
+    else:
+        st.info("No Business on the Books PDF — only the current month of the ROB will be filled.")
 
     if not st.button("Preview changes", key="ihg_preview", type="primary"):
         return
@@ -5132,7 +5245,7 @@ def render_ihg_update(hotels):
         if wb_type == "ROB":
             avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
             sheet = first_uncolored_sheet(wb, avail)
-            changes = build_ihg_rob_plan(parsed, wb[sheet])
+            changes = build_ihg_rob_plan(parsed, wb[sheet], bob=bob)
             passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                       if w and n != sheet]
             extra = "  ·  skipped " + "; ".join(passed) if passed else ""
