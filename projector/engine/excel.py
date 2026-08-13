@@ -146,6 +146,31 @@ def block_rows(blocks: list[tuple[str, pd.DataFrame, object]]) -> list[tuple[int
     return positions
 
 
+def _write_num(ws, row: int, col: int, value, fmt=None) -> None:
+    """Write a number, leaving the cell blank when the value isn't finite.
+
+    Growth against a zero base year comes out infinite, and a ratio with no
+    denominator comes out NaN. XlsxWriter refuses to write either, so a single
+    such value failed the whole download rather than the one cell:
+
+        NAN/INF not supported in write_number() without 'nan_inf_to_errors'
+
+    Testing with pd.isna is not enough on its own — it is False for +/-inf.
+    A blank cell is the right answer here anyway: the rate genuinely is not
+    defined, and writing 0 would read as "no growth", which is a different
+    claim.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        ws.write_blank(row, col, None, fmt)
+        return
+    if not np.isfinite(number):
+        ws.write_blank(row, col, None, fmt)
+        return
+    ws.write_number(row, col, number, fmt)
+
+
 def _write_blocks(book, formats: dict, name: str,
                   blocks: list[tuple[str, pd.DataFrame, object]]) -> None:
     """Stack several titled tables down one sheet instead of spreading them over tabs."""
@@ -173,7 +198,7 @@ def _write_blocks(book, formats: dict, name: str,
                 elif pd.isna(value):
                     ws.write_blank(row, c, None, fmt)
                 elif isinstance(value, (int, float, np.integer, np.floating)):
-                    ws.write_number(row, c, float(value), fmt)
+                    _write_num(ws, row, c, value, fmt)
                 else:
                     ws.write_string(row, c, str(value))
             row += 1
@@ -370,7 +395,7 @@ def _write_assumptions(
         if style is None:
             ws.write_string(row + i, 1, str(value))
         else:
-            ws.write_number(row + i, 1, float(value), formats[style])
+            _write_num(ws, row + i, 1, value, formats[style])
     row += len(fixed) + 2
     ws.write(row, 0, "Smoothing applies to rooms only, and blends each night as "
                      "(1 - s) x last year's actual + s x the smoothed estimate. ADR is never "
@@ -448,10 +473,10 @@ def _write_daily(book, formats: dict, model: ForecastModel, a: Assumptions,
 
         for seg in segments:
             for j in range(n_years):
-                ws.write_number(r + 1, index[f"{seg} Base Rooms Y{j + 1}"],
-                                float(model.base_rooms[seg][j][r]))
-                ws.write_number(r + 1, index[f"{seg} Base ADR Y{j + 1}"],
-                                float(model.base_adr[seg][j][r]))
+                _write_num(ws, r + 1, index[f"{seg} Base Rooms Y{j + 1}"],
+                           model.base_rooms[seg][j][r])
+                _write_num(ws, r + 1, index[f"{seg} Base ADR Y{j + 1}"],
+                           model.base_adr[seg][j][r])
 
         month_cell = cell("MonthNum", r, abs_col=True)
         years_cell = cell("YearsBack", r, abs_col=True)
@@ -676,9 +701,9 @@ def _write_monthly(book, formats: dict, model: ForecastModel, a: Assumptions,
             if pd.isna(value):
                 ws.write_blank(row, col_of[head], None, formats[fmt])
             else:
-                ws.write_number(row, col_of[head],
-                                float(value) / 100 if fmt == "pct" else float(value),
-                                formats[fmt])
+                _write_num(ws, row, col_of[head],
+                           float(value) / 100 if fmt == "pct" else float(value),
+                           formats[fmt])
 
         for head, current_col, prior_col in (("Rooms vs LY %", "Total Rooms", "LY Rooms"),
                                              ("ADR vs LY %", "Total ADR", "LY ADR"),
