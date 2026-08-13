@@ -6970,10 +6970,12 @@ with tab_pl:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_projection:
     st.divider()
-    st.header("1-Year Projection")
-    st.info(
-        "Not built yet — this is a placeholder so the section has its shape.\n\n"
-        "A day-by-day rooms and ADR projection a year out already exists as a "
-        "separate Budget Projector app in its own repository. It can either be "
-        "brought in here or left where it is and linked to."
-    )
+    try:
+        from projector import ui as projector_ui
+        projector_ui.render()
+    except Exception as exc:
+        st.error(f"1-Year Projection failed to load: {exc}")
+        st.caption(
+            "It needs altair, numpy and XlsxWriter — check they installed with "
+            "the rest of requirements.txt."
+        )
