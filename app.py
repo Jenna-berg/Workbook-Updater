@@ -3022,6 +3022,25 @@ def get_drive_service():
 
 
 @st.cache_data(ttl=3600)
+def service_account_email():
+    """The address folders have to be shared with, read from the live
+    credentials rather than written down anywhere.
+
+    Worth taking from the credentials themselves: the account in use has
+    changed before, and telling someone to share a folder with a stale address
+    produces a hotel that stays invisible with no indication why.
+    """
+    try:
+        if "google_credentials" in st.secrets:
+            return dict(st.secrets["google_credentials"]).get("client_email")
+        import json
+        with open(CREDS_PATH, encoding="utf-8") as fh:
+            return json.load(fh).get("client_email")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
 def has_edit_access(folder_id, email="workbook-updater-live@linchris-rob-updater.iam.gserviceaccount.com"):
     """Check if the given email has editor access to a folder.
     Returns True if editor, False if viewer-only or no access.
@@ -6172,10 +6191,14 @@ with tab_weekly:
 
     missing = portfolio_hotels_missing(portfolio, all_discovered)
     if missing:
+        who = service_account_email() or "the service account"
         st.warning(
-            f"No Drive folder found for: {', '.join(missing)} — "
-            f"they won't appear below. A hotel is only discovered if its folder "
-            f"contains a 'REVENUE REPORTS' subfolder shared with the service account."
+            f"**Not shared with the app yet:** {', '.join(missing)}\n\n"
+            f"Nothing in Drive matches these names, so they can't appear below. "
+            f"Share each hotel's folder — or at least its `REVENUE REPORTS` "
+            f"subfolder — with\n\n`{who}`\n\n"
+            f"as Editor, then press ↺ to refresh. A hotel is only discovered "
+            f"once a folder it can see contains a `REVENUE REPORTS` subfolder."
         )
 
     if portfolio == "Hilton":
