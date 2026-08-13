@@ -6970,12 +6970,28 @@ with tab_pl:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_projection:
     st.divider()
-    try:
-        from projector import ui as projector_ui
-        projector_ui.render()
-    except Exception as exc:
-        st.error(f"1-Year Projection failed to load: {exc}")
+    # Streamlit runs every tab body on every interaction, so importing the
+    # projector here would pull altair and XlsxWriter — about 55 MB — into
+    # memory on each page view, whether or not anyone opens this tab. This app
+    # already runs close to the limit on Streamlit Cloud, so the import waits
+    # behind a click and only happens for someone actually using the tool.
+    if not st.session_state.get("projector_open"):
+        st.header("1-Year Projection")
         st.caption(
-            "It needs altair, numpy and XlsxWriter — check they installed with "
-            "the rest of requirements.txt."
+            "Day-by-day rooms and ADR budget for the year ahead, built from a "
+            "segmentation pivot export."
         )
+        if st.button("Open the Budget Projector", key="projector_open_btn",
+                     type="primary"):
+            st.session_state["projector_open"] = True
+            st.rerun()
+    else:
+        try:
+            from projector import ui as projector_ui
+            projector_ui.render()
+        except Exception as exc:
+            st.error(f"1-Year Projection failed to load: {exc}")
+            st.caption(
+                "It needs altair, numpy and XlsxWriter — check they installed "
+                "with the rest of requirements.txt."
+            )
