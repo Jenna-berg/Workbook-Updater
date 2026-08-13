@@ -57,7 +57,24 @@ def _aggregate(frame: pd.DataFrame, group_key, segments: list[str], capacity: in
 
 
 def _safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
-    return (num / den.replace(0, pd.NA)).astype(float).fillna(0.0)
+    """num / den, with a zero denominator giving 0 rather than an error.
+
+    The zero is blanked with `where` rather than replaced by pd.NA. pd.NA is a
+    pandas singleton that numpy cannot cast, so the old form raised
+
+        float() argument must be a string or a real number, not 'NAType'
+
+    the moment any denominator was zero — which happens for any segment a hotel
+    has no rooms in, and for a rooms-available figure of zero. `where` leaves a
+    plain NaN, which casts cleanly and is then filled.
+
+    Both sides are coerced first: these columns come out of a spreadsheet pivot
+    and can carry blanks or stray text that would otherwise make the division
+    object-typed.
+    """
+    num = pd.to_numeric(num, errors="coerce")
+    den = pd.to_numeric(den, errors="coerce")
+    return (num / den.where(den != 0)).astype(float).fillna(0.0)
 
 
 def monthly(daily: pd.DataFrame, capacity: int, segments: list[str] | None = None) -> pd.DataFrame:
