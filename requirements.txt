@@ -9,6 +9,11 @@ google-auth-httplib2>=0.1
 xlrd>=2.0
 pdfplumber>=0.11
 # Budget Projector (Financial Tools -> 1-Year Projection)
-numpy>=1.26
-altair>=5.0
+# altair must stay below 6: streamlit 1.41 itself requires altair<6, and
+# altair 6 needs a newer typing_extensions than streamlit 1.41 allows —
+# together those produce "_TypedDictMeta.__new__() got an unexpected keyword
+# argument 'closed'" at import. The projector only uses long-stable altair
+# APIs (Chart/X/Y/Color/Tooltip/Scale/Axis/Row/Column), so 5.x is plenty.
+numpy>=1.26,<3
+altair>=5.0,<6
 XlsxWriter>=3.2
