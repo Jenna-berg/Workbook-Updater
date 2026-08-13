@@ -2890,9 +2890,25 @@ def get_hotels_from_drive():
             else:
                 hotels.append((display, MULTI_ID_PREFIX + ",".join(info["ids"])))
 
+        hotels = [(name, fid) for name, fid in hotels if not _is_test_folder(name)]
         return sorted(hotels, key=lambda x: x[0])
     except Exception:
         return []
+
+
+# Sandbox copies live alongside the real folders — 'LONG BEACH - TEST' next to
+# 'LONG BEACH'. They are filtered out at discovery rather than in any one
+# dropdown, so nothing downstream can reach them: not the workbook update, not
+# the OOO report, not the ancillary tool.
+#
+# Matched as a whole word so a hotel whose name merely contains the letters
+# (Testa, Contest Point) would not disappear.
+_TEST_FOLDER_RE = re.compile(r"\bTEST\b", re.IGNORECASE)
+
+
+def _is_test_folder(name: str) -> bool:
+    return bool(_TEST_FOLDER_RE.search(str(name or "")))
+
 
 WORKBOOK_TYPES = ["ROB", "Strategy Report", "Forecast"]
 
