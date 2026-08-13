@@ -484,7 +484,14 @@ def parse_ihg_business_on_books(file_like):
                 d_mm, d_dd, d_yy = (int(dm.group(i)) for i in (1, 2, 3))
                 entry["days"].append({
                     "date":      datetime.date(2000 + d_yy, d_mm, d_dd),
+                    "ind_rms":   dv[0],
+                    "blk_rms":   dv[1],
+                    "npu_rms":   dv[2],
                     "rooms":     dv[4],
+                    "ooo":       dv[5],
+                    "turn":      dv[7],
+                    "ind_rev":   dv[10],
+                    "blk_rev":   dv[12],
                     "total_rev": dv[14],
                     "avg_rate":  dv[15],
                 })
@@ -624,6 +631,112 @@ def build_ihg_forecast_plan(parsed, ws, wb=None):
                 continue
             stamp = d["date"].strftime("%b %d").replace(" 0", " ")
             put(snap, col, f"{stamp} wk/wk rooms", int(round(d["total_occ"])))
+    return changes
+
+
+def detect_ihg_sr_columns(ws):
+    """{field: column} for an IHG Strategy Report, read off the header.
+
+    Headings are split across rows 3 and 4 and only the pair is unique — 'TRAN'
+    alone is both the LY transient rooms column and the start of the transient
+    revenue heading — so the two rows are joined before matching.
+    """
+    wanted = {
+        ("trans", "sold"):     "trans_rms",
+        ("group", "sold"):     "group_rms",
+        ("prop.", "regrets"):  "regrets",
+        ("grp rms", "n/pu"):   "group_npu",
+        ("ooo", "rooms"):      "ooo",
+        ("tran", "rev ty"):    "trans_rev",
+        ("grp", "rev ty"):     "group_rev",
+    }
+    out = {}
+    for c in range(1, 70):
+        h3 = str(ws.cell(3, c).value or "").strip().lower()
+        h4 = str(ws.cell(4, c).value or "").strip().lower()
+        key = wanted.get((h3, h4))
+        if key and key not in out:
+            out[key] = c
+    return out
+
+
+def build_ihg_sr_plan(hf, bob, ws):
+    """Strategy Report changes for one IHG hotel from the two PDFs.
+
+    Each dated row takes its figures from whichever report covers that day:
+    History and Forecast for days already behind the Business on the Books
+    start, Business on the Books from that date on. The boundary is read from
+    the report itself rather than assumed, since it moves with the pull date.
+
+    History and Forecast carries no OOO or turnaway columns, so for the earlier
+    days those two are left as they are rather than zeroed.
+
+    Monthly total rows never match a date and so are skipped, which is what
+    keeps them from being written over.
+    """
+    cols = detect_ihg_sr_columns(ws)
+    if "trans_rms" not in cols:
+        return []
+
+    hf_by_date = {d["date"]: d for d in (hf or {}).get("days", [])}
+    bob_by_date = {}
+    for m in (bob or {}).get("months", {}).values():
+        for d in m.get("days", []):
+            bob_by_date[d["date"]] = d
+    if not bob_by_date and not hf_by_date:
+        return []
+    bob_start = min(bob_by_date) if bob_by_date else None
+
+    changes = []
+
+    def put(row, col, label, value, when):
+        if col is None or value is None:
+            return
+        changes.append({
+            "row": row, "col": col, "label": f"{when:%b %d} {label}".replace(" 0", " "),
+            "month": when.month, "new_value": value,
+            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+        })
+
+    for r in range(5, ws.max_row + 1):
+        v = ws.cell(r, 3).value
+        if isinstance(v, datetime.datetime):
+            day = v.date()
+        elif isinstance(v, datetime.date):
+            day = v
+        else:
+            continue                     # blank rows and monthly totals
+
+        if bob_start is not None and day >= bob_start:
+            d = bob_by_date.get(day)
+            if not d:
+                continue
+            put(r, cols.get("trans_rms"), "trans sold",  int(round(d["ind_rms"])), day)
+            put(r, cols.get("group_rms"), "group sold",
+                int(round(d["blk_rms"] + d["npu_rms"])), day)
+            put(r, cols.get("group_npu"), "grp n/pu",    int(round(d["npu_rms"])), day)
+            put(r, cols.get("ooo"),       "OOO",         int(round(d["ooo"])), day)
+            put(r, cols.get("regrets"),   "regrets",     int(round(d["turn"])), day)
+            put(r, cols.get("trans_rev"), "trans rev",   round(d["ind_rev"], 2), day)
+            put(r, cols.get("group_rev"), "group rev",   round(d["blk_rev"], 2), day)
+        else:
+            d = hf_by_date.get(day)
+            if not d:
+                continue
+            put(r, cols.get("trans_rms"), "trans sold", int(round(d["ind_rms"])), day)
+            put(r, cols.get("group_rms"), "group sold", int(round(d["blk_rms"])), day)
+            put(r, cols.get("trans_rev"), "trans rev",  round(d["ind_rev"], 2), day)
+            put(r, cols.get("group_rev"), "group rev",  round(d["blk_rev"], 2), day)
+            # A day that has already happened can have nothing left unpicked.
+            put(r, cols.get("group_npu"), "grp n/pu", 0, day)
+            # History and Forecast carries no OOO or turnaway columns, so these
+            # keep whatever earlier weeks put there — unless it's text, which
+            # would feed a #VALUE! into the row's demand and occupancy formulas.
+            for key in ("ooo", "regrets"):
+                col = cols.get(key)
+                if col and isinstance(ws.cell(r, col).value, str) \
+                        and not is_formula(ws.cell(r, col).value):
+                    put(r, col, f"{key} (cleared non-numeric)", 0, day)
     return changes
 
 
@@ -5394,9 +5507,9 @@ def render_ihg_update(hotels):
         with col_w:
             wb_sels = st.pills(
                 "Workbooks to update",
-                ["ROB", "Forecast"],
+                WORKBOOK_TYPES,
                 selection_mode="multi",
-                default=["ROB", "Forecast"],
+                default=WORKBOOK_TYPES,
                 key="ihg_wb",
             ) or []
         c1, c2 = st.columns(2)
@@ -5480,6 +5593,26 @@ def render_ihg_update(hotels):
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
                 note = "  ·  skipped " + "; ".join(passed) if passed else ""
+            elif wb_type == "Strategy Report":
+                avail = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
+                sheet = first_undone_strategy_sheet(wb, avail)
+                changes = build_ihg_sr_plan(parsed, bob, wb[sheet])
+                note = ""
+                if not bob:
+                    problems.append(
+                        "Strategy Report: without the Business on the Books PDF "
+                        "only the days before it starts can be filled.")
+                if not changes:
+                    problems.append(
+                        f"{file_name}: could not match the Strategy Report's "
+                        f"column headings on '{sheet}'.")
+                    continue
+                # The as-of date sits above the grid rather than in it.
+                changes.insert(0, {
+                    "row": 2, "col": 5, "label": "As-of date", "month": None,
+                    "new_value": parsed["report_date"],
+                    "skip_reason": "formula" if is_formula(wb[sheet].cell(2, 5).value) else None,
+                })
             else:
                 avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
                 sheet = first_unhighlighted_forecast_sheet(wb, avail)
