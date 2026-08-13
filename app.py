@@ -461,6 +461,12 @@ def parse_ihg_business_on_books(file_like):
                 "group_rooms": v[1] + v[2],
                 "group_rev":   v[12],
                 "total_rev":   v[14],
+                # D-Blk on its own is the blocked-but-not-picked-up remainder,
+                # which is what the ROB's pink 'Group rooms NPU' column wants.
+                # It is also counted inside group_rooms above, where the ROB
+                # asks for the whole block.
+                "npu_rooms":   v[2],
+                "blk_avg":     v[13],
                 "days":        [],
             }
             # Per-date rows, used to drive a Forecast for a month other than
@@ -505,27 +511,48 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
     changes = [{"row": 4, "col": 5, "label": "As-of date", "month": None,
                 "new_value": as_of, "skip_reason": None}]
 
+    def put(row, col, name, value, month, source):
+        if row is None:
+            return
+        changes.append({
+            "row": row, "col": col, "label": f"{name} ({source})", "month": month,
+            "new_value": value,
+            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+        })
+
     def emit(labels, month, rooms, rev, grp_rooms, grp_rev, source):
-        for lab, value, name in [
-            ("revenue",        round(rev, 2),            "Revenue"),
-            ("room nights",    int(round(rooms)),        "Room Nights"),
-            ("group rms sold", int(round(grp_rooms)),    "Group Rms sold"),
-            ("group rm rev",   round(grp_rev, 2),        "Group Rm Rev"),
-        ]:
-            row = labels.get(lab)
-            if row is None:
-                continue
-            changes.append({
-                "row": row, "col": 5, "label": f"{name} ({source})", "month": month,
-                "new_value": value,
-                "skip_reason": "formula" if is_formula(ws.cell(row, 5).value) else None,
-            })
+        put(labels.get("revenue"),        5, "Revenue",        round(rev, 2),         month, source)
+        put(labels.get("room nights"),    5, "Room Nights",    int(round(rooms)),     month, source)
+        put(labels.get("group rms sold"), 5, "Group Rms sold", int(round(grp_rooms)), month, source)
+        put(labels.get("group rm rev"),   5, "Group Rm Rev",   round(grp_rev, 2),     month, source)
+
+    def emit_npu(labels, month, m):
+        """Column G — the pink 'Group rooms NPU' pair.
+
+        Rooms are D-Blk, the part of the block still unpicked; revenue is that
+        at the block's own average rate, which is how the column has been kept
+        by hand (Nov: 55 x 112.16 = 6,168.80 to the cent).
+
+        This comes from Business on the Books even for the current month:
+        History and Forecast has no unpicked figure, and only the days still
+        ahead can have one anyway, which is exactly the span Business on the
+        Books starts from.
+        """
+        npu = m.get("npu_rooms", 0.0)
+        put(labels.get("group rms sold"), 7, "Group NPU rms",
+            int(round(npu)), month, "BoB")
+        put(labels.get("group rm rev"), 7, "Group NPU rev",
+            round(npu * m.get("blk_avg", 0.0), 2), month, "BoB")
 
     cur = blocks.get(as_of.month - 1)
     if cur:
         t = parsed["total"]
         emit(cur, as_of.month, t["total_occ"], t["total_rev"],
              t["blk_rms"], t["blk_rev"], "H&F")
+        if bob:
+            m = bob["months"].get((as_of.year, as_of.month))
+            if m:
+                emit_npu(cur, as_of.month, m)
 
     if bob:
         for (year, month), m in sorted(bob["months"].items()):
@@ -536,6 +563,7 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
                 continue
             emit(labels, month, m["rooms"], m["total_rev"],
                  m["group_rooms"], m["group_rev"], "BoB")
+            emit_npu(labels, month, m)
     return changes
 
 
@@ -587,7 +615,36 @@ def build_ihg_forecast_plan(parsed, ws, wb=None):
         else:
             put(otb_row, col, f"{stamp} OTB rooms", int(round(d["total_occ"])))
             put(adr_row, col, f"{stamp} OTB ADR",   round(d["avg_rate"], 2))
+
+    snap = find_forecast_snapshot_row(ws)
+    if snap:
+        for d in parsed["days"]:
+            col = col_of.get(d["date"])
+            if col is None:
+                continue
+            stamp = d["date"].strftime("%b %d").replace(" 0", " ")
+            put(snap, col, f"{stamp} wk/wk rooms", int(round(d["total_occ"])))
     return changes
+
+
+def find_forecast_snapshot_row(ws, search_from=45, search_to=90):
+    """Row in the week-over-week pickup grid that belongs to THIS week tab.
+
+    The grid stacks one row per weekly snapshot with a 'Pick UP' row between
+    each pair, computed as this snapshot minus the one above. Every row except
+    one is a formula reaching back into an earlier week's tab; the row for the
+    tab you're on is the one whose column A is '=A2' — a self-reference to its
+    own as-of date. That is the only row that should ever be written, and it
+    moves down by two with each successive week (WK2 row 57, WK3 59, WK4 61).
+
+    Returns None if no such row is found, so a template that doesn't carry
+    this grid is skipped rather than written to at a guessed row.
+    """
+    for r in range(search_from, search_to):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip().replace("+", "").replace(" ", "").upper() == "=A2":
+            return r
+    return None
 
 
 def build_ihg_next_month_forecast_plan(bob, ws, target_month, wb=None):
