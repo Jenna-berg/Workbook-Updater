@@ -6044,8 +6044,19 @@ if test_mode:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
     
-tab_weekly, tab_ancillary, tab_ooo, tab_pl = st.tabs(
-    ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report", "P&L Spreadsheet"])
+# ── Main menu ────────────────────────────────────────────────────────────────
+# Two sections rather than one flat row of tools. The tab objects are created
+# inside their section but used further down at module level — a Streamlit tab
+# is bound to its position on the page, not to the block that made it, so the
+# tool bodies below stay exactly where they are.
+main_revenue, main_financial = st.tabs(["📈  Revenue Management", "💵  Financial Tools"])
+
+with main_revenue:
+    tab_weekly, tab_ancillary, tab_ooo = st.tabs(
+        ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
+
+with main_financial:
+    tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
 
 with tab_weekly:
     st.divider()
@@ -6952,3 +6963,17 @@ with tab_pl:
                                "Miscellaneous, Fixed Expenses.")
                 except Exception as exc:
                     st.error("Build error: {}".format(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1-Year Projection
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_projection:
+    st.divider()
+    st.header("1-Year Projection")
+    st.info(
+        "Not built yet — this is a placeholder so the section has its shape.\n\n"
+        "A day-by-day rooms and ADR projection a year out already exists as a "
+        "separate Budget Projector app in its own repository. It can either be "
+        "brought in here or left where it is and linked to."
+    )
