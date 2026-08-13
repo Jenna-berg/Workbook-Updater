@@ -2976,16 +2976,26 @@ def portfolio_of(hotel_display_name):
 
 
 def hotels_in_portfolio(portfolio, discovered):
-    """[(display_name, folder_id)] from `discovered` belonging to `portfolio`,
-    ordered as declared above so the checkbox list is stable between runs.
-    Hotels that are declared but have no matching Drive folder are dropped —
-    surface those separately rather than showing an entry that cannot run."""
+    """[(display_name, folder_id)] for every hotel declared in `portfolio`,
+    in declared order so the list is stable between runs.
+
+    A hotel with no matching Drive folder is still listed, with an empty folder
+    id. Leaving it out meant a hotel could vanish from the dropdown with no
+    indication of why, and checking access up front to decide was slow enough
+    to be worse than the problem. Selecting one now fails when it is run, with
+    a message naming what is wrong.
+    """
     members = PORTFOLIO_HOTELS.get(portfolio, {})
     out = []
-    for kws in members.values():
-        for name, fid in discovered:
-            if any(k in name.upper() for k in kws) and (name, fid) not in out:
-                out.append((name, fid))
+    for label, kws in members.items():
+        matched = [(name, fid) for name, fid in discovered
+                   if any(k in name.upper() for k in kws)]
+        if matched:
+            for entry in matched:
+                if entry not in out:
+                    out.append(entry)
+        else:
+            out.append((label, ""))
     return out
 
 
@@ -3040,41 +3050,11 @@ def service_account_email():
         return None
 
 
-@st.cache_data(ttl=3600)
-def has_edit_access(folder_id, email="workbook-updater-live@linchris-rob-updater.iam.gserviceaccount.com"):
-    """Check if the given email has editor access to a folder.
-    Returns True if editor, False if viewer-only or no access.
-    Cached for 1 hour to avoid repeated API calls.
-    """
-    try:
-        svc = get_drive_service()
-        perms = svc.permissions().list(
-            fileId=folder_id, fields="permissions(emailAddress,role)",
-            supportsAllDrives=True
-        ).execute()
-        for perm in perms.get("permissions", []):
-            if perm.get("emailAddress") == email:
-                return perm.get("role") == "owner" or perm.get("role") == "organizer" or perm.get("role") == "editor"
-        return False
-    except Exception:
-        return False
-
-
-@st.cache_data(ttl=3600)
-def get_hotels_with_edit_access():
-    """Return list of hotels with edit access. Cached for 1 hour."""
-    all_hotels = get_hotels_from_drive()
-    filtered = []
-    for hotel_name, folder_id in all_hotels:
-        # Handle MULTI_ID format
-        if folder_id.startswith(MULTI_ID_PREFIX):
-            ids = folder_id[len(MULTI_ID_PREFIX):].split(",")
-            if any(has_edit_access(fid) for fid in ids):
-                filtered.append((hotel_name, folder_id))
-        else:
-            if has_edit_access(folder_id):
-                filtered.append((hotel_name, folder_id))
-    return filtered
+# has_edit_access() / get_hotels_with_edit_access() removed. They pre-checked
+# every hotel's folder permissions to decide what to show, which meant a Drive
+# call per hotel before the page could draw — slow enough that it was worse
+# than the problem it solved. Nothing called them. The dropdown now lists every
+# declared hotel and reports a sharing problem when one is actually run.
 
 
 def drive_find_folder_by_keyword(service, keyword, parent_id=None):
@@ -5416,6 +5396,12 @@ def render_hilton_update(hotels):
         svc = get_drive_service()
         jobs, problems = [], []
         for name, fid in selected:
+            if not fid:
+                problems.append(
+                    f"{name}: no Drive folder the app can see. Share its folder "
+                    f"(or its REVENUE REPORTS subfolder) with "
+                    f"{service_account_email() or 'the service account'} as Editor.")
+                continue
             try:
                 wash = parse_group_wash(wash_files[name])
             except Exception as e:
@@ -5597,6 +5583,14 @@ def render_ihg_update(hotels):
         svc = get_drive_service()
         hotel_id = id_map[hotel_sel]
         jobs, problems = [], []
+        if not hotel_id:
+            st.error(
+                f"{hotel_sel} has no Drive folder the app can see. Share its "
+                f"folder (or its REVENUE REPORTS subfolder) with "
+                f"`{service_account_email() or 'the service account'}` as "
+                f"Editor, then press ↺ to refresh."
+            )
+            st.stop()
         for wb_type in wb_sels:
             result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
             if err or not result:
