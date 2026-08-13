@@ -322,6 +322,176 @@ def parse_group_wash(file_like):
     return out
 
 
+# ── IHG portfolio source file ────────────────────────────────────────────────
+# "History and Forecast Business Block" — a PDF covering the current month
+# end to end, one row per date plus two Subtotal rows and a Total. The rows
+# above the first Subtotal are days that have already happened; the rows below
+# it are still on the books. That single split drives everything: the ROB
+# takes the Total row, the Forecast takes the daily rows on both sides of it,
+# and the Strategy Report takes the first Subtotal.
+#
+# Columns, left to right:
+#   Date, Total Occ., Arr. Rms.,
+#   Individual: Deduct Rms., Room Revenue, Non-D Rms., Non-Deduct Room Revenue
+#   Blocks:     Deduct Rms., Room Revenue, Non-D Rms., Non-Deduct Room Revenue
+#   Total Hotel: Occ %, Room Revenue, Average Rate
+
+_IHG_NUM = r"([\d,]+\.?\d*)"
+_IHG_ROW = re.compile(
+    r"^(?P<label>\d{2}-\d{2}-\d{2}|Subtotal|Total)\s+"
+    + r"\s+".join([_IHG_NUM] * 10)
+    + r"\s+(?P<occpct>[\d.]+)%\s+" + _IHG_NUM + r"\s+" + _IHG_NUM + r"\s*$"
+)
+_IHG_FIELDS = ["total_occ", "arr_rms", "ind_rms", "ind_rev", "ind_nond_rms",
+               "ind_nond_rev", "blk_rms", "blk_rev", "blk_nond_rms", "blk_nond_rev"]
+
+
+def _ihg_num(s):
+    try:
+        return float(str(s).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_ihg_history_forecast(file_like):
+    """History and Forecast Business Block PDF → parsed rows.
+
+    Returns {report_date, days: [...], subtotals: [...], total: {...}} where
+    each day carries date, total_occ, blk_rms, blk_rev, total_rev, avg_rate
+    and an `is_past` flag set from the position of the first Subtotal — the
+    report prints completed days above it and on-the-books days below.
+    """
+    import pdfplumber
+
+    text = ""
+    with pdfplumber.open(file_like) as pdf:
+        for page in pdf.pages:
+            text += (page.extract_text() or "") + "\n"
+
+    report_date = None
+    m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$", text.split("\n")[0].strip())
+    if m:
+        mm, dd, yy = (int(x) for x in m.groups())
+        report_date = datetime.date(2000 + yy, mm, dd)
+
+    days, subtotals, total = [], [], None
+    seen_subtotal = False
+    for line in text.split("\n"):
+        mt = _IHG_ROW.match(line.strip())
+        if not mt:
+            continue
+        nums = [_ihg_num(g) for g in mt.groups()[1:11]]
+        rec = dict(zip(_IHG_FIELDS, nums))
+        rec["occ_pct"] = float(mt.group("occpct"))
+        rec["total_rev"] = _ihg_num(mt.groups()[-2])
+        rec["avg_rate"] = _ihg_num(mt.groups()[-1])
+        label = mt.group("label")
+        if label == "Subtotal":
+            subtotals.append(rec)
+            seen_subtotal = True
+        elif label == "Total":
+            total = rec
+        else:
+            mm, dd, yy = (int(x) for x in label.split("-"))
+            rec["date"] = datetime.date(2000 + yy, mm, dd)
+            # Above the first Subtotal = already happened.
+            rec["is_past"] = not seen_subtotal
+            days.append(rec)
+
+    if total is None:
+        raise ValueError(
+            "No 'Total' row found — is this the History and Forecast Business "
+            "Block report?")
+    return {"report_date": report_date, "days": days,
+            "subtotals": subtotals, "total": total}
+
+
+def build_ihg_rob_plan(parsed, ws, as_of=None):
+    """ROB changes for one IHG hotel from the History and Forecast PDF.
+
+    The report covers only the current month, so only that month's block is
+    touched. The Total row supplies all four figures: Total Occ. is the room
+    nights, Total Hotel Room Revenue the revenue, and the Blocks pair the
+    group rooms and group revenue.
+    """
+    as_of = as_of or parsed.get("report_date") or datetime.date.today()
+    month = as_of.month
+    blocks = rob_month_blocks(ws)
+    labels = blocks.get(month - 1)
+    changes = [{"row": 4, "col": 5, "label": "As-of date", "month": None,
+                "new_value": as_of, "skip_reason": None}]
+    if not labels:
+        return changes
+
+    t = parsed["total"]
+    for lab, value, name in [
+        ("revenue",        round(t["total_rev"], 2),  "Revenue"),
+        ("room nights",    int(round(t["total_occ"])), "Room Nights"),
+        ("group rms sold", int(round(t["blk_rms"])),  "Group Rms sold"),
+        ("group rm rev",   round(t["blk_rev"], 2),    "Group Rm Rev"),
+    ]:
+        row = labels.get(lab)
+        if row is None:
+            continue
+        changes.append({
+            "row": row, "col": 5, "label": name, "month": month,
+            "new_value": value,
+            "skip_reason": "formula" if is_formula(ws.cell(row, 5).value) else None,
+        })
+    return changes
+
+
+def build_ihg_forecast_plan(parsed, ws, wb=None):
+    """Forecast changes for one IHG hotel from the same PDF.
+
+    A day that has already happened is an actual and goes to the ACTUAL block
+    as rooms + revenue; a day still ahead is on the books and goes to the OTB
+    block as rooms + rate. Which side a day falls on comes from the report's
+    own Subtotal split rather than from today's date, so a report pulled for
+    an earlier as-of still lands correctly.
+
+    `wb` is needed because an untouched week tab carries its dates as formulas
+    pointing at WK1 rather than as literal dates; without the workbook there is
+    nothing to resolve them against and no column would match.
+    """
+    rows = locate_forecast_rows(ws)
+    if not rows:
+        return []
+    otb_row       = rows["otb_rooms_row"]
+    adr_row       = rows["adr_otb_row"]
+    act_rooms_row = rows["actual_rooms_row"]
+    act_rev_row   = rows["actual_revenue_row"]
+
+    col_of = {}
+    for date_val, col in build_forecast_date_col_map(
+            ws, wb=wb, date_row=rows["date_row"]).items():
+        col_of[date_val.date() if isinstance(date_val, datetime.datetime) else date_val] = col
+
+    changes = []
+
+    def put(row, col, label, value):
+        if row is None or col is None:
+            return
+        changes.append({
+            "row": row, "col": col, "label": label, "month": None,
+            "new_value": value,
+            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+        })
+
+    for d in parsed["days"]:
+        col = col_of.get(d["date"])
+        if col is None:
+            continue
+        stamp = d["date"].strftime("%b %d").replace(" 0", " ")
+        if d["is_past"]:
+            put(act_rooms_row, col, f"{stamp} actual rooms",   int(round(d["total_occ"])))
+            put(act_rev_row,   col, f"{stamp} actual revenue", round(d["total_rev"], 2))
+        else:
+            put(otb_row, col, f"{stamp} OTB rooms", int(round(d["total_occ"])))
+            put(adr_row, col, f"{stamp} OTB ADR",   round(d["avg_rate"], 2))
+    return changes
+
+
 # ── ROB Update ───────────────────────────────────────────────────────────────
 
 ROB_SHEETS = ["wk one", "wk two", "wk three", "wk four", "wk five", "wk six"]
@@ -4888,6 +5058,108 @@ def render_hilton_update(hotels):
                 st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
 
 
+def render_ihg_update(hotels):
+    """IHG portfolio run.
+
+    One hotel at a time, like Stay In Touch, but fed by the History and
+    Forecast Business Block PDF rather than a CSV. That single report drives
+    both workbooks: the ROB takes its Total row for the current month, and the
+    Forecast takes the daily rows — completed days as actuals, on-the-books
+    days as OTB rooms and rate.
+    """
+    if not hotels:
+        st.info("No IHG properties found in Drive.")
+        return
+
+    hotel_names = [h[0] for h in hotels]
+    id_map = {h[0]: h[1] for h in hotels}
+
+    st.caption(
+        "Upload the History and Forecast Business Block PDF for the current "
+        "month. The ROB takes its Total row; the Forecast takes the daily rows, "
+        "split into actuals and on-the-books at the report's own Subtotal line."
+    )
+
+    with st.container(border=True):
+        col_h, col_w = st.columns([3, 3])
+        with col_h:
+            hotel_sel = st.selectbox("Hotel", hotel_names, key="ihg_hotel")
+        with col_w:
+            wb_sels = st.pills(
+                "Workbooks to update",
+                ["ROB", "Forecast"],
+                selection_mode="multi",
+                default=["ROB", "Forecast"],
+                key="ihg_wb",
+            ) or []
+        pdf_file = st.file_uploader(
+            "History and Forecast Business Block (PDF)",
+            type=["pdf"], key=f"ihg_pdf_{hotel_sel}")
+
+    if not pdf_file:
+        st.info("Upload the PDF to continue.")
+        return
+
+    try:
+        parsed = parse_ihg_history_forecast(pdf_file)
+    except Exception as e:
+        st.error(f"Could not read the PDF: {e}")
+        return
+
+    past = [d for d in parsed["days"] if d["is_past"]]
+    future = [d for d in parsed["days"] if not d["is_past"]]
+    t = parsed["total"]
+    st.success(
+        f"Report date {parsed['report_date']} — {len(parsed['days'])} days "
+        f"({len(past)} completed, {len(future)} on the books). "
+        f"Month total {t['total_occ']:,.0f} rooms / ${t['total_rev']:,.2f}."
+    )
+
+    if not st.button("Preview changes", key="ihg_preview", type="primary"):
+        return
+
+    svc = get_drive_service()
+    hotel_id = id_map[hotel_sel]
+    for wb_type in wb_sels:
+        st.divider()
+        result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
+        if err or not result:
+            st.error(f"{wb_type}: {err}")
+            continue
+        file_id, file_name = result
+        wb = openpyxl.load_workbook(io.BytesIO(drive_download(svc, file_id)),
+                                    data_only=False)
+        if wb_type == "ROB":
+            avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+            sheet = first_uncolored_sheet(wb, avail)
+            changes = build_ihg_rob_plan(parsed, wb[sheet])
+            passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                      if w and n != sheet]
+            extra = "  ·  skipped " + "; ".join(passed) if passed else ""
+        else:
+            avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+            sheet = first_unhighlighted_forecast_sheet(wb, avail)
+            changes = build_ihg_forecast_plan(parsed, wb[sheet], wb=wb)
+            extra = ""
+            if not changes:
+                st.error(
+                    f"{file_name}: could not locate the OTB / actual rows on "
+                    f"'{sheet}'. The tab's column-A labels don't match the "
+                    f"expected template.")
+                continue
+
+        st.subheader(f"{wb_type} — {sheet}")
+        st.caption(file_name + extra)
+        writes = [c for c in changes if not c["skip_reason"]]
+        skips = [c for c in changes if c["skip_reason"]]
+        st.dataframe(pd.DataFrame([
+            {"row": c["row"], "col": get_column_letter(c["col"]),
+             "field": c["label"], "value": c["new_value"]}
+            for c in writes]), use_container_width=True, hide_index=True)
+        if skips:
+            st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
+
+
 def _match_inncode(hotel_name, srp):
     """Map a Drive hotel name to the InnCode used in the SRP export."""
     code = HILTON_INNCODES.get(hotel_name)
@@ -5258,6 +5530,9 @@ with tab_weekly:
 
     if portfolio == "Hilton":
         render_hilton_update(hotels)
+        st.stop()
+    if portfolio == "IHG":
+        render_ihg_update(hotels)
         st.stop()
 
     start_new_month = False
