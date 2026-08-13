@@ -1146,6 +1146,88 @@ def strip_tables(wb):
         ws.tables.clear()
 
 
+def apply_portfolio_plans(svc, jobs, undo_key):
+    """Write, mark done, upload — shared by the Hilton and IHG runs.
+
+    Each job is {key, file_id, file_name, wb_bytes, sheet, changes}. The
+    pre-write value of every cell is snapshotted first so the run can be undone
+    in one step, and the clean pre-write bytes are kept alongside so the undo
+    rebuilds from the original rather than from what was just written.
+
+    A macro-enabled workbook is reopened with keep_vba so uploading it back
+    doesn't strip the macros.
+    """
+    saved, errors, snapshot = [], [], {}
+    for job in jobs:
+        try:
+            keep_vba = str(job.get("file_name", "")).lower().endswith(".xlsm")
+            wb = openpyxl.load_workbook(io.BytesIO(job["wb_bytes"]),
+                                        data_only=False, keep_vba=keep_vba)
+            ws = wb[job["sheet"]]
+            writes = [c for c in job["changes"] if not c.get("skip_reason")]
+            prev_tab = ws.sheet_properties.tabColor
+            snapshot[job["key"]] = {
+                "file_id":   job["file_id"],
+                "file_name": job["file_name"],
+                "wb_bytes":  job["wb_bytes"],
+                "sheet":     job["sheet"],
+                "keep_vba":  keep_vba,
+                # The tab colour is part of what a run changes — undoing the
+                # cells but leaving the tab green would leave the week looking
+                # complete and get it skipped on the next run.
+                "tab_rgb":   getattr(prev_tab, "rgb", None) if prev_tab is not None else None,
+                "cells":     {(job["sheet"], c["row"], c["col"]):
+                              ws.cell(c["row"], c["col"]).value for c in writes},
+            }
+            for c in writes:
+                ws.cell(c["row"], c["col"]).value = c["new_value"]
+                if isinstance(c["new_value"], (datetime.date, datetime.datetime)):
+                    ws.cell(c["row"], c["col"]).number_format = "m/d/yyyy"
+            color_tab_done(wb, job["sheet"])
+            strip_tables(wb)
+            out = io.BytesIO()
+            wb.save(out)
+            drive_upload(svc, job["file_id"], out.getvalue(), job["file_name"])
+            saved.append(f'{job["file_name"]} → {job["sheet"]} ({len(writes)} cells)')
+        except Exception as e:
+            errors.append(f'{job["key"]}: {e}')
+    if snapshot:
+        st.session_state[undo_key] = snapshot
+    return saved, errors
+
+
+def undo_portfolio_plans(svc, undo_key):
+    """Put every snapshotted cell back and re-upload."""
+    snapshot = st.session_state.get(undo_key) or {}
+    if not snapshot:
+        return [], ["Nothing to undo — no snapshot from this session."]
+    saved, errors = [], []
+    for key, info in snapshot.items():
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(info["wb_bytes"]),
+                                        data_only=False,
+                                        keep_vba=info.get("keep_vba", False))
+            ws = wb[info["sheet"]]
+            for (_sheet, row, col), original in info["cells"].items():
+                ws.cell(row, col).value = original
+            rgb = info.get("tab_rgb")
+            if rgb:
+                from openpyxl.styles.colors import Color
+                ws.sheet_properties.tabColor = Color(rgb=rgb)
+            else:
+                ws.sheet_properties.tabColor = None
+            strip_tables(wb)
+            out = io.BytesIO()
+            wb.save(out)
+            drive_upload(svc, info["file_id"], out.getvalue(), info["file_name"])
+            saved.append(info["file_name"])
+        except Exception as e:
+            errors.append(f"{key}: {e}")
+    if not errors:
+        st.session_state.pop(undo_key, None)
+    return saved, errors
+
+
 # ── Strategy Report ───────────────────────────────────────────────────────────
 
 STRATEGY_SHEETS = ["WKONE", "WKTWO", "WKTHREE", "WKFOUR", "WKFIVE"]
@@ -5198,58 +5280,87 @@ def render_hilton_update(hotels):
         st.info(f"Waiting on Group Wash report for: {', '.join(missing_wash)}")
         return
 
-    if not st.button("Preview changes", key="hil_preview", type="primary"):
+    if st.button("Preview changes", key="hil_preview", type="primary"):
+        svc = get_drive_service()
+        jobs, problems = [], []
+        for name, fid in selected:
+            try:
+                wash = parse_group_wash(wash_files[name])
+            except Exception as e:
+                problems.append(f"{name}: could not read the Group Wash report — {e}")
+                continue
+
+            inn = _match_inncode(name, srp)
+            if not inn:
+                problems.append(
+                    f"{name}: no matching 'Property - InnCode' in the SRP export. "
+                    f"Codes present: {', '.join(sorted(srp))}. Add it to "
+                    f"HILTON_INNCODES so the split knows which rows belong here.")
+                continue
+
+            for wb_type in wb_sels:
+                result, err = resolve_drive_workbook(svc, fid, name, wb_type)
+                if err or not result:
+                    problems.append(f"{name} — {wb_type}: {err}")
+                    continue
+                file_id, file_name = result
+                if wb_type != "ROB":
+                    problems.append(
+                        f"{name} — Forecast ({file_name}): ingest not wired up yet, "
+                        f"skipped.")
+                    continue
+                raw = drive_download(svc, file_id)
+                wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
+                avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+                sheet = first_uncolored_sheet(wb, avail)
+                changes = build_hilton_rob_plan(srp.get(inn, {}), wash, wb[sheet])
+                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                          if w and n != sheet]
+                jobs.append({
+                    "key": f"{name} — {wb_type}",
+                    "file_id": file_id, "file_name": file_name,
+                    "wb_bytes": raw, "sheet": sheet, "changes": changes,
+                    "note": f"  ·  InnCode {inn}"
+                            + ("  ·  skipped " + "; ".join(passed) if passed else ""),
+                })
+        st.session_state["hil_jobs"] = jobs
+        st.session_state["hil_problems"] = problems
+
+    jobs = st.session_state.get("hil_jobs") or []
+    for msg in st.session_state.get("hil_problems") or []:
+        st.warning(msg)
+    if not jobs:
         return
 
-    svc = get_drive_service()
-    for name, fid in selected:
+    for job in jobs:
         st.divider()
-        st.subheader(name)
-        try:
-            wash = parse_group_wash(wash_files[name])
-        except Exception as e:
-            st.error(f"{name}: could not read the Group Wash report — {e}")
-            continue
+        st.subheader(job["key"] + f" — {job['sheet']}")
+        st.caption(job["file_name"] + job.get("note", ""))
+        _show_ihg_plan(job["changes"])
 
-        inn = _match_inncode(name, srp)
-        if not inn:
-            st.error(
-                f"{name}: no matching 'Property - InnCode' in the SRP export. "
-                f"Codes present: {', '.join(sorted(srp))}. "
-                f"Add it to HILTON_INNCODES so the split knows which rows belong here."
-            )
-            continue
-
-        for wb_type in wb_sels:
-            result, err = resolve_drive_workbook(svc, fid, name, wb_type)
-            if err or not result:
-                st.error(f"{name} — {wb_type}: {err}")
-                continue
-            file_id, file_name = result
-            wb = openpyxl.load_workbook(io.BytesIO(drive_download(svc, file_id)),
-                                        data_only=False)
-            if wb_type != "ROB":
-                st.caption(f"{wb_type}: {file_name} — Forecast ingest not wired up yet.")
-                continue
-
-            avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
-            sheet = first_uncolored_sheet(wb, avail)
-            changes = build_hilton_rob_plan(srp.get(inn, {}), wash, wb[sheet])
-            passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                      if w and n != sheet]
-            st.caption(f"{file_name} → **{sheet}** (InnCode {inn})"
-                       + ("  ·  skipped " + "; ".join(passed) if passed else ""))
-            writes = [c for c in changes if not c["skip_reason"]]
-            skips = [c for c in changes if c["skip_reason"]]
-            st.dataframe(pd.DataFrame([
-                {"row": c["row"],
-                 "col": get_column_letter(c["col"]),
-                 "field": c["label"],
-                 "month": c["month"],
-                 "value": c["new_value"]}
-                for c in writes]), use_container_width=True, hide_index=True)
-            if skips:
-                st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
+    st.divider()
+    total = sum(len([c for c in j["changes"] if not c["skip_reason"]]) for j in jobs)
+    st.write(f"**{total} cells across {len(jobs)} workbook(s).** "
+             f"Applying writes to Drive and marks each tab done (green).")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Confirm and apply to Drive", key="hil_apply", type="primary"):
+            saved, errors = apply_portfolio_plans(
+                get_drive_service(), jobs, "hil_undo")
+            for s in saved:
+                st.success(f"Saved {s}")
+            for e in errors:
+                st.error(e)
+            if saved:
+                st.session_state.pop("hil_jobs", None)
+    with col_b:
+        if st.session_state.get("hil_undo"):
+            if st.button("Undo last apply", key="hil_undo_btn"):
+                saved, errors = undo_portfolio_plans(get_drive_service(), "hil_undo")
+                for s in saved:
+                    st.success(f"Reverted {s}")
+                for e in errors:
+                    st.error(e)
 
 
 def render_ihg_update(hotels):
@@ -5350,72 +5461,108 @@ def render_ihg_update(hotels):
     else:
         st.info("No Business on the Books PDF — only the current month of the ROB will be filled.")
 
-    if not st.button("Preview changes", key="ihg_preview", type="primary"):
+    if st.button("Preview changes", key="ihg_preview", type="primary"):
+        svc = get_drive_service()
+        hotel_id = id_map[hotel_sel]
+        jobs, problems = [], []
+        for wb_type in wb_sels:
+            result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
+            if err or not result:
+                problems.append(f"{wb_type}: {err}")
+                continue
+            file_id, file_name = result
+            raw = drive_download(svc, file_id)
+            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
+            if wb_type == "ROB":
+                avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+                sheet = first_uncolored_sheet(wb, avail)
+                changes = build_ihg_rob_plan(parsed, wb[sheet], bob=bob)
+                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                          if w and n != sheet]
+                note = "  ·  skipped " + "; ".join(passed) if passed else ""
+            else:
+                avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+                sheet = first_unhighlighted_forecast_sheet(wb, avail)
+                changes = build_ihg_forecast_plan(parsed, wb[sheet], wb=wb)
+                note = ""
+                if not changes:
+                    problems.append(
+                        f"{file_name}: could not locate the OTB / actual rows on "
+                        f"'{sheet}' — its column-A labels don't match the template.")
+                    continue
+            jobs.append({"key": f"{wb_type} ({parsed['report_date']:%b %Y})",
+                         "file_id": file_id, "file_name": file_name,
+                         "wb_bytes": raw, "sheet": sheet,
+                         "changes": changes, "note": note})
+
+        if ihg_next_month and "Forecast" in wb_sels:
+            ref = parsed["report_date"] or datetime.date.today()
+            nxt = (ref.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+            if not bob:
+                problems.append("Next month's Forecast needs the Business on the "
+                                "Books PDF — that's where its daily rows come from.")
+            else:
+                nm_result, nm_err = resolve_drive_workbook(
+                    svc, hotel_id, hotel_sel, "Forecast", month_date=nxt)
+                if nm_err or not nm_result:
+                    problems.append(f"{nxt:%b %Y} Forecast: {nm_err}")
+                else:
+                    nm_id, nm_name = nm_result
+                    nm_raw = drive_download(svc, nm_id)
+                    nm_wb = openpyxl.load_workbook(io.BytesIO(nm_raw), data_only=False)
+                    nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
+                    nm_sheet = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
+                    nm_changes = build_ihg_next_month_forecast_plan(
+                        bob, nm_wb[nm_sheet], nxt, wb=nm_wb)
+                    if not nm_changes:
+                        problems.append(
+                            f"Nothing to write for {nxt:%B %Y} — no daily rows in "
+                            f"Business on the Books, or '{nm_sheet}' doesn't match "
+                            f"the template.")
+                    else:
+                        jobs.append({"key": f"Forecast ({nxt:%b %Y})",
+                                     "file_id": nm_id, "file_name": nm_name,
+                                     "wb_bytes": nm_raw, "sheet": nm_sheet,
+                                     "changes": nm_changes, "note": ""})
+
+        st.session_state["ihg_jobs"] = jobs
+        st.session_state["ihg_problems"] = problems
+
+    jobs = st.session_state.get("ihg_jobs") or []
+    for msg in st.session_state.get("ihg_problems") or []:
+        st.error(msg)
+    if not jobs:
         return
 
-    svc = get_drive_service()
-    hotel_id = id_map[hotel_sel]
-    for wb_type in wb_sels:
+    for job in jobs:
         st.divider()
-        result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
-        if err or not result:
-            st.error(f"{wb_type}: {err}")
-            continue
-        file_id, file_name = result
-        wb = openpyxl.load_workbook(io.BytesIO(drive_download(svc, file_id)),
-                                    data_only=False)
-        if wb_type == "ROB":
-            avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
-            sheet = first_uncolored_sheet(wb, avail)
-            changes = build_ihg_rob_plan(parsed, wb[sheet], bob=bob)
-            passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                      if w and n != sheet]
-            extra = "  ·  skipped " + "; ".join(passed) if passed else ""
-        else:
-            avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-            sheet = first_unhighlighted_forecast_sheet(wb, avail)
-            changes = build_ihg_forecast_plan(parsed, wb[sheet], wb=wb)
-            extra = ""
-            if not changes:
-                st.error(
-                    f"{file_name}: could not locate the OTB / actual rows on "
-                    f"'{sheet}'. The tab's column-A labels don't match the "
-                    f"expected template.")
-                continue
+        st.subheader(f"{job['key']} — {job['sheet']}")
+        st.caption(job["file_name"] + job.get("note", ""))
+        _show_ihg_plan(job["changes"])
 
-        st.subheader(f"{wb_type} — {sheet}")
-        st.caption(file_name + extra)
-        _show_ihg_plan(changes)
-
-    if ihg_next_month and "Forecast" in wb_sels:
-        st.divider()
-        ref = parsed["report_date"] or datetime.date.today()
-        nxt = (ref.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-        st.subheader(f"Forecast — {nxt.strftime('%B %Y')}")
-        if not bob:
-            st.warning("Needs the Business on the Books PDF — that's where next "
-                       "month's daily rows come from.")
-        else:
-            nm_result, nm_err = resolve_drive_workbook(
-                svc, hotel_id, hotel_sel, "Forecast", month_date=nxt)
-            if nm_err or not nm_result:
-                st.error(f"{nxt.strftime('%b %Y')} Forecast: {nm_err}")
-            else:
-                nm_id, nm_name = nm_result
-                nm_wb = openpyxl.load_workbook(
-                    io.BytesIO(drive_download(svc, nm_id)), data_only=False)
-                nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
-                nm_sheet = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
-                nm_changes = build_ihg_next_month_forecast_plan(
-                    bob, nm_wb[nm_sheet], nxt, wb=nm_wb)
-                st.caption(f"{nm_name} → {nm_sheet}")
-                if not nm_changes:
-                    st.warning(
-                        f"Nothing to write — the Business on the Books report has "
-                        f"no daily rows for {nxt.strftime('%B %Y')}, or "
-                        f"'{nm_sheet}' doesn't match the expected template.")
-                else:
-                    _show_ihg_plan(nm_changes)
+    st.divider()
+    total = sum(len([c for c in j["changes"] if not c["skip_reason"]]) for j in jobs)
+    st.write(f"**{total} cells across {len(jobs)} workbook(s).** "
+             f"Applying writes to Drive and marks each tab done (green).")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Confirm and apply to Drive", key="ihg_apply", type="primary"):
+            saved, errors = apply_portfolio_plans(
+                get_drive_service(), jobs, "ihg_undo")
+            for s in saved:
+                st.success(f"Saved {s}")
+            for e in errors:
+                st.error(e)
+            if saved:
+                st.session_state.pop("ihg_jobs", None)
+    with col_b:
+        if st.session_state.get("ihg_undo"):
+            if st.button("Undo last apply", key="ihg_undo_btn"):
+                saved, errors = undo_portfolio_plans(get_drive_service(), "ihg_undo")
+                for s in saved:
+                    st.success(f"Reverted {s}")
+                for e in errors:
+                    st.error(e)
 
 
 def _show_ihg_plan(changes):
