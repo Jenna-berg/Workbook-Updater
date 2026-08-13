@@ -5463,6 +5463,9 @@ def render_hilton_update(hotels):
     jobs = st.session_state.get("hil_jobs") or []
     for msg in st.session_state.get("hil_problems") or []:
         st.warning(msg)
+
+    _render_undo_bar("hil_undo")
+
     if not jobs:
         return
 
@@ -5476,25 +5479,45 @@ def render_hilton_update(hotels):
     total = sum(len([c for c in j["changes"] if not c["skip_reason"]]) for j in jobs)
     st.write(f"**{total} cells across {len(jobs)} workbook(s).** "
              f"Applying writes to Drive and marks each tab done (green).")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Confirm and apply to Drive", key="hil_apply", type="primary"):
-            saved, errors = apply_portfolio_plans(
-                get_drive_service(), jobs, "hil_undo")
-            for s in saved:
-                st.success(f"Saved {s}")
-            for e in errors:
-                st.error(e)
-            if saved:
-                st.session_state.pop("hil_jobs", None)
-    with col_b:
-        if st.session_state.get("hil_undo"):
-            if st.button("Undo last apply", key="hil_undo_btn"):
-                saved, errors = undo_portfolio_plans(get_drive_service(), "hil_undo")
+    if st.button("Confirm and apply to Drive", key="hil_apply", type="primary"):
+        saved, errors = apply_portfolio_plans(get_drive_service(), jobs, "hil_undo")
+        for s in saved:
+            st.success(f"Saved {s}")
+        for e in errors:
+            st.error(e)
+        if saved:
+            st.session_state.pop("hil_jobs", None)
+            st.rerun()
+
+
+def _render_undo_bar(undo_key: str):
+    """Offer to roll back the last apply, for as long as there is one to roll
+    back. Drawn outside the preview: applying clears the plan, so an undo
+    button living inside it would disappear on exactly the rerun where someone
+    wants it."""
+    snapshot = st.session_state.get(undo_key)
+    if not snapshot:
+        return
+    cells = sum(len(info.get("cells", {})) for info in snapshot.values())
+    names = ", ".join(info["file_name"] for info in snapshot.values())
+    with st.container(border=True):
+        col_msg, col_btn = st.columns([4, 1])
+        with col_msg:
+            st.markdown(
+                f"**Last apply can still be undone** — {cells} cell(s) across "
+                f"{len(snapshot)} workbook(s).")
+            st.caption(f"{names}. Restores the previous values and the tab's "
+                       f"original colour.")
+        with col_btn:
+            st.write("")
+            if st.button("Undo", key=f"{undo_key}_btn", use_container_width=True):
+                saved, errors = undo_portfolio_plans(get_drive_service(), undo_key)
                 for s in saved:
                     st.success(f"Reverted {s}")
                 for e in errors:
                     st.error(e)
+                if not errors:
+                    st.rerun()
 
 
 def render_ihg_update(hotels):
@@ -5693,6 +5716,12 @@ def render_ihg_update(hotels):
     jobs = st.session_state.get("ihg_jobs") or []
     for msg in st.session_state.get("ihg_problems") or []:
         st.error(msg)
+
+    # Drawn before the preview and outside it: applying clears the plan, so an
+    # undo living inside the plan block would vanish on the one rerun where it
+    # is wanted.
+    _render_undo_bar("ihg_undo")
+
     if not jobs:
         return
 
@@ -5706,25 +5735,15 @@ def render_ihg_update(hotels):
     total = sum(len([c for c in j["changes"] if not c["skip_reason"]]) for j in jobs)
     st.write(f"**{total} cells across {len(jobs)} workbook(s).** "
              f"Applying writes to Drive and marks each tab done (green).")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Confirm and apply to Drive", key="ihg_apply", type="primary"):
-            saved, errors = apply_portfolio_plans(
-                get_drive_service(), jobs, "ihg_undo")
-            for s in saved:
-                st.success(f"Saved {s}")
-            for e in errors:
-                st.error(e)
-            if saved:
-                st.session_state.pop("ihg_jobs", None)
-    with col_b:
-        if st.session_state.get("ihg_undo"):
-            if st.button("Undo last apply", key="ihg_undo_btn"):
-                saved, errors = undo_portfolio_plans(get_drive_service(), "ihg_undo")
-                for s in saved:
-                    st.success(f"Reverted {s}")
-                for e in errors:
-                    st.error(e)
+    if st.button("Confirm and apply to Drive", key="ihg_apply", type="primary"):
+        saved, errors = apply_portfolio_plans(get_drive_service(), jobs, "ihg_undo")
+        for s in saved:
+            st.success(f"Saved {s}")
+        for e in errors:
+            st.error(e)
+        if saved:
+            st.session_state.pop("ihg_jobs", None)
+            st.rerun()
 
 
 def _show_ihg_plan(changes):
@@ -6203,12 +6222,14 @@ with tab_weekly:
     if missing:
         who = service_account_email() or "the service account"
         st.warning(
-            f"**Not shared with the app yet:** {', '.join(missing)}\n\n"
-            f"Nothing in Drive matches these names, so they can't appear below. "
-            f"Share each hotel's folder — or at least its `REVENUE REPORTS` "
-            f"subfolder — with\n\n`{who}`\n\n"
-            f"as Editor, then press ↺ to refresh. A hotel is only discovered "
-            f"once a folder it can see contains a `REVENUE REPORTS` subfolder."
+            f"**No Drive folder found for:** {', '.join(missing)}\n\n"
+            f"They are still listed below and can be selected, but a run will "
+            f"stop with an error until this is sorted. This app signs in as\n\n"
+            f"`{who}`\n\n"
+            f"so that is the address the folder has to be shared with — sharing "
+            f"with a different service account has no effect here. It also needs "
+            f"a `REVENUE REPORTS` subfolder inside to be recognised as a hotel. "
+            f"Press ↺ after sharing."
         )
 
     if portfolio == "Hilton":
