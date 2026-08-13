@@ -9,11 +9,15 @@ google-auth-httplib2>=0.1
 xlrd>=2.0
 pdfplumber>=0.11
 # Budget Projector (Financial Tools -> 1-Year Projection)
-# altair must stay below 6: streamlit 1.41 itself requires altair<6, and
-# altair 6 needs a newer typing_extensions than streamlit 1.41 allows —
-# together those produce "_TypedDictMeta.__new__() got an unexpected keyword
-# argument 'closed'" at import. The projector only uses long-stable altair
-# APIs (Chart/X/Y/Color/Tooltip/Scale/Axis/Row/Column), so 5.x is plenty.
+# altair must stay below 5.4. From 5.4 on it declares classes as
+#   class X(TypedDict, closed=True)
+# which only works where typing_extensions supplies TypedDict itself. Streamlit
+# Cloud builds on Python 3.14, where that falls through to the standard
+# library's TypedDict, which rejects the argument:
+#   _TypedDictMeta.__new__() got an unexpected keyword argument 'closed'
+# 5.3.0 has no such declaration anywhere. The projector only uses long-stable
+# altair APIs (Chart/X/Y/Color/Tooltip/Scale/Axis/StrokeDash/Row/Column), so
+# nothing is lost by staying there.
 numpy>=1.26,<3
-altair>=5.0,<6
+altair>=5.0,<5.4
 XlsxWriter>=3.2
