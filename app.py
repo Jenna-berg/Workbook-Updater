@@ -456,12 +456,33 @@ def parse_ihg_business_on_books(file_like):
             v = [_ihg_num(x) for x in nums]
             # Ind-R Blk-R D-Blk N-Blk T-Rms OOO OOS Turn Avbl Occ%
             # Ind-Revenue Ind-Avg Blk-Revenue Blk-Avg Total-Revenue Total-Avg
-            months[(year, mon)] = {
+            entry = {
                 "rooms":       v[4],
                 "group_rooms": v[1] + v[2],
                 "group_rev":   v[12],
                 "total_rev":   v[14],
+                "days":        [],
             }
+            # Per-date rows, used to drive a Forecast for a month other than
+            # the current one. Every day here is still on the books — this
+            # report starts at the report date, so nothing in it has happened.
+            for line in lines:
+                dm = re.match(r"^(\d{2})-(\d{2})-(\d{2})\s+[A-Za-z]{3}\s+(.*)$",
+                              line.strip())
+                if not dm:
+                    continue
+                dnums = re.findall(r"[\d,]+\.?\d*", dm.group(4))
+                if len(dnums) < 16:
+                    continue
+                dv = [_ihg_num(x) for x in dnums]
+                d_mm, d_dd, d_yy = (int(dm.group(i)) for i in (1, 2, 3))
+                entry["days"].append({
+                    "date":      datetime.date(2000 + d_yy, d_mm, d_dd),
+                    "rooms":     dv[4],
+                    "total_rev": dv[14],
+                    "avg_rate":  dv[15],
+                })
+            months[(year, mon)] = entry
     if not months:
         raise ValueError(
             "No month totals found — is this the Business on the Books report?")
@@ -566,6 +587,45 @@ def build_ihg_forecast_plan(parsed, ws, wb=None):
         else:
             put(otb_row, col, f"{stamp} OTB rooms", int(round(d["total_occ"])))
             put(adr_row, col, f"{stamp} OTB ADR",   round(d["avg_rate"], 2))
+    return changes
+
+
+def build_ihg_next_month_forecast_plan(bob, ws, target_month, wb=None):
+    """Forecast changes for a month other than the current one, from the
+    Business on the Books daily rows.
+
+    Everything in that report is still on the books — it starts at the report
+    date — so every day goes to the OTB rows and none to the actual rows.
+    """
+    key = (target_month.year, target_month.month)
+    month = (bob or {}).get("months", {}).get(key)
+    if not month or not month.get("days"):
+        return []
+
+    rows = locate_forecast_rows(ws)
+    if not rows:
+        return []
+
+    col_of = {}
+    for date_val, col in build_forecast_date_col_map(
+            ws, wb=wb, date_row=rows["date_row"]).items():
+        col_of[date_val.date() if isinstance(date_val, datetime.datetime) else date_val] = col
+
+    changes = []
+    for d in month["days"]:
+        col = col_of.get(d["date"])
+        if col is None:
+            continue
+        stamp = d["date"].strftime("%b %d").replace(" 0", " ")
+        for row, label, value in [
+            (rows["otb_rooms_row"], f"{stamp} OTB rooms", int(round(d["rooms"]))),
+            (rows["adr_otb_row"],   f"{stamp} OTB ADR",   round(d["avg_rate"], 2)),
+        ]:
+            changes.append({
+                "row": row, "col": col, "label": label, "month": target_month.month,
+                "new_value": value,
+                "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+            })
     return changes
 
 
@@ -5180,6 +5240,11 @@ def render_ihg_update(hotels):
             bob_file = st.file_uploader(
                 "Business on the Books (PDF)",
                 type=["pdf"], key=f"ihg_bob_{hotel_sel}")
+        ihg_next_month = st.checkbox(
+            "Include next month's Forecast",
+            key="ihg_fcst_next",
+            help="Fills next month's Forecast workbook from the Business on the "
+                 "Books daily rows. Needs that PDF.")
 
     if not pdf_file:
         st.info("Upload the History and Forecast PDF to continue.")
@@ -5263,14 +5328,48 @@ def render_ihg_update(hotels):
 
         st.subheader(f"{wb_type} — {sheet}")
         st.caption(file_name + extra)
-        writes = [c for c in changes if not c["skip_reason"]]
-        skips = [c for c in changes if c["skip_reason"]]
-        st.dataframe(pd.DataFrame([
-            {"row": c["row"], "col": get_column_letter(c["col"]),
-             "field": c["label"], "value": c["new_value"]}
-            for c in writes]), use_container_width=True, hide_index=True)
-        if skips:
-            st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
+        _show_ihg_plan(changes)
+
+    if ihg_next_month and "Forecast" in wb_sels:
+        st.divider()
+        ref = parsed["report_date"] or datetime.date.today()
+        nxt = (ref.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        st.subheader(f"Forecast — {nxt.strftime('%B %Y')}")
+        if not bob:
+            st.warning("Needs the Business on the Books PDF — that's where next "
+                       "month's daily rows come from.")
+        else:
+            nm_result, nm_err = resolve_drive_workbook(
+                svc, hotel_id, hotel_sel, "Forecast", month_date=nxt)
+            if nm_err or not nm_result:
+                st.error(f"{nxt.strftime('%b %Y')} Forecast: {nm_err}")
+            else:
+                nm_id, nm_name = nm_result
+                nm_wb = openpyxl.load_workbook(
+                    io.BytesIO(drive_download(svc, nm_id)), data_only=False)
+                nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
+                nm_sheet = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
+                nm_changes = build_ihg_next_month_forecast_plan(
+                    bob, nm_wb[nm_sheet], nxt, wb=nm_wb)
+                st.caption(f"{nm_name} → {nm_sheet}")
+                if not nm_changes:
+                    st.warning(
+                        f"Nothing to write — the Business on the Books report has "
+                        f"no daily rows for {nxt.strftime('%B %Y')}, or "
+                        f"'{nm_sheet}' doesn't match the expected template.")
+                else:
+                    _show_ihg_plan(nm_changes)
+
+
+def _show_ihg_plan(changes):
+    writes = [c for c in changes if not c["skip_reason"]]
+    skips = [c for c in changes if c["skip_reason"]]
+    st.dataframe(pd.DataFrame([
+        {"row": c["row"], "col": get_column_letter(c["col"]),
+         "field": c["label"], "value": c["new_value"]}
+        for c in writes]), use_container_width=True, hide_index=True)
+    if skips:
+        st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
 
 
 def _match_inncode(hotel_name, srp):
