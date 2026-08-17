@@ -251,23 +251,38 @@ def _spread_stay(arrival, nights):
         yield (arrival + datetime.timedelta(days=i)).date()
 
 
-def parse_srp_activity(file_like):
-    """SRP Activity export → {inncode: {(year, month): {seg: [nights, revenue]}}}
+def _srp_bucket():
+    return collections.defaultdict(
+        lambda: collections.defaultdict(lambda: [0, 0.0]))
 
-    seg is 'TOT', 'GRP', 'PRM' or 'TRN' (transient = everything that is
-    neither group nor permanent). Only TRN is ultimately used for the ROB,
-    since group and permanent come from the Wash report, but the rest is kept
-    for reconciliation display.
+
+def parse_srp_activity(file_like):
+    """SRP Activity export → {inncode: {"name", "months", "days"}}
+
+    'months' is {(year, month): {seg: [nights, revenue]}} and 'days' the same
+    keyed by occupancy date. seg is 'TOT', 'GRP', 'PRM' or 'TRN' (transient =
+    everything that is neither group nor permanent). Only TRN is ultimately
+    used, since group and permanent come from the Wash report, but the rest is
+    kept for reconciliation display.
+
+    The ROB wants months and the Forecast wants days. Both views are built in
+    the same pass over the same stays, so the two workbooks cannot end up
+    disagreeing about what a booking contributed.
+
+    'name' is the export's own 'Property - Name', kept so a hotel can still be
+    identified when its InnCode isn't one we know.
     """
     raw = pd.read_excel(file_like, sheet_name=0, header=None)
     hr = _find_header_row(raw, "Stay ID")
     df = pd.read_excel(file_like, sheet_name=0, header=hr)
     df = df[df["Stay ID"].notna()]
 
-    out = collections.defaultdict(
-        lambda: collections.defaultdict(
-            lambda: collections.defaultdict(lambda: [0, 0.0])))
+    out = {}
     for rec in df.to_dict("records"):
+        # Every export seen so far arrives pre-filtered to live bookings, but
+        # the column is there and nothing promises it always will be.
+        if str(rec.get("Cancelled Flag", "")).strip().lower() in ("yes", "y", "true"):
+            continue
         nights = int(safe_float(rec.get("Room Nights")) or 0)
         if nights <= 0:
             continue
@@ -279,15 +294,31 @@ def parse_srp_activity(file_like):
         is_grp = str(rec.get("SRP Type", "")).strip().lower() == "convention" and not is_perm
         kind = "PRM" if is_perm else ("GRP" if is_grp else "TRN")
         inn = str(rec.get("Property - InnCode", "")).strip().upper()
+        prop = out.setdefault(
+            inn, {"name": "", "months": _srp_bucket(), "days": _srp_bucket()})
+        if not prop["name"]:
+            prop["name"] = str(rec.get("Property - Name", "") or "").strip()
         for d in _spread_stay(arrival, nights):
-            b = out[inn][(d.year, d.month)]
-            b["TOT"][0] += 1;   b["TOT"][1] += per
-            b[kind][0] += 1;    b[kind][1] += per
+            for view, key in ((prop["months"], (d.year, d.month)), (prop["days"], d)):
+                b = view[key]
+                b["TOT"][0] += 1;   b["TOT"][1] += per
+                b[kind][0] += 1;    b[kind][1] += per
     return out
 
 
+def _wash_bucket():
+    return collections.defaultdict(
+        lambda: collections.defaultdict(
+            lambda: {"pu_rooms": 0.0, "pu_rev": 0.0, "av_rooms": 0.0, "av_rev": 0.0}))
+
+
 def parse_group_wash(file_like):
-    """Individual Group Wash export → {(year, month): {seg: {...}}}
+    """Individual Group Wash export → {"months": ..., "days": ...}
+
+    'months' is {(year, month): {seg: {...}}} and 'days' the same keyed by
+    occupancy date, built in one pass for the same reason parse_srp_activity
+    builds both: the ROB reads months, the Forecast reads days, and they must
+    describe the same blocks.
 
     seg is 'GRP' (Market Segment != PERM) or 'PRM' (== PERM); each holds
     pu_rooms / pu_rev / av_rooms / av_rev.
@@ -303,9 +334,7 @@ def parse_group_wash(file_like):
     df = pd.read_excel(file_like, sheet_name=0, header=hr)
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
 
-    out = collections.defaultdict(
-        lambda: collections.defaultdict(
-            lambda: {"pu_rooms": 0.0, "pu_rev": 0.0, "av_rooms": 0.0, "av_rev": 0.0}))
+    months, days = _wash_bucket(), _wash_bucket()
     for rec in df.to_dict("records"):
         occ = rec.get("Occupancy Date")
         if not isinstance(occ, (datetime.datetime, datetime.date)):
@@ -314,12 +343,14 @@ def parse_group_wash(file_like):
         av = safe_float(rec.get("Available Block")) or 0.0
         rate = safe_float(rec.get("Rate")) or 0.0
         seg = "PRM" if str(rec.get("Market Segment", "")).strip().upper() == WASH_PERM_SEGMENT else "GRP"
-        b = out[(occ.year, occ.month)][seg]
-        b["pu_rooms"] += pu
-        b["pu_rev"] += pu * rate
-        b["av_rooms"] += av
-        b["av_rev"] += av * rate
-    return out
+        day = occ.date() if isinstance(occ, datetime.datetime) else occ
+        for view, key in ((months, (occ.year, occ.month)), (days, day)):
+            b = view[key][seg]
+            b["pu_rooms"] += pu
+            b["pu_rev"] += pu * rate
+            b["av_rooms"] += av
+            b["av_rev"] += av * rate
+    return {"months": months, "days": days}
 
 
 # ── IHG portfolio source file ────────────────────────────────────────────────
@@ -974,11 +1005,31 @@ def find_secondary_col(ws, block_start):
     return min(candidates) if candidates else None
 
 
+def _hilton_totals(srp_period, wash_period):
+    """Rooms and revenue for one period, composed the same way everywhere.
+
+    Transient comes from SRP; group and permanent come from the Wash report's
+    pick-up, because SRP's own 'convention' flag undercounts group badly (one
+    real month read 270 against the wash report's 1,017). The ROB calls this
+    with a month's buckets and the Forecast with a day's, which is the only
+    reason the two workbooks are guaranteed to agree on the month.
+
+    Returns (rooms, revenue, group, perm); the two wash segments come back so
+    callers needing the unpicked remainder don't reach into the buckets again.
+    """
+    trn = srp_period.get("TRN", [0, 0.0])
+    g = wash_period.get("GRP") or {}
+    p = wash_period.get("PRM") or {}
+    rooms = trn[0] + g.get("pu_rooms", 0.0) + p.get("pu_rooms", 0.0)
+    rev = trn[1] + g.get("pu_rev", 0.0) + p.get("pu_rev", 0.0)
+    return rooms, rev, g, p
+
+
 def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
-    srp_months  — parse_srp_activity()[inncode]
-    wash_months — parse_group_wash() for that same hotel
+    srp_months  — parse_srp_activity()[inncode]["months"]
+    wash_months — parse_group_wash()["months"] for that same hotel
 
     Column E takes what is on the books, column G ('not p/u') the unpicked
     remainder of the group blocks. Totals are assembled rather than lifted
@@ -1011,17 +1062,12 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
         if month < as_of.month:
             continue                      # never rewrite a closed month
         key = (as_of.year, month)
-        s = srp_months.get(key) or {}
-        w = wash_months.get(key) or {}
-        trn = s.get("TRN", [0, 0.0])
-        g = w.get("GRP", {})
-        p = w.get("PRM", {})
+        tot_rooms, tot_rev, g, p = _hilton_totals(
+            srp_months.get(key) or {}, wash_months.get(key) or {})
 
         g_pu_r, g_pu_v = g.get("pu_rooms", 0.0), g.get("pu_rev", 0.0)
         p_pu_r, p_pu_v = p.get("pu_rooms", 0.0), p.get("pu_rev", 0.0)
 
-        tot_rooms = trn[0] + g_pu_r + p_pu_r
-        tot_rev = trn[1] + g_pu_v + p_pu_v
         if not (tot_rooms or g_pu_r or p_pu_r):
             continue                      # nothing on the books for this month
 
@@ -1038,6 +1084,77 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
             put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p.get("av_rooms", 0.0))), month)
             put(L("perm rm rev"),   7, "Perm not p/u rev", round(p.get("av_rev", 0.0), 2), month)
     return changes
+
+
+def build_hilton_forecast_plan(srp_days, wash_days, ws, as_of=None):
+    """Forecast changes for one Hilton hotel from the two Hilton exports.
+
+    The Hilton Forecast is the same shape as every other Forecast the app
+    writes — dates running across row 4, with OTB rooms, OTB ADR, actual rooms
+    and actual revenue each on their own titled row — so it is located with the
+    shared helpers rather than a second Hilton-specific set.
+
+    A day is composed exactly as build_hilton_rob_plan composes a month, from
+    the same two exports, so the Forecast's month cannot drift from the ROB's.
+    Days already gone take actual rooms and revenue; days still ahead take the
+    rooms on the books and the rate they are on the books at. Today counts as
+    ahead, because it is still selling.
+
+    'Estimated Pick Up' and the forecast ADR are deliberately never written:
+    they are the revenue manager's judgement, not anything the exports know.
+    """
+    as_of = as_of or datetime.date.today()
+    rows = locate_forecast_rows(ws)
+    if not rows:
+        return [], ["could not read its row titles (As-of date / Rooms Sold / "
+                    "ADR OTB / Revenue)."]
+    col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
+    if not col_map:
+        return [], ["could not read its date row."]
+
+    changes, warns = [], []
+
+    def put(label, row, col, value):
+        changes.append({
+            "label": label, "row": row, "col": col, "new_value": value,
+            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+        })
+
+    put("As-of date", rows["as_of_row"], 1, as_of)
+
+    dated = 0
+    for d, col in sorted(col_map.items()):
+        rooms, rev, _, _ = _hilton_totals(srp_days.get(d) or {}, wash_days.get(d) or {})
+        if not rooms:
+            continue
+        dated += 1
+        if d < as_of:
+            put(f"Rooms Sold (actual) {d}", rows["actual_rooms_row"], col,
+                int(round(rooms)))
+            put(f"Revenue (actual) {d}", rows["actual_revenue_row"], col,
+                round(rev, 2))
+        else:
+            put(f"Rooms Sold (OTB) {d}", rows["otb_rooms_row"], col,
+                int(round(rooms)))
+            put(f"ADR OTB {d}", rows["adr_otb_row"], col, round(rev / rooms, 2))
+
+    if not dated:
+        return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms in "
+                    f"the SRP export. Is this the right month's workbook?"]
+
+    # Pick-up tracking chart: this week's on-the-books rooms written under the
+    # previous weeks', which is what makes the week-on-week build visible.
+    track = find_next_pickup_data_row(ws)
+    if track:
+        put("Pickup tracking: date", track, 1, as_of)
+        for d, col in sorted(col_map.items()):
+            rooms, _, _, _ = _hilton_totals(srp_days.get(d) or {},
+                                            wash_days.get(d) or {})
+            put(f"Pickup tracking: Rooms Sold {d}", track, col, int(round(rooms)))
+    else:
+        warns.append("no free row left in its pick-up tracking chart.")
+
+    return changes, warns
 
 
 def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
@@ -1360,8 +1477,14 @@ def first_unhighlighted_forecast_sheet(wb, sheet_names):
         # (not a strict isinstance check) also catches numbers stored as
         # text, which a strict int/float check would miss entirely.
         col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
-        data_cols = col_map.values() if col_map else range(2, 10)
-        has_data = any(safe_float(ws.cell(otb_row, c).value) is not None for c in data_cols)
+        data_cols = list(col_map.values()) if col_map else list(range(2, 10))
+        # The actuals row counts as data too. A week whose OTB row was never
+        # filled but whose actuals were entered by hand is a used week —
+        # confirmed on a real Hilton file, where checking OTB alone offered up
+        # an already-written week as the next one to fill.
+        has_data = any(safe_float(ws.cell(r, c).value) is not None
+                       for r in (otb_row, rows["actual_rooms_row"])
+                       for c in data_cols)
         if has_data:
             continue
         return name
@@ -3129,16 +3252,23 @@ PORTFOLIO_HOTELS = {
 # Property codes as they appear in the SRP Activity export's 'Property -
 # InnCode' column, which is how one shared export gets split per hotel.
 # Confirmed from real exports; the three blanks have not appeared in one yet.
+# Every code below is the one the property's own SRP report prints in its
+# "Property: <code> - <name>" header, so the mapping is the vendor's, not a
+# guess. All nine are listed: a hotel missing from here used to be skipped
+# with a warning, which is how a three-hotel run quietly became a one-hotel
+# run. _match_inncode can now also fall back to the export's
+# 'Property - Name' column, so a code changing underneath us degrades to a
+# name match rather than to silence.
 HILTON_INNCODES = {
-    "Littleton":     "LTNNH",
-    "Nashua":        "ASHSS",
-    "Ann Arbor":     "ARBAA",
-    "Mesa":          "MESWH",
-    "Kansas City":   "MCIAP",
-    "Memphis":       "MEMPH",
-    # "Northbrook":  "?",   not yet seen in an export
-    # "Andover":     "?",
-    # "Silver Spring": "?",
+    "Littleton":     "LTNNH",   # Hampton Inn Littleton
+    "Nashua":        "ASHSS",   # DoubleTree by Hilton Nashua
+    "Ann Arbor":     "ARBAA",   # DoubleTree by Hilton Ann Arbor North
+    "Mesa":          "MESWH",   # DoubleTree by Hilton Phoenix Mesa
+    "Kansas City":   "MCIAP",   # Hilton Kansas City Airport
+    "Memphis":       "MEMPH",   # Hilton Memphis
+    "Northbrook":    "CHINB",   # Chicago Northbrook Hilton
+    "Andover":       "BOSOR",   # DoubleTree by Hilton Boston-Andover
+    "Silver Spring": "DCAGS",   # DoubleTree Washington DC Silver Spring
 }
 
 # Hilton properties do not run a Strategy Report.
@@ -5577,9 +5707,12 @@ def render_hilton_update(hotels):
         return
 
     st.caption(
-        "One SRP Activity export covers every property; each hotel also needs its "
-        "own Group Wash export. Group and Permanent figures come from the Wash "
-        "report — the booking export supplies only the transient remainder."
+        "One SRP Activity export covers every property — it must be run with all "
+        "the properties you tick below, or the ones it leaves out can't be "
+        "updated. Each hotel also needs its own Group Wash export: Group and "
+        "Permanent figures come from the Wash report, and the booking export "
+        "supplies only the transient remainder. Both workbooks are built from "
+        "the same stays — the ROB by month, the Forecast day by day."
     )
 
     with st.container(border=True):
@@ -5625,7 +5758,24 @@ def render_hilton_update(hotels):
         st.error(f"Could not read the SRP Activity export: {e}")
         return
 
-    st.success(f"SRP Activity: {len(srp)} properties — {', '.join(sorted(srp))}")
+    st.success("SRP Activity covers {}: {}".format(
+        f"{len(srp)} propert" + ("y" if len(srp) == 1 else "ies"),
+        ", ".join(f"{c} ({srp[c]['name']})" if srp[c].get("name") else c
+                  for c in sorted(srp))))
+
+    # Resolved up front, not inside the run. A hotel the export doesn't cover
+    # can't be updated, and finding that out only after pressing the button is
+    # how a three-hotel run quietly came back having done one.
+    codes = {name: _match_inncode(name, srp) for name, _ in selected}
+    unmatched = [n for n, c in codes.items() if not c]
+    if unmatched:
+        st.warning(
+            f"**Not in this SRP export, so {'it' if len(unmatched) == 1 else 'they'} "
+            f"cannot be run: {', '.join(unmatched)}.** Re-run the SRP Activity "
+            f"report with every selected property ticked, or deselect "
+            f"{'it' if len(unmatched) == 1 else 'them'} here.")
+        if len(unmatched) == len(selected):
+            return
 
     missing_wash = [n for n, _ in selected if not wash_files.get(n)]
     if missing_wash:
@@ -5648,38 +5798,53 @@ def render_hilton_update(hotels):
                 problems.append(f"{name}: could not read the Group Wash report — {e}")
                 continue
 
-            inn = _match_inncode(name, srp)
+            inn = codes.get(name)
             if not inn:
-                problems.append(
-                    f"{name}: no matching 'Property - InnCode' in the SRP export. "
-                    f"Codes present: {', '.join(sorted(srp))}. Add it to "
-                    f"HILTON_INNCODES so the split knows which rows belong here.")
-                continue
+                continue          # already reported above, before the button
 
+            prop = srp[inn]
             for wb_type in wb_sels:
                 result, err = resolve_drive_workbook(svc, fid, name, wb_type)
                 if err or not result:
                     problems.append(f"{name} — {wb_type}: {err}")
                     continue
                 file_id, file_name = result
-                if wb_type != "ROB":
-                    problems.append(
-                        f"{name} — Forecast ({file_name}): ingest not wired up yet, "
-                        f"skipped.")
-                    continue
                 raw = drive_download(svc, file_id)
                 wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
-                avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
-                sheet = first_uncolored_sheet(wb, avail)
-                changes = build_hilton_rob_plan(srp.get(inn, {}), wash, wb[sheet])
-                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                          if w and n != sheet]
+                note = f"  ·  InnCode {inn}"
+
+                if wb_type == "ROB":
+                    avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+                    if not avail:
+                        problems.append(f"{name} — ROB ({file_name}): none of the "
+                                        f"week tabs were found.")
+                        continue
+                    sheet = first_uncolored_sheet(wb, avail)
+                    changes = build_hilton_rob_plan(
+                        prop["months"], wash["months"], wb[sheet])
+                    passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                              if w and n != sheet]
+                    if passed:
+                        note += "  ·  skipped " + "; ".join(passed)
+                else:
+                    avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+                    if not avail:
+                        problems.append(f"{name} — Forecast ({file_name}): none of "
+                                        f"FCST-WK1 – WK9 were found.")
+                        continue
+                    sheet = first_unhighlighted_forecast_sheet(wb, avail)
+                    changes, warns = build_hilton_forecast_plan(
+                        prop["days"], wash["days"], wb[sheet])
+                    for w in warns:
+                        problems.append(f"{name} — Forecast ({file_name}, {sheet}): {w}")
+                    if not changes:
+                        continue
+
                 jobs.append({
                     "key": f"{name} — {wb_type}",
                     "file_id": file_id, "file_name": file_name,
                     "wb_bytes": raw, "sheet": sheet, "changes": changes,
-                    "note": f"  ·  InnCode {inn}"
-                            + ("  ·  skipped " + "; ".join(passed) if passed else ""),
+                    "note": note,
                 })
         st.session_state["hil_jobs"] = jobs
         st.session_state["hil_problems"] = problems
@@ -5996,16 +6161,27 @@ def _show_ihg_plan(changes):
 
 
 def _match_inncode(hotel_name, srp):
-    """Map a Drive hotel name to the InnCode used in the SRP export."""
-    code = HILTON_INNCODES.get(hotel_name)
-    if code and code in srp:
-        return code
-    up = hotel_name.upper()
-    for label, kws in PORTFOLIO_HOTELS["Hilton"].items():
-        if any(k in up for k in kws):
-            c = HILTON_INNCODES.get(label)
-            if c and c in srp:
-                return c
+    """Map a Drive hotel name to the InnCode used in the SRP export.
+
+    The lookup table is tried first, then the export's own 'Property - Name'.
+    That fallback is what keeps a hotel running the day Hilton reissues its
+    code or a tenth property appears: an unrecognised code used to mean the
+    hotel was silently dropped from the run.
+    """
+    up = (hotel_name or "").upper()
+    labels = [label for label, kws in PORTFOLIO_HOTELS["Hilton"].items()
+              if any(k in up for k in kws)]
+    for label in [hotel_name, *labels]:
+        code = HILTON_INNCODES.get(label)
+        if code and code in srp:
+            return code
+
+    keywords = [k for label in labels
+                for k in PORTFOLIO_HOTELS["Hilton"][label]] or [up]
+    for code, prop in srp.items():
+        name = (prop.get("name") or "").upper()
+        if name and any(k in name for k in keywords):
+            return code
     return None
 
 
