@@ -2683,7 +2683,17 @@ def build_forecast_date_col_map(ws, wb=None, date_row=4):
             break
         if cell.value is None and col > 2:
             break
-        col_map[month_start + datetime.timedelta(days=col - 2)] = col
+        d = month_start + datetime.timedelta(days=col - 2)
+        # One workbook covers one month. The templates carry 31 date columns
+        # and most chain them straight through (=prev+1), so in a 30-day month
+        # the last one computes to the 1st of the *next* month — confirmed on a
+        # real June file, where the map ran to 1 Jul. Some hotels blank that
+        # cell by hand and some don't, so the month end is what decides, not
+        # how many columns the sheet happens to have. Left in, a foreign day
+        # lands inside this month's Totals column.
+        if (d.year, d.month) != (month_start.year, month_start.month):
+            break
+        col_map[d] = col
         col += 1
     return col_map
 
@@ -5732,6 +5742,16 @@ def render_hilton_update(hotels):
             key="hil_wb",
         ) or []
 
+        hil_next_month = st.checkbox(
+            "Include next month's Forecast",
+            key="hil_fcst_next",
+            disabled="Forecast" not in wb_sels,
+            help="Fills next month's own Forecast workbook for every selected "
+                 "property, from the same SRP export — it already runs a year "
+                 "ahead. Everything that far out is still on the books, so it "
+                 "all lands on the OTB rows and none on the actuals.",
+        )
+
         srp_file = st.file_uploader(
             "SRP Activity — all Hilton properties (one file)",
             type=["xlsx"], key="hil_srp")
@@ -5784,6 +5804,8 @@ def render_hilton_update(hotels):
 
     if st.button("Preview changes", key="hil_preview", type="primary"):
         svc = get_drive_service()
+        next_month = (datetime.date.today().replace(day=1)
+                      + datetime.timedelta(days=32)).replace(day=1)
         jobs, problems = [], []
         for name, fid in selected:
             if not fid:
@@ -5804,6 +5826,13 @@ def render_hilton_update(hotels):
 
             prop = srp[inn]
             for wb_type in wb_sels:
+                if wb_type == "Forecast":
+                    job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
+                                               problems)
+                    if job:
+                        jobs.append(job)
+                    continue
+
                 result, err = resolve_drive_workbook(svc, fid, name, wb_type)
                 if err or not result:
                     problems.append(f"{name} — {wb_type}: {err}")
@@ -5811,41 +5840,31 @@ def render_hilton_update(hotels):
                 file_id, file_name = result
                 raw = drive_download(svc, file_id)
                 wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
+                avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+                if not avail:
+                    problems.append(f"{name} — ROB ({file_name}): none of the "
+                                    f"week tabs were found.")
+                    continue
+                sheet = first_uncolored_sheet(wb, avail)
+                changes = build_hilton_rob_plan(
+                    prop["months"], wash["months"], wb[sheet])
                 note = f"  ·  InnCode {inn}"
-
-                if wb_type == "ROB":
-                    avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
-                    if not avail:
-                        problems.append(f"{name} — ROB ({file_name}): none of the "
-                                        f"week tabs were found.")
-                        continue
-                    sheet = first_uncolored_sheet(wb, avail)
-                    changes = build_hilton_rob_plan(
-                        prop["months"], wash["months"], wb[sheet])
-                    passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                              if w and n != sheet]
-                    if passed:
-                        note += "  ·  skipped " + "; ".join(passed)
-                else:
-                    avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-                    if not avail:
-                        problems.append(f"{name} — Forecast ({file_name}): none of "
-                                        f"FCST-WK1 – WK9 were found.")
-                        continue
-                    sheet = first_unhighlighted_forecast_sheet(wb, avail)
-                    changes, warns = build_hilton_forecast_plan(
-                        prop["days"], wash["days"], wb[sheet])
-                    for w in warns:
-                        problems.append(f"{name} — Forecast ({file_name}, {sheet}): {w}")
-                    if not changes:
-                        continue
-
+                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
+                          if w and n != sheet]
+                if passed:
+                    note += "  ·  skipped " + "; ".join(passed)
                 jobs.append({
                     "key": f"{name} — {wb_type}",
                     "file_id": file_id, "file_name": file_name,
                     "wb_bytes": raw, "sheet": sheet, "changes": changes,
                     "note": note,
                 })
+
+            if hil_next_month and "Forecast" in wb_sels:
+                job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
+                                           problems, month_date=next_month)
+                if job:
+                    jobs.append(job)
         st.session_state["hil_jobs"] = jobs
         st.session_state["hil_problems"] = problems
 
@@ -6158,6 +6177,51 @@ def _show_ihg_plan(changes):
         for c in writes]), use_container_width=True, hide_index=True)
     if skips:
         st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
+
+
+def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
+                         month_date=None):
+    """Build the Forecast job for one Hilton hotel and one month.
+
+    month_date picks which month's workbook to open; None means the current
+    one. Nothing else differs between the two. The SRP export runs a year
+    forward, and build_hilton_forecast_plan already sends every date that
+    hasn't happened yet to the OTB rows, so next month needs no separate
+    builder the way IHG's does — there, next month genuinely comes from a
+    different report.
+
+    Returns the job, or None having appended the reason to `problems`.
+    """
+    label = f"Forecast ({month_date:%b %Y})" if month_date else "Forecast"
+    result, err = resolve_drive_workbook(
+        svc, hotel_id, hotel_name, "Forecast", month_date=month_date)
+    if err or not result:
+        problems.append(f"{hotel_name} — {label}: {err}")
+        return None
+
+    file_id, file_name = result
+    raw = drive_download(svc, file_id)
+    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
+    avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+    if not avail:
+        problems.append(f"{hotel_name} — {label} ({file_name}): none of "
+                        f"FCST-WK1 – WK9 were found.")
+        return None
+
+    sheet = first_unhighlighted_forecast_sheet(wb, avail)
+    changes, warns = build_hilton_forecast_plan(
+        prop["days"], wash["days"], wb[sheet])
+    for w in warns:
+        problems.append(f"{hotel_name} — {label} ({file_name}, {sheet}): {w}")
+    if not changes:
+        return None
+
+    return {
+        "key": f"{hotel_name} — {label}",
+        "file_id": file_id, "file_name": file_name,
+        "wb_bytes": raw, "sheet": sheet, "changes": changes,
+        "note": f"  ·  InnCode {inn}",
+    }
 
 
 def _match_inncode(hotel_name, srp):
