@@ -3397,18 +3397,63 @@ CREDS_PATH = "credentials.json.json"
 SCOPES     = ["https://www.googleapis.com/auth/drive"]
 
 
+# ── Drive transport ──────────────────────────────────────────────────────────
+# A plain build() gives the whole app one httplib2 connection, and the service
+# object is cached for the process, so every session and every Streamlit thread
+# shared a single socket. httplib2 is not thread-safe: two people working at
+# once interleave reads on the same TLS stream and one of them gets
+#
+#   ssl.SSLError  ...  in recv_into / self._sslobj.read(len, buffer)
+#
+# with no useful message, because the record it read was the middle of somebody
+# else's response. The same socket also goes stale between calls — Google closes
+# idle connections, and httplib2 hands the closed one back out.
+#
+# googleapiclient already knows how to retry that exact error, but only
+# num_retries times and the default is zero, so the first blip aborted the run.
+#
+# Both halves are fixed here rather than at the 28 call sites: every request is
+# built with its own connection and its own retry budget.
+DRIVE_RETRIES = 5
+
+
 @st.cache_resource
-def get_drive_service():
+def _drive_credentials():
     # Production (Streamlit Cloud): credentials stored in st.secrets["google_credentials"]
     if "google_credentials" in st.secrets:
-        import json
-        creds = service_account.Credentials.from_service_account_info(
+        return service_account.Credentials.from_service_account_info(
             dict(st.secrets["google_credentials"]), scopes=SCOPES
         )
-    else:
-        # Local dev: read from file
-        creds = service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    # Local dev: read from file
+    return service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
+
+
+def _authorized_http():
+    """A connection of its own, for one request."""
+    import httplib2
+    import google_auth_httplib2
+    return google_auth_httplib2.AuthorizedHttp(
+        _drive_credentials(), http=httplib2.Http(timeout=120))
+
+
+@st.cache_resource
+def get_drive_service():
+    from googleapiclient.http import HttpRequest
+
+    class _OwnConnectionRequest(HttpRequest):
+        """Retries the transient transport errors the default ignores."""
+
+        def execute(self, http=None, num_retries=DRIVE_RETRIES):
+            return super().execute(http=http, num_retries=num_retries)
+
+        def next_chunk(self, http=None, num_retries=DRIVE_RETRIES):
+            return super().next_chunk(http=http, num_retries=num_retries)
+
+    def request_builder(_http, *args, **kwargs):
+        return _OwnConnectionRequest(_authorized_http(), *args, **kwargs)
+
+    return build("drive", "v3", credentials=_drive_credentials(),
+                 cache_discovery=False, requestBuilder=request_builder)
 
 
 @st.cache_data(ttl=3600)
@@ -3675,7 +3720,12 @@ def drive_download(service, file_id) -> bytes:
     dl  = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
-        _, done = dl.next_chunk()
+        # MediaIoBaseDownload wraps the request rather than using it, so the
+        # retry budget built into the request builder doesn't reach here and
+        # has to be handed over per chunk. Downloads are the longest-lived
+        # Drive calls the app makes and the likeliest to meet a dropped
+        # connection.
+        _, done = dl.next_chunk(num_retries=DRIVE_RETRIES)
     return buf.getvalue()
 
 
