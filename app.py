@@ -336,21 +336,159 @@ def parse_group_wash(file_like):
 #   Blocks:     Deduct Rms., Room Revenue, Non-D Rms., Non-Deduct Room Revenue
 #   Total Hotel: Occ %, Room Revenue, Average Rate
 
-_IHG_NUM = r"([\d,]+\.?\d*)"
-_IHG_ROW = re.compile(
-    r"^(?P<label>\d{2}-\d{2}-\d{2}|Subtotal|Total)\s+"
-    + r"\s+".join([_IHG_NUM] * 10)
-    + r"\s+(?P<occpct>[\d.]+)%\s+" + _IHG_NUM + r"\s+" + _IHG_NUM + r"\s*$"
-)
-_IHG_FIELDS = ["total_occ", "arr_rms", "ind_rms", "ind_rev", "ind_nond_rms",
-               "ind_nond_rev", "blk_rms", "blk_rev", "blk_nond_rms", "blk_nond_rev"]
-
-
 def _ihg_num(s):
     try:
-        return float(str(s).replace(",", ""))
+        return float(str(s).replace(",", "").rstrip("%"))
     except (TypeError, ValueError):
         return 0.0
+
+
+# ── Reading these PDFs by column title ───────────────────────────────────────
+# Values are read by matching them to the heading above them, never by counting
+# along the row. Counting worked only for as long as the reports kept exactly
+# the columns they have today: insert one, drop one, or reorder them and every
+# figure after that point silently shifts to the wrong field, which is the kind
+# of error that produces a plausible-looking workbook rather than a crash.
+#
+# The anchor is the right edge. Both reports right-align their numbers under
+# right-aligned headings, so a value's right edge sits within a point or two of
+# its column's — far more reliable than centres, which drift with digit count.
+#
+# History and Forecast stacks its headings three deep and repeats names across
+# groups ('Room Revenue' appears under Individual, Blocks and Total Hotel), so
+# the spanning group label is needed to tell them apart. Business on the Books
+# has one flat row of unique names.
+
+def _ihg_text_lines(page, tolerance=2.5):
+    """Words grouped into visual lines, each sorted left to right.
+
+    Grouped by how close the tops are rather than by an exact rounded value.
+    Words on one printed row are not always at an identical top — a real Total
+    row in these reports drifts by a fraction of a point partway across, and
+    bucketing on round(top) split it in two, silently dropping every figure
+    after the break.
+    """
+    lines = []
+    for word in sorted(page.extract_words(), key=lambda w: (w["top"], w["x0"])):
+        if lines and abs(word["top"] - lines[-1][0]) <= tolerance:
+            lines[-1][1].append(word)
+            # track the row's running centre so a long row can't drift away
+            lines[-1][0] = (lines[-1][0] * (len(lines[-1][1]) - 1)
+                            + word["top"]) / len(lines[-1][1])
+        else:
+            lines.append([word["top"], [word]])
+    return [(top, sorted(words, key=lambda w: w["x0"])) for top, words in lines]
+
+
+def _ihg_is_data_line(words):
+    """A dated row carrying figures — not the report date printed in the corner."""
+    if not words or not re.match(r"^\d{2}-\d{2}-\d{2}$", words[0]["text"]):
+        return False
+    return sum(1 for w in words[1:]
+               if re.fullmatch(r"[\d,]+\.?\d*%?", w["text"])) >= 6
+
+
+_IHG_PAGE_FURNITURE = re.compile(
+    r"\d{2}:\d{2}|^\d{2}-\d{2}-\d{2}$|Holiday|History and Forecast|"
+    r"Business on the Books", re.IGNORECASE)
+
+
+def _ihg_columns(page):
+    """({right_edge: (group, label)}, lines, index_of_first_data_line)."""
+    lines = _ihg_text_lines(page)
+    first_data = next((i for i, (_t, ws) in enumerate(lines)
+                       if _ihg_is_data_line(ws)), None)
+    if first_data is None:
+        return {}, lines, None
+
+    header = [(t, ws) for t, ws in lines[:first_data]
+              if not _IHG_PAGE_FURNITURE.search(" ".join(w["text"] for w in ws).strip())]
+    if not header:
+        return {}, lines, first_data
+
+    # Columns come from the heading line the figures align to — the lowest one.
+    cols = []
+    for word in header[-1][1]:
+        if cols and word["x0"] - cols[-1][-1]["x1"] < 6:
+            cols[-1].append(word)
+        else:
+            cols.append([word])
+    columns = {max(w["x1"] for w in grp): {
+        "left": min(w["x0"] for w in grp),
+        "right": max(w["x1"] for w in grp),
+        "label": " ".join(w["text"] for w in grp),
+        "above": [],
+        "group": "",
+    } for grp in cols}
+
+    for _t, words in reversed(header[:-1]):
+        pairs = [(w, min(columns.values(), key=lambda c: abs(c["right"] - w["x1"])))
+                 for w in words]
+        aligned = [(w, c) for w, c in pairs if abs(c["right"] - w["x1"]) <= 3]
+        # Decide per row, not per word: 'Total Hotel' ends within 3pt of its own
+        # column, enough to mistake the spanning group row for a stacked one if
+        # a single match were taken as proof.
+        if len(aligned) >= max(2, len(words) * 0.6):
+            for word, col in aligned:
+                col["above"].insert(0, word["text"])
+            continue
+        spans, run = [], []
+        for word in words:
+            if run and word["x0"] - run[-1]["x1"] < 8:
+                run.append(word)
+            else:
+                if run:
+                    spans.append(run)
+                run = [word]
+        if run:
+            spans.append(run)
+        centres = [((min(w["x0"] for w in s) + max(w["x1"] for w in s)) / 2,
+                    " ".join(w["text"] for w in s)) for s in spans]
+        if centres:
+            for col in columns.values():
+                mid = (col["left"] + col["right"]) / 2
+                col["group"] = min(centres, key=lambda p: abs(p[0] - mid))[1]
+
+    named = {}
+    for right, col in columns.items():
+        label = re.sub(r"\s+", " ", " ".join(col["above"] + [col["label"]])).strip()
+        named[right] = (col["group"].strip().lower(), label.lower())
+    return named, lines, first_data
+
+
+def _ihg_locate(columns, wanted, source_name):
+    """{field: right_edge} from {field: (group_contains, exact_label)}.
+
+    Raises rather than guessing: a missing heading means the report has changed
+    shape, and quietly carrying on would write whatever happened to be nearby.
+    """
+    found, missing = {}, []
+    for field, (group_hint, label) in wanted.items():
+        hits = [r for r, (g, lab) in columns.items()
+                if lab == label and (not group_hint or group_hint in g)]
+        if len(hits) == 1:
+            found[field] = hits[0]
+        else:
+            missing.append(f"{field} ({group_hint + ' | ' if group_hint else ''}{label})"
+                           + (f" — {len(hits)} matches" if hits else ""))
+    if missing:
+        raise ValueError(
+            f"Couldn't find these columns in the {source_name} report by heading: "
+            + "; ".join(missing)
+            + ". Headings read: "
+            + ", ".join(sorted(f"{g}|{lab}" for g, lab in columns.values()))
+        )
+    return found
+
+
+def _ihg_row_values(words, columns):
+    """{right_edge: text} for one line, each value matched to its column."""
+    out = {}
+    for word in words:
+        nearest = min(columns, key=lambda r: abs(r - word["x1"]))
+        if abs(nearest - word["x1"]) <= 6:
+            out[nearest] = word["text"]
+    return out
 
 
 def parse_ihg_history_forecast(file_like):
@@ -363,40 +501,53 @@ def parse_ihg_history_forecast(file_like):
     """
     import pdfplumber
 
-    text = ""
+    # (group contains, exact heading) for each figure taken from this report.
+    wanted = {
+        "total_occ": ("",            "total occ."),
+        "ind_rms":   ("individual",  "deduct rms."),
+        "ind_rev":   ("individual",  "deduct room revenue"),
+        "blk_rms":   ("blocks",      "deduct rms."),
+        "blk_rev":   ("blocks",      "deduct room revenue"),
+        "occ_pct":   ("total hotel", "occ %"),
+        "total_rev": ("total hotel", "room revenue"),
+        "avg_rate":  ("total hotel", "average rate"),
+    }
+
+    report_date, days, subtotals, total = None, [], [], None
+    seen_subtotal = False
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
-            text += (page.extract_text() or "") + "\n"
+            if report_date is None:
+                head = (page.extract_text() or "").split("\n")
+                m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$",
+                              head[0].strip() if head else "")
+                if m:
+                    mm, dd, yy = (int(x) for x in m.groups())
+                    report_date = datetime.date(2000 + yy, mm, dd)
 
-    report_date = None
-    m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$", text.split("\n")[0].strip())
-    if m:
-        mm, dd, yy = (int(x) for x in m.groups())
-        report_date = datetime.date(2000 + yy, mm, dd)
+            columns, lines, first_data = _ihg_columns(page)
+            if not columns or first_data is None:
+                continue
+            where = _ihg_locate(columns, wanted, "History and Forecast")
 
-    days, subtotals, total = [], [], None
-    seen_subtotal = False
-    for line in text.split("\n"):
-        mt = _IHG_ROW.match(line.strip())
-        if not mt:
-            continue
-        nums = [_ihg_num(g) for g in mt.groups()[1:11]]
-        rec = dict(zip(_IHG_FIELDS, nums))
-        rec["occ_pct"] = float(mt.group("occpct"))
-        rec["total_rev"] = _ihg_num(mt.groups()[-2])
-        rec["avg_rate"] = _ihg_num(mt.groups()[-1])
-        label = mt.group("label")
-        if label == "Subtotal":
-            subtotals.append(rec)
-            seen_subtotal = True
-        elif label == "Total":
-            total = rec
-        else:
-            mm, dd, yy = (int(x) for x in label.split("-"))
-            rec["date"] = datetime.date(2000 + yy, mm, dd)
-            # Above the first Subtotal = already happened.
-            rec["is_past"] = not seen_subtotal
-            days.append(rec)
+            for _top, words in lines[first_data:]:
+                head_text = words[0]["text"].strip()
+                is_day = bool(re.match(r"^\d{2}-\d{2}-\d{2}$", head_text))
+                if not is_day and head_text not in ("Subtotal", "Total"):
+                    continue
+                cells = _ihg_row_values(words, columns)
+                rec = {f: _ihg_num(cells.get(col)) for f, col in where.items()}
+                if head_text == "Subtotal":
+                    subtotals.append(rec)
+                    seen_subtotal = True
+                elif head_text == "Total":
+                    total = rec
+                else:
+                    mm, dd, yy = (int(x) for x in head_text.split("-"))
+                    rec["date"] = datetime.date(2000 + yy, mm, dd)
+                    # Everything above the first Subtotal has already happened.
+                    rec["is_past"] = not seen_subtotal
+                    days.append(rec)
 
     if total is None:
         raise ValueError(
@@ -428,74 +579,76 @@ def parse_ihg_business_on_books(file_like):
     """
     import pdfplumber
 
+    # One flat heading row here, every name unique, so no group is needed.
+    wanted = {
+        "ind_rms":   ("", "ind-r"),
+        "blk_rms":   ("", "blk-r"),
+        "npu_rms":   ("", "d-blk"),
+        "rooms":     ("", "t-rms"),
+        "ooo":       ("", "ooo"),
+        "turn":      ("", "turn"),
+        "ind_rev":   ("", "ind-revenue"),
+        "blk_rev":   ("", "blk-revenue"),
+        "blk_avg":   ("", "blk-avg. rate"),
+        "total_rev": ("", "total revenue"),
+        "avg_rate":  ("", "total avg. rate"),
+    }
+
     months, report_date = {}, None
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
-            lines = (page.extract_text() or "").split("\n")
-            if report_date is None and lines:
-                m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$", lines[0].strip())
+            text_lines = (page.extract_text() or "").split("\n")
+            if report_date is None and text_lines:
+                m = re.search(r"(\d{2})-(\d{2})-(\d{2})\s*$", text_lines[0].strip())
                 if m:
                     mm, dd, yy = (int(x) for x in m.groups())
                     report_date = datetime.date(2000 + yy, mm, dd)
 
-            hdr = next((l for l in lines if "Ind-R" in l and "Blk-R" in l), None)
-            tot = next((l for l in lines if l.strip().startswith("Total ")), None)
-            if not hdr or not tot:
+            columns, lines, first_data = _ihg_columns(page)
+            if not columns or first_data is None:
                 continue
-            mh = re.match(r"^([A-Za-z]{3})\s+(\d{2})\b", hdr.strip())
+            # The month this page covers is named in the heading's first cell,
+            # e.g. 'AUG 26' sitting above the date column.
+            month_cell = min(columns, key=lambda r: r)
+            mh = re.match(r"^([a-z]{3})\s+(\d{2})$", columns[month_cell][1].strip())
             if not mh:
                 continue
             mon = _BOB_MONTHS.get(mh.group(1).upper())
             if not mon:
                 continue
             year = 2000 + int(mh.group(2))
+            where = _ihg_locate(columns, wanted, "Business on the Books")
 
-            nums = re.findall(r"[\d,]+\.?\d*", tot)
-            if len(nums) < 16:
-                continue
-            v = [_ihg_num(x) for x in nums]
-            # Ind-R Blk-R D-Blk N-Blk T-Rms OOO OOS Turn Avbl Occ%
-            # Ind-Revenue Ind-Avg Blk-Revenue Blk-Avg Total-Revenue Total-Avg
-            entry = {
-                "rooms":       v[4],
-                "group_rooms": v[1] + v[2],
-                "group_rev":   v[12],
-                "total_rev":   v[14],
-                # D-Blk on its own is the blocked-but-not-picked-up remainder,
-                # which is what the ROB's pink 'Group rooms NPU' column wants.
-                # It is also counted inside group_rooms above, where the ROB
-                # asks for the whole block.
-                "npu_rooms":   v[2],
-                "blk_avg":     v[13],
-                "days":        [],
-            }
-            # Per-date rows, used to drive a Forecast for a month other than
-            # the current one. Every day here is still on the books — this
-            # report starts at the report date, so nothing in it has happened.
-            for line in lines:
-                dm = re.match(r"^(\d{2})-(\d{2})-(\d{2})\s+[A-Za-z]{3}\s+(.*)$",
-                              line.strip())
-                if not dm:
+            entry = None
+            days = []
+            for _top, words in lines[first_data:]:
+                head_text = words[0]["text"].strip()
+                is_day = bool(re.match(r"^\d{2}-\d{2}-\d{2}$", head_text))
+                if not is_day and head_text != "Total":
                     continue
-                dnums = re.findall(r"[\d,]+\.?\d*", dm.group(4))
-                if len(dnums) < 16:
-                    continue
-                dv = [_ihg_num(x) for x in dnums]
-                d_mm, d_dd, d_yy = (int(dm.group(i)) for i in (1, 2, 3))
-                entry["days"].append({
-                    "date":      datetime.date(2000 + d_yy, d_mm, d_dd),
-                    "ind_rms":   dv[0],
-                    "blk_rms":   dv[1],
-                    "npu_rms":   dv[2],
-                    "rooms":     dv[4],
-                    "ooo":       dv[5],
-                    "turn":      dv[7],
-                    "ind_rev":   dv[10],
-                    "blk_rev":   dv[12],
-                    "total_rev": dv[14],
-                    "avg_rate":  dv[15],
-                })
-            months[(year, mon)] = entry
+                cells = _ihg_row_values(words, columns)
+                v = {f: _ihg_num(cells.get(col)) for f, col in where.items()}
+                if is_day:
+                    mm, dd, yy = (int(x) for x in head_text.split("-"))
+                    days.append(dict(v, date=datetime.date(2000 + yy, mm, dd)))
+                else:
+                    entry = {
+                        "rooms":       v["rooms"],
+                        # The ROB wants the whole block, which is the picked-up
+                        # part plus the remainder still unpicked.
+                        "group_rooms": v["blk_rms"] + v["npu_rms"],
+                        "group_rev":   v["blk_rev"],
+                        "total_rev":   v["total_rev"],
+                        # D-Blk alone is that unpicked remainder, which is what
+                        # the ROB's pink 'Group rooms NPU' column asks for.
+                        "npu_rooms":   v["npu_rms"],
+                        "blk_avg":     v["blk_avg"],
+                    }
+            if entry is not None:
+                # Every day in this report is still on the books — it starts at
+                # the report date, so nothing in it has happened yet.
+                entry["days"] = days
+                months[(year, mon)] = entry
     if not months:
         raise ValueError(
             "No month totals found — is this the Business on the Books report?")
