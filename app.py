@@ -813,7 +813,7 @@ def detect_ihg_sr_columns(ws):
     return out
 
 
-def build_ihg_sr_plan(hf, bob, ws):
+def build_ihg_sr_plan(hf, bob, ws, ws_values=None):
     """Strategy Report changes for one IHG hotel from the two PDFs.
 
     Each dated row takes its figures from whichever report covers that day:
@@ -826,10 +826,17 @@ def build_ihg_sr_plan(hf, bob, ws):
 
     Monthly total rows never match a date and so are skipped, which is what
     keeps them from being written over.
+
+    `ws_values` is the same sheet from a data_only load. The date column is not
+    always literal dates — one hotel's later week tabs carry '=WKONE!C5' and
+    '=C5+1' instead, which read back as formula text and match no day at all.
+    Dates are taken from the cached values when that view is supplied.
     """
     cols = detect_ihg_sr_columns(ws)
     if "trans_rms" not in cols:
         return []
+    dates_from = ws_values if ws_values is not None else ws
+    date_col = detect_date_column(dates_from) or 3
 
     hf_by_date = {d["date"]: d for d in (hf or {}).get("days", [])}
     bob_by_date = {}
@@ -851,8 +858,8 @@ def build_ihg_sr_plan(hf, bob, ws):
             "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
         })
 
-    for r in range(5, ws.max_row + 1):
-        v = ws.cell(r, 3).value
+    for r in range(5, max(ws.max_row, dates_from.max_row) + 1):
+        v = dates_from.cell(r, date_col).value
         if isinstance(v, datetime.datetime):
             day = v.date()
         elif isinstance(v, datetime.date):
@@ -5865,16 +5872,30 @@ def render_ihg_update(hotels):
             elif wb_type == "Strategy Report":
                 avail = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
                 sheet = first_undone_strategy_sheet(wb, avail)
-                changes = build_ihg_sr_plan(parsed, bob, wb[sheet])
+                # A second, values-only view: the date column is formulas on
+                # some hotels' later week tabs, and formulas read back as text.
+                wb_vals = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+                changes = build_ihg_sr_plan(parsed, bob, wb[sheet],
+                                            ws_values=wb_vals[sheet])
                 note = ""
                 if not bob:
                     problems.append(
                         "Strategy Report: without the Business on the Books PDF "
                         "only the days before it starts can be filled.")
                 if not changes:
-                    problems.append(
-                        f"{file_name}: could not match the Strategy Report's "
-                        f"column headings on '{sheet}'.")
+                    # Say which of the two it was rather than guessing at one.
+                    found = detect_ihg_sr_columns(wb[sheet])
+                    if "trans_rms" not in found:
+                        problems.append(
+                            f"{file_name}: couldn't match the Strategy Report's "
+                            f"column headings on '{sheet}'. Found: "
+                            f"{sorted(found) or 'none'}.")
+                    else:
+                        problems.append(
+                            f"{file_name}: headings matched on '{sheet}', but none "
+                            f"of its dated rows line up with the report's dates "
+                            f"({parsed['report_date']:%b %Y}). Is this the right "
+                            f"month's workbook?")
                     continue
                 # The as-of date sits above the grid rather than in it.
                 changes.insert(0, {
