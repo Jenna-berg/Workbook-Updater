@@ -1118,15 +1118,15 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
     and actual revenue each on their own titled row — so it is located with the
     shared helpers rather than a second Hilton-specific set.
 
-    Only the on-the-books rows are written, and only from today forward.
+    The rule, confirmed with the user: this fills today to month end and
+    nothing else. Days that have actualised are entered by hand.
 
-    The actuals rows are left alone because this export cannot fill them. SRP
-    Activity lists reservations that are still live, so a day's rooms decay as
-    it recedes: on a 17 Aug export one hotel's 1 Aug read 4 rooms against a real
-    245, 8 Aug read 11, 13 Aug read 83, and only 14–16 Aug came back right. The
-    old code wrote those numbers into the actuals row, which is worse than
-    leaving it empty — the day looks filled and reads twenty times low. Whoever
-    fills actuals needs a report of departed stays, which this isn't.
+    That matches what the export can actually support. SRP Activity lists
+    reservations that are still live, so a completed day's rooms decay as it
+    recedes: on a 17 Aug export one hotel's 1 Aug read 4 rooms against a real
+    245, 8 Aug read 11, 13 Aug read 83, and only 14–16 Aug came back right.
+    Writing those into the actuals row is worse than leaving it empty — the day
+    looks filled and reads twenty times low, which is how this was found.
 
     'Estimated Pick Up' and the forecast ADR are likewise never written: they
     are the revenue manager's judgement, not anything the export knows.
@@ -1166,9 +1166,9 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
         return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms still "
                     f"on the books. Is this the right month's workbook?"]
     if past:
-        warns.append(f"{past} day(s) already gone were left untouched — this export "
-                     f"only sees live reservations, so it can't fill the actuals "
-                     f"rows. Those stay yours to enter.")
+        warns.append(f"filled {dated} day(s) from {as_of:%b %d} to month end. The "
+                     f"{past} day(s) before that have actualised and are left for "
+                     f"you to enter by hand, as agreed.")
 
     # Pick-up tracking chart: this week's on-the-books rooms written under the
     # previous weeks', which is what makes the week-on-week build visible. Same
