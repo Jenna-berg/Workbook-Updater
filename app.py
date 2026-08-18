@@ -256,6 +256,103 @@ def _srp_bucket():
         lambda: collections.defaultdict(lambda: [0, 0.0]))
 
 
+def parse_srp_filters(file_like):
+    """The FILTERS block the SRP Activity export prints above its data.
+
+    Worth reading, because two of those filters quietly change what the numbers
+    mean and neither is visible once the rows are parsed:
+
+      Booked Date     excludes anything booked on or after it. One real export
+                      was generated on 12 Aug with this set to 5 Aug, so a whole
+                      week of bookings was missing. That is what made Kansas
+                      City's September read 773 rooms on the books against 1,017
+                      already picked up in the wash report — group appeared to
+                      exceed the total, when really the total was a week stale.
+
+      Departure Date  excludes stays that checked out before it. Set to two days
+                      before the run, it drops nearly every completed day: one
+                      hotel's 1 Aug read 4 rooms against a real 245.
+
+    Returns {"booked_to", "departure_from", "run_date", "inncodes", "lines"},
+    with dates as date or None.
+    """
+    head = pd.read_excel(file_like, sheet_name=0, header=None, nrows=13)
+    lines = []
+    for r in range(len(head)):
+        vals = [str(v).strip() for v in head.iloc[r].tolist()
+                if str(v) != "nan" and str(v).strip()]
+        if vals:
+            lines.append(" ".join(vals))
+
+    def _date_after(label):
+        for line in lines:
+            if line.lower().startswith(label.lower()):
+                m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", line)
+                if m:
+                    mo, dy, yr = (int(g) for g in m.groups())
+                    return datetime.date(yr, mo, dy)
+        return None
+
+    codes = []
+    for line in lines:
+        if line.lower().startswith("property - inncode"):
+            codes = re.findall(r"\b[A-Z]{5}\b", line.split(":", 1)[-1])
+
+    # The report carries its own run date in the data. Comparing the Booked Date
+    # filter against that, rather than against today, means a file uploaded a
+    # day late isn't accused of being stale.
+    run_date = None
+    try:
+        hr = _find_header_row(head, "Stay ID")
+        first = pd.read_excel(file_like, sheet_name=0, header=hr, nrows=1)
+        rd = first["Run Date"].iloc[0] if "Run Date" in first.columns else None
+        if isinstance(rd, (datetime.datetime, pd.Timestamp)):
+            run_date = rd.date()
+        elif isinstance(rd, datetime.date):
+            run_date = rd
+    except Exception:
+        pass
+
+    return {
+        "booked_to":      _date_after("Booked Date"),
+        "departure_from": _date_after("Departure Date"),
+        "run_date":       run_date,
+        "inncodes":       codes,
+        "lines":          [l for l in lines if ":" in l and not l.startswith("Stay ID")],
+    }
+
+
+def srp_filter_warnings(filters):
+    """Filter settings that will skew the figures, in plain terms.
+
+    Caught at upload rather than left to show up as odd numbers in a workbook
+    days later, which is how both of these were originally found.
+    """
+    if not filters:
+        return []
+    out = []
+    ref = filters.get("run_date") or datetime.date.today()
+
+    booked = filters.get("booked_to")
+    if booked and (ref - booked).days >= 2:
+        behind = (ref - booked).days
+        out.append(
+            f"**This export is missing {behind} days of bookings.** Its "
+            f"'Booked Date' filter is set to {booked.day} {booked:%b} but the "
+            f"report ran on {ref.day} {ref:%b}, so anything booked in between is "
+            f"absent and every on-the-books total will read low. Re-run it with "
+            f"Booked Date set to the day you run it.")
+
+    dep = filters.get("departure_from")
+    if dep and dep.day > 1:
+        out.append(
+            f"**Completed days will read far too low.** Its 'Departure Date' "
+            f"filter starts {dep.day} {dep:%b}, so guests who checked out before "
+            f"then are excluded — {dep:%B} 1–{dep.day - 1} are missing most of "
+            f"their stays. Set Departure Date to start on the 1st to capture them.")
+    return out
+
+
 def parse_srp_activity(file_like):
     """SRP Activity export → {inncode: {"name", "months", "days"}}
 
@@ -5862,6 +5959,22 @@ def render_hilton_update(hotels):
         f"{len(srp)} propert" + ("y" if len(srp) == 1 else "ies"),
         ", ".join(f"{c} ({srp[c]['name']})" if srp[c].get("name") else c
                   for c in sorted(srp))))
+
+    # The export's own FILTERS block decides what the numbers can possibly mean.
+    # Checked here so a stale filter is caught at upload rather than turning up
+    # as odd figures in a workbook days later.
+    try:
+        srp_filters = parse_srp_filters(srp_file)
+    except Exception:
+        srp_filters = None
+    for msg in srp_filter_warnings(srp_filters):
+        st.warning(msg)
+    if srp_filters and srp_filters.get("lines"):
+        with st.expander("Filters this export was run with"):
+            for line in srp_filters["lines"]:
+                st.markdown(f"- {line}")
+            st.caption("Booked Date should be the day you run it, and Departure "
+                       "Date should start on the 1st of the month.")
 
     # Resolved up front, not inside the run. A hotel the export doesn't cover
     # can't be updated, and finding that out only after pressing the button is
