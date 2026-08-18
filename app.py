@@ -1010,18 +1010,14 @@ def _srp_seg(srp_period, seg):
 
     seg is 'TOT', 'GRP', 'PRM' or 'TRN'.
 
-    Column E of the ROB and the on-the-books side of the Forecast are the SRP
-    export's own figures, taken as they stand. They used to be assembled here
-    instead — SRP transient plus the Wash report's pick-up — on the theory that
-    SRP undercounted group. Checked against three hand-corrected workbooks, that
-    assembly is what put every total out by a few thousand: 48 of the 55
-    corrected cells equal the plain SRP figure, and every Revenue, Room Nights
-    and Permanent cell among them matches exactly.
+    Only TOT is used to write with. It is the ROB's total and the Forecast's
+    on-the-books rooms, taken exactly as the export states it: checked against
+    three hand-corrected workbooks, every Revenue and Room Nights cell in them
+    equals the plain SRP figure, and Andover reproduces cell for cell.
 
-    The Wash report is still right for column G. Its 'Available Block' is the
-    unpicked remainder and has no counterpart in SRP, which only knows about
-    bookings that exist. Only its 'Pick Up' has been dropped, because SRP has
-    already counted those rooms.
+    Group and permanent are NOT read from here even though SRP carries them —
+    its 'convention' flag undercounts group badly. Those come from the Wash
+    report; see build_hilton_rob_plan.
     """
     rooms, rev = (srp_period or {}).get(seg, [0, 0.0])
     return rooms, rev
@@ -1033,9 +1029,19 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     srp_months  — parse_srp_activity()[inncode]["months"]
     wash_months — parse_group_wash()["months"] for that same hotel
 
-    Column E is the SRP export as it stands — TOT for the total, GRP for group,
-    PRM for permanent. Column G ('not p/u') is the Wash report's unpicked block
-    remainder, which SRP has no equivalent for.
+    Each figure comes from the report that measures it best:
+
+      total (col E)    SRP's own TOT — every room on the books
+      group/perm (E)   the Wash report's Pick Up
+      not p/u (col G)  the Wash report's Available Block
+
+    The total used to be assembled as SRP transient + Wash pick-up, which
+    double-counted: pick-up *reclassifies* rooms that SRP has already counted
+    inside TOT — SRP files a block room under whatever code the individual
+    booked with — so adding the two put every month out by a few thousand.
+    Group still has to come from the Wash report, because SRP's 'convention'
+    flag genuinely undercounts it (Kansas City September: 270 rooms by SRP
+    against 789 by the wash report).
 
     Rows are located by label. A cell holding a hand-written reconciliation
     like '=294767+55017' is left alone, but a cross-sheet mirror like
@@ -1045,7 +1051,7 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     """
     as_of = as_of or datetime.date.today()
     blocks = rob_month_blocks(ws)
-    changes = []
+    changes, warns = [], []
 
     def put(row, col, label, value, month):
         if row is None or value is None:
@@ -1069,29 +1075,39 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
         srp = srp_months.get(key) or {}
         wash = wash_months.get(key) or {}
         tot_rooms, tot_rev = _srp_seg(srp, "TOT")
-        g_rooms, g_rev = _srp_seg(srp, "GRP")
-        p_rooms, p_rev = _srp_seg(srp, "PRM")
-
-        # Column G only — the part of the block nobody has taken up yet.
-        g_npu = wash.get("GRP") or {}
-        p_npu = wash.get("PRM") or {}
+        g = wash.get("GRP") or {}
+        p = wash.get("PRM") or {}
 
         if not tot_rooms:
             continue                      # nothing on the books for this month
 
+        # The two reports have to describe the same hotel. Pick-up is a subset
+        # of what is on the books, so it cannot exceed it — when it does, one
+        # of the two exports is for a different date range or a different
+        # property, and the month is wrong whichever figure you believe.
+        # Confirmed real case: Kansas City September read 773 rooms on the
+        # books against 1,017 picked up.
+        picked = g.get("pu_rooms", 0.0) + p.get("pu_rooms", 0.0)
+        if picked > tot_rooms:
+            warns.append(
+                f"{datetime.date(as_of.year, month, 1):%B}: the Wash report picks up "
+                f"{picked:,.0f} rooms but SRP only has {tot_rooms:,.0f} on the books. "
+                f"Group can't exceed the total — check the two exports cover the "
+                f"same dates and the same property.")
+
         L = labels.get
         put(L("revenue"),        5, "Revenue",        round(tot_rev, 2), month)
         put(L("room nights"),    5, "Room Nights",    int(round(tot_rooms)), month)
-        put(L("group rms sold"), 5, "Group Rms sold", int(round(g_rooms)), month)
-        put(L("group rm rev"),   5, "Group Rm Rev",   round(g_rev, 2), month)
-        put(L("group rms sold"), 7, "Group not p/u rms", int(round(g_npu.get("av_rooms", 0.0))), month)
-        put(L("group rm rev"),   7, "Group not p/u rev", round(g_npu.get("av_rev", 0.0), 2), month)
+        put(L("group rms sold"), 5, "Group Rms sold", int(round(g.get("pu_rooms", 0.0))), month)
+        put(L("group rm rev"),   5, "Group Rm Rev",   round(g.get("pu_rev", 0.0), 2), month)
+        put(L("group rms sold"), 7, "Group not p/u rms", int(round(g.get("av_rooms", 0.0))), month)
+        put(L("group rm rev"),   7, "Group not p/u rev", round(g.get("av_rev", 0.0), 2), month)
         if L("perm rms sold"):
-            put(L("perm rms sold"), 5, "Perm Rms Sold", int(round(p_rooms)), month)
-            put(L("perm rm rev"),   5, "Perm Rm Rev",   round(p_rev, 2), month)
-            put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p_npu.get("av_rooms", 0.0))), month)
-            put(L("perm rm rev"),   7, "Perm not p/u rev", round(p_npu.get("av_rev", 0.0), 2), month)
-    return changes
+            put(L("perm rms sold"), 5, "Perm Rms Sold", int(round(p.get("pu_rooms", 0.0))), month)
+            put(L("perm rm rev"),   5, "Perm Rm Rev",   round(p.get("pu_rev", 0.0), 2), month)
+            put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p.get("av_rooms", 0.0))), month)
+            put(L("perm rm rev"),   7, "Perm not p/u rev", round(p.get("av_rev", 0.0), 2), month)
+    return changes, warns
 
 
 def build_hilton_forecast_plan(srp_days, ws, as_of=None):
@@ -5910,8 +5926,10 @@ def render_hilton_update(hotels):
                                     f"week tabs were found.")
                     continue
                 sheet = first_uncolored_sheet(wb, avail)
-                changes = build_hilton_rob_plan(
+                changes, rob_warns = build_hilton_rob_plan(
                     prop["months"], wash["months"], wb[sheet])
+                for w in rob_warns:
+                    problems.append(f"{name} — ROB ({file_name}): {w}")
                 note = f"  ·  InnCode {inn}"
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
