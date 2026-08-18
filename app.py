@@ -1005,24 +1005,26 @@ def find_secondary_col(ws, block_start):
     return min(candidates) if candidates else None
 
 
-def _hilton_totals(srp_period, wash_period):
-    """Rooms and revenue for one period, composed the same way everywhere.
+def _srp_seg(srp_period, seg):
+    """(rooms, revenue) for one segment of one period, or zeros.
 
-    Transient comes from SRP; group and permanent come from the Wash report's
-    pick-up, because SRP's own 'convention' flag undercounts group badly (one
-    real month read 270 against the wash report's 1,017). The ROB calls this
-    with a month's buckets and the Forecast with a day's, which is the only
-    reason the two workbooks are guaranteed to agree on the month.
+    seg is 'TOT', 'GRP', 'PRM' or 'TRN'.
 
-    Returns (rooms, revenue, group, perm); the two wash segments come back so
-    callers needing the unpicked remainder don't reach into the buckets again.
+    Column E of the ROB and the on-the-books side of the Forecast are the SRP
+    export's own figures, taken as they stand. They used to be assembled here
+    instead — SRP transient plus the Wash report's pick-up — on the theory that
+    SRP undercounted group. Checked against three hand-corrected workbooks, that
+    assembly is what put every total out by a few thousand: 48 of the 55
+    corrected cells equal the plain SRP figure, and every Revenue, Room Nights
+    and Permanent cell among them matches exactly.
+
+    The Wash report is still right for column G. Its 'Available Block' is the
+    unpicked remainder and has no counterpart in SRP, which only knows about
+    bookings that exist. Only its 'Pick Up' has been dropped, because SRP has
+    already counted those rooms.
     """
-    trn = srp_period.get("TRN", [0, 0.0])
-    g = wash_period.get("GRP") or {}
-    p = wash_period.get("PRM") or {}
-    rooms = trn[0] + g.get("pu_rooms", 0.0) + p.get("pu_rooms", 0.0)
-    rev = trn[1] + g.get("pu_rev", 0.0) + p.get("pu_rev", 0.0)
-    return rooms, rev, g, p
+    rooms, rev = (srp_period or {}).get(seg, [0, 0.0])
+    return rooms, rev
 
 
 def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
@@ -1031,14 +1033,15 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     srp_months  — parse_srp_activity()[inncode]["months"]
     wash_months — parse_group_wash()["months"] for that same hotel
 
-    Column E takes what is on the books, column G ('not p/u') the unpicked
-    remainder of the group blocks. Totals are assembled rather than lifted
-    from SRP: transient comes from SRP, group and permanent from the Wash
-    report's pick-up, because SRP's own 'convention' flag undercounts group.
+    Column E is the SRP export as it stands — TOT for the total, GRP for group,
+    PRM for permanent. Column G ('not p/u') is the Wash report's unpicked block
+    remainder, which SRP has no equivalent for.
 
-    Rows are located by label, and any cell already holding a formula is left
-    alone — weeks get reconciled by hand into expressions like '=294767+55017'
-    and those must not be flattened.
+    Rows are located by label. A cell holding a hand-written reconciliation
+    like '=294767+55017' is left alone, but a cross-sheet mirror like
+    "='wk one'!E110" is overwritten: that is the template pointing at last
+    week, not a figure anyone entered, and leaving it stranded a stale Perm
+    row on a real workbook.
     """
     as_of = as_of or datetime.date.today()
     blocks = rob_month_blocks(ws)
@@ -1047,12 +1050,13 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     def put(row, col, label, value, month):
         if row is None or value is None:
             return
-        if is_formula(ws.cell(row, col).value):
-            changes.append({"row": row, "col": col, "label": label, "month": month,
-                            "new_value": value, "skip_reason": "formula"})
-            return
+        existing = ws.cell(row, col).value
+        # Same rule _rob_week_taken_reason uses to decide whether a week is
+        # really filled: a formula reaching into another sheet is a placeholder,
+        # anything else someone typed on purpose.
+        skip = "formula" if (is_formula(existing) and "!" not in str(existing)) else None
         changes.append({"row": row, "col": col, "label": label, "month": month,
-                        "new_value": value, "skip_reason": None})
+                        "new_value": value, "skip_reason": skip})
 
     changes.append({"row": 4, "col": 5, "label": "As-of date", "month": None,
                     "new_value": as_of, "skip_reason": None})
@@ -1062,46 +1066,54 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
         if month < as_of.month:
             continue                      # never rewrite a closed month
         key = (as_of.year, month)
-        tot_rooms, tot_rev, g, p = _hilton_totals(
-            srp_months.get(key) or {}, wash_months.get(key) or {})
+        srp = srp_months.get(key) or {}
+        wash = wash_months.get(key) or {}
+        tot_rooms, tot_rev = _srp_seg(srp, "TOT")
+        g_rooms, g_rev = _srp_seg(srp, "GRP")
+        p_rooms, p_rev = _srp_seg(srp, "PRM")
 
-        g_pu_r, g_pu_v = g.get("pu_rooms", 0.0), g.get("pu_rev", 0.0)
-        p_pu_r, p_pu_v = p.get("pu_rooms", 0.0), p.get("pu_rev", 0.0)
+        # Column G only — the part of the block nobody has taken up yet.
+        g_npu = wash.get("GRP") or {}
+        p_npu = wash.get("PRM") or {}
 
-        if not (tot_rooms or g_pu_r or p_pu_r):
+        if not tot_rooms:
             continue                      # nothing on the books for this month
 
         L = labels.get
         put(L("revenue"),        5, "Revenue",        round(tot_rev, 2), month)
         put(L("room nights"),    5, "Room Nights",    int(round(tot_rooms)), month)
-        put(L("group rms sold"), 5, "Group Rms sold", int(round(g_pu_r)), month)
-        put(L("group rm rev"),   5, "Group Rm Rev",   round(g_pu_v, 2), month)
-        put(L("group rms sold"), 7, "Group not p/u rms", int(round(g.get("av_rooms", 0.0))), month)
-        put(L("group rm rev"),   7, "Group not p/u rev", round(g.get("av_rev", 0.0), 2), month)
+        put(L("group rms sold"), 5, "Group Rms sold", int(round(g_rooms)), month)
+        put(L("group rm rev"),   5, "Group Rm Rev",   round(g_rev, 2), month)
+        put(L("group rms sold"), 7, "Group not p/u rms", int(round(g_npu.get("av_rooms", 0.0))), month)
+        put(L("group rm rev"),   7, "Group not p/u rev", round(g_npu.get("av_rev", 0.0), 2), month)
         if L("perm rms sold"):
-            put(L("perm rms sold"), 5, "Perm Rms Sold", int(round(p_pu_r)), month)
-            put(L("perm rm rev"),   5, "Perm Rm Rev",   round(p_pu_v, 2), month)
-            put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p.get("av_rooms", 0.0))), month)
-            put(L("perm rm rev"),   7, "Perm not p/u rev", round(p.get("av_rev", 0.0), 2), month)
+            put(L("perm rms sold"), 5, "Perm Rms Sold", int(round(p_rooms)), month)
+            put(L("perm rm rev"),   5, "Perm Rm Rev",   round(p_rev, 2), month)
+            put(L("perm rms sold"), 7, "Perm not p/u rms", int(round(p_npu.get("av_rooms", 0.0))), month)
+            put(L("perm rm rev"),   7, "Perm not p/u rev", round(p_npu.get("av_rev", 0.0), 2), month)
     return changes
 
 
-def build_hilton_forecast_plan(srp_days, wash_days, ws, as_of=None):
-    """Forecast changes for one Hilton hotel from the two Hilton exports.
+def build_hilton_forecast_plan(srp_days, ws, as_of=None):
+    """Forecast changes for one Hilton hotel from the SRP export.
 
     The Hilton Forecast is the same shape as every other Forecast the app
     writes — dates running across row 4, with OTB rooms, OTB ADR, actual rooms
     and actual revenue each on their own titled row — so it is located with the
     shared helpers rather than a second Hilton-specific set.
 
-    A day is composed exactly as build_hilton_rob_plan composes a month, from
-    the same two exports, so the Forecast's month cannot drift from the ROB's.
-    Days already gone take actual rooms and revenue; days still ahead take the
-    rooms on the books and the rate they are on the books at. Today counts as
-    ahead, because it is still selling.
+    Only the on-the-books rows are written, and only from today forward.
 
-    'Estimated Pick Up' and the forecast ADR are deliberately never written:
-    they are the revenue manager's judgement, not anything the exports know.
+    The actuals rows are left alone because this export cannot fill them. SRP
+    Activity lists reservations that are still live, so a day's rooms decay as
+    it recedes: on a 17 Aug export one hotel's 1 Aug read 4 rooms against a real
+    245, 8 Aug read 11, 13 Aug read 83, and only 14–16 Aug came back right. The
+    old code wrote those numbers into the actuals row, which is worse than
+    leaving it empty — the day looks filled and reads twenty times low. Whoever
+    fills actuals needs a report of departed stays, which this isn't.
+
+    'Estimated Pick Up' and the forecast ADR are likewise never written: they
+    are the revenue manager's judgement, not anything the export knows.
     """
     as_of = as_of or datetime.date.today()
     rows = locate_forecast_rows(ws)
@@ -1122,34 +1134,36 @@ def build_hilton_forecast_plan(srp_days, wash_days, ws, as_of=None):
 
     put("As-of date", rows["as_of_row"], 1, as_of)
 
-    dated = 0
+    dated, past = 0, 0
     for d, col in sorted(col_map.items()):
-        rooms, rev, _, _ = _hilton_totals(srp_days.get(d) or {}, wash_days.get(d) or {})
+        if d < as_of:
+            past += 1
+            continue
+        rooms, rev = _srp_seg(srp_days.get(d), "TOT")
         if not rooms:
             continue
         dated += 1
-        if d < as_of:
-            put(f"Rooms Sold (actual) {d}", rows["actual_rooms_row"], col,
-                int(round(rooms)))
-            put(f"Revenue (actual) {d}", rows["actual_revenue_row"], col,
-                round(rev, 2))
-        else:
-            put(f"Rooms Sold (OTB) {d}", rows["otb_rooms_row"], col,
-                int(round(rooms)))
-            put(f"ADR OTB {d}", rows["adr_otb_row"], col, round(rev / rooms, 2))
+        put(f"Rooms Sold (OTB) {d}", rows["otb_rooms_row"], col, int(round(rooms)))
+        put(f"ADR OTB {d}", rows["adr_otb_row"], col, round(rev / rooms, 2))
 
     if not dated:
-        return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms in "
-                    f"the SRP export. Is this the right month's workbook?"]
+        return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms still "
+                    f"on the books. Is this the right month's workbook?"]
+    if past:
+        warns.append(f"{past} day(s) already gone were left untouched — this export "
+                     f"only sees live reservations, so it can't fill the actuals "
+                     f"rows. Those stay yours to enter.")
 
     # Pick-up tracking chart: this week's on-the-books rooms written under the
-    # previous weeks', which is what makes the week-on-week build visible.
+    # previous weeks', which is what makes the week-on-week build visible. Same
+    # cutoff — a completed day's figure here would be as wrong as it is above.
     track = find_next_pickup_data_row(ws)
     if track:
         put("Pickup tracking: date", track, 1, as_of)
         for d, col in sorted(col_map.items()):
-            rooms, _, _, _ = _hilton_totals(srp_days.get(d) or {},
-                                            wash_days.get(d) or {})
+            if d < as_of:
+                continue
+            rooms, _ = _srp_seg(srp_days.get(d), "TOT")
             put(f"Pickup tracking: Rooms Sold {d}", track, col, int(round(rooms)))
     else:
         warns.append("no free row left in its pick-up tracking chart.")
@@ -6259,8 +6273,7 @@ def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
         return None
 
     sheet = first_unhighlighted_forecast_sheet(wb, avail)
-    changes, warns = build_hilton_forecast_plan(
-        prop["days"], wash["days"], wb[sheet])
+    changes, warns = build_hilton_forecast_plan(prop["days"], wb[sheet])
     for w in warns:
         problems.append(f"{hotel_name} — {label} ({file_name}, {sheet}): {w}")
     if not changes:
