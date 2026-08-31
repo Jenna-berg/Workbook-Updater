@@ -2782,7 +2782,57 @@ def find_restrictions_col(ws, upto_col=None):
     return None
 
 
-def build_rates_change_plan(rate_df, wb, sheet_name):
+def _strategy_norm(v):
+    return re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
+
+
+def _strategy_hotel_aliases(hotel_name):
+    aliases = {_strategy_norm(hotel_name)}
+    for _portfolio, members in PORTFOLIO_HOTELS.items():
+        for label, keywords in members.items():
+            if label == hotel_name:
+                aliases.add(_strategy_norm(label))
+                aliases.update(_strategy_norm(k) for k in keywords)
+    return {a for a in aliases if len(a) >= 4}
+
+
+def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
+    """Map Rates/Restrictions to the selected hotel's header, never by position."""
+    aliases = _strategy_hotel_aliases(hotel_name)
+    def matches(v):
+        n = _strategy_norm(v)
+        return bool(n) and any(a in n or n in a for a in aliases)
+
+    spans = []
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= 4 and rng.max_row >= 1:
+            v = ws.cell(rng.min_row, rng.min_col).value
+            if matches(v):
+                spans.append((rng.min_col, rng.max_col, str(v or "")))
+    for r in range(1,5):
+        for c in range(1, ws.max_column+1):
+            v=ws.cell(r,c).value
+            if matches(v):
+                spans.append((c,c,str(v or "")))
+    if not spans:
+        return None, None, f"Could not match selected hotel '{hotel_name}' to a Strategy Report header."
+
+    start,end,label=max(spans,key=lambda x:(x[1]-x[0],-x[0]))
+    lo=max(1,start-2); hi=min(ws.max_column,end+3); center=(start+end)/2
+    rates=[]; restrictions=[]
+    for c in range(lo,hi+1):
+        hdr=' '.join(str(ws.cell(r,c).value or '') for r in range(2,5)).upper()
+        compact=hdr.replace(' ','').replace('-','')
+        if ('RATE' in hdr or 'DOUBLE' in hdr) and 'BALLROOM' not in hdr and 'COMP SET' not in hdr:
+            rates.append(c)
+        if 'REST' in compact and 'TION' in compact:
+            restrictions.append(c)
+    rate=min(rates,key=lambda c:abs(c-center)) if rates else None
+    restr=min(restrictions,key=lambda c:abs(c-center)) if restrictions else None
+    return rate, restr, f"Matched '{hotel_name}' to Strategy header '{label}'"
+
+
+def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
     today = datetime.date.today()
     # include previous month — final numbers arrive on the 1st of the following month
     prev_month_start = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
@@ -2797,27 +2847,18 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     scope_end = max(date_row_map.keys()) if date_row_map else datetime.date(today.year, 12, 31)
     ws = wb[sheet_name]
 
-    restric_col = find_restrictions_col(ws)
-
-    # Find hotel rate column by scanning right from Restrictions looking for "hotel" or "rate"
-    # Don't assume it's restric_col+1 — there may be intermediate columns (e.g. casino ballroom).
-    # Always read actual column headers, never assume positions.
-    hotel_col = None
-    if restric_col:
-        for c in range(restric_col + 1, min(restric_col + 10, ws.max_column + 1)):
-            hdr3 = str(ws.cell(3, c).value or "").upper()
-            hdr4 = str(ws.cell(4, c).value or "").upper()
-            combined = hdr3 + " " + hdr4
-            if ("HOTEL" in combined or "RATE" in combined) and "BALLROOM" not in combined:
-                hotel_col = c
-                break
-
     changes = []
     warnings = []
+    hotel_col = restric_col = None
+    if hotel_name:
+        hotel_col, restric_col, diag = find_strategy_hotel_rate_restriction_cols(ws, hotel_name)
+        warnings.append(diag)
+    else:
+        warnings.append("No hotel name supplied for Rates & Restrictions mapping.")
+    if not hotel_col:
+        warnings.append(f"Could not locate the Rate column for selected hotel '{hotel_name or 'Unknown'}'; rates will not be changed.")
     if not restric_col:
-        warnings.append("Could not find Restrictions column in sheet headers.")
-    if not hotel_col and restric_col:
-        warnings.append("Could not find Hotel Rate column after Restrictions.")
+        warnings.append(f"Could not locate the Restrictions column for selected hotel '{hotel_name or 'Unknown'}'; restrictions will not be changed.")
 
     for _, row in rate_df.iterrows():
         date_str = str(row.get("Date", "")).strip()
@@ -4373,6 +4414,11 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
             # though it were a reporting date.
             if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
                 as_of_dates[new_col] = v
+    prev_week_current_year_date = None
+    if prev_ws is not None:
+        v = prev_ws.cell(4, 5).value
+        if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
+            prev_week_current_year_date = v
     as_of_dates[5] = datetime.datetime(target_month.year, target_month.month, target_month.day)
 
     for month_idx in range(12):
@@ -4394,7 +4440,10 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
             same_sheet_chain = is_formula(cur) and "!" not in cur
             if block_start != 4 and same_sheet_chain:
                 continue
-            cell.value = date_val
+            write_date = date_val
+            if col == 5 and month_idx <= prev_idx and prev_week_current_year_date is not None:
+                write_date = prev_week_current_year_date
+            cell.value = write_date
 
         # ── Data rows (offsets 1–7) ───────────────────────────────────────────
         if month_idx < prev_idx:
@@ -4485,6 +4534,73 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                 v = ly_ws.cell(r, ly_sec_col).value
                 if v is not None and not is_formula(str(v)) and not is_datelike(v):
                     new_ws.cell(r, 8).value = v
+
+
+def _wk1_previous_table_refs(ws, target_year):
+    months=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec']
+    hdr=None
+    for r in range(1,min(ws.max_row+1,80)):
+        for c in range(1,ws.max_column+1):
+            s=str(ws.cell(r,c).value or '').lower()
+            if 'week 1 previous' in s or ('calculation only' in s and 'week' in s):
+                hdr=(r,c); break
+        if hdr: break
+    if not hdr: return {}
+    hr,hc=hdr; mcol=None
+    for r in range(hr+1,min(ws.max_row+1,hr+40)):
+        for c in range(max(1,hc-5),min(ws.max_column+1,hc+8)):
+            if str(ws.cell(r,c).value or '').strip().lower() in months:
+                mcol=c; break
+        if mcol: break
+    if not mcol: return {}
+    mrows={}
+    for r in range(hr+1,min(ws.max_row+1,hr+40)):
+        s=str(ws.cell(r,mcol).value or '').strip().lower()
+        if s in months: mrows[months.index(s)]=r
+    ycols={}
+    for r in range(hr,min(ws.max_row+1,hr+10)):
+        for c in range(mcol+1,min(ws.max_column+1,mcol+20)):
+            v=ws.cell(r,c).value; y=None
+            if isinstance(v,(int,float)) and 2000<=int(v)<=2100: y=int(v)
+            elif isinstance(v,str):
+                m=re.search(r'\b(20\d{2})\b',v); y=int(m.group(1)) if m else None
+            elif isinstance(v,(datetime.datetime,datetime.date)): y=v.year
+            if y: ycols[y]=c
+        if len(ycols)>=4: break
+    if not ycols:
+        for c,y in zip(range(mcol+1,mcol+5),range(target_year-3,target_year+1)): ycols[y]=c
+    return {(mi,y):ws.cell(r,c).coordinate for mi,r in mrows.items() for y,c in ycols.items()}
+
+
+def apply_rob_pickup_wow_formulas(wb, target_year):
+    """All months, all year columns: current-week Revenue minus prior-week Revenue."""
+    from openpyxl.utils import get_column_letter
+    weeks=[s for s in ROB_SHEETS if s in wb.sheetnames]
+    if not weeks: return ['Pickup WoW formulas: no ROB week tabs found.']
+    wk1=wb[weeks[0]]; refs=_wk1_previous_table_refs(wk1,target_year)
+    year_by_col={}
+    for c in range(2,6):
+        v=wk1.cell(4,c).value; y=None
+        if isinstance(v,(datetime.datetime,datetime.date)): y=v.year
+        elif isinstance(v,(int,float)) and 2000<=int(v)<=2100: y=int(v)
+        elif isinstance(v,str):
+            m=re.search(r'\b(20\d{2})\b',v); y=int(m.group(1)) if m else None
+        year_by_col[c]=y or (target_year-5+c)
+    for wi,sname in enumerate(weeks):
+        ws=wb[sname]
+        for mi,labels in rob_month_blocks(ws).items():
+            rr=labels.get('revenue')
+            pr=next((r for lab,r in labels.items() if 'pickup' in lab and 'wow' in lab.replace(' ','')),None)
+            if not rr or not pr: continue
+            for c in range(2,6):
+                L=get_column_letter(c)
+                if wi==0:
+                    ref=refs.get((mi,year_by_col[c]))
+                    if ref: ws.cell(pr,c).value=f'={L}{rr}-{ref}'
+                else:
+                    prev=weeks[wi-1]
+                    ws.cell(pr,c).value=f"={L}{rr}-'{prev}'!{L}{rr}"
+    return [] if refs else ['Pickup WoW formulas: WK1 previous table could not be mapped; WK1 formulas left unchanged.']
 
 
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
@@ -4663,6 +4779,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month)
         if err:
             warnings.append(f"Prev table: {err}")
+
+    warnings.extend(apply_rob_pickup_wow_formulas(new_wb, target_month.year))
 
     strip_tables(new_wb)
     out = io.BytesIO()
@@ -6829,7 +6947,7 @@ if test_mode:
                 if rate_file2:
                     rate_df = parse_rate_csv(rate_file2.read())
                     rate_changes, rate_warnings = build_rates_change_plan(
-                        rate_df, wb2_full, sheet_choice2)
+                        rate_df, wb2_full, sheet_choice2, hotel_name=None)
                     all_changes += rate_changes
     
                 st.session_state["str_changes"]   = all_changes
@@ -7495,7 +7613,7 @@ with tab_weekly:
                                                        ly_wb=None)
                 warnings = []
                 if rate_df is not None:
-                    rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
+                    rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet, hotel_name=hotel_sel)
                     changes  += rate_changes
                     warnings += rate_warnings
             else:  # Forecast — current month (no Month Ending Forecast fill here)
