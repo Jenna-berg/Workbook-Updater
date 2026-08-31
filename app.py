@@ -3242,14 +3242,26 @@ def get_hotels_from_drive():
     to 'MULTI:<id>,<id>,...' listing every year's folder. resolve_drive_workbook
     and _find_rev_reports_folder_for_year both know how to unpack this.
     """
-    try:
-        svc = get_drive_service()
-        q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        result = svc.files().list(
-            q=q, fields="files(id, name)", pageSize=200,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute()
-        folders = result.get("files", [])
+q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+
+folders = []
+page_token = None
+
+while True:
+    result = svc.files().list(
+        q=q,
+        fields="nextPageToken, files(id, name)",
+        pageSize=1000,
+        pageToken=page_token,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+
+    folders.extend(result.get("files", []))
+
+    page_token = result.get("nextPageToken")
+    if not page_token:
+        break
 
         hotels = []
         known_groups = {}  # hotel display name -> [folder_id, ...]
@@ -3623,45 +3635,84 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
             return f["id"], f["name"]
     return None, None
 
-
+def _explicit_folder_year(name):
+    """Return an explicit 20xx year found in a folder name, or None."""
+    match = re.search(r"\b(20\d{2})\b", str(name or ""))
+    return int(match.group(1)) if match else None
 def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     """Rank REVENUE REPORTS folder candidates for a target month/year.
-    CRITICAL: Prefer year-only folders (2026 REVENUE REPORTS) over month
-    folders, even for the target month. Month folders should only be used
-    if they're the ONLY folders available (flat per-month layout like Harbor).
+
+    IMPORTANT:
+    Never allow a folder explicitly belonging to a different year to satisfy
+    the request. Generic folders with no year in their name remain valid
+    because some hotels use:
+        REVENUE REPORTS > Year > Month
+
     Order of preference:
-      1. name contains the year but NO month abbreviation — a true year
-         folder (month subfolders live inside it) [NESTED LAYOUT];
-      2. name contains target month AND no other month abbr [FLAT LAYOUT];
-      3. name contains year but NO month abbr (if step 2 didn't find anything);
-      4. name contains the year at all (fallback);
-      5. first candidate.
+      1. requested-year folder with no month abbreviation
+      2. exact requested-month folder
+      3. other requested-year folder
+      4. generic folder with no explicit year
     """
     if not candidates:
         return None
+
+    target_year = int(year_kw)
+
+    # Exclude folders that explicitly belong to another calendar year.
+    #
+    # Example during a 2026 lookup:
+    #   2026 REVENUE REPORTS  -> allowed
+    #   AUG2026 REVENUE ...   -> allowed
+    #   REVENUE REPORTS       -> allowed
+    #   2027 REVENUE REPORTS  -> EXCLUDED
+    eligible = [
+        f for f in candidates
+        if _explicit_folder_year(f["name"]) in (None, target_year)
+    ]
+
+    if not eligible:
+        return None
+
     month_kw_2digit = month_kw[:3] + month_kw[-2:] if month_kw else None
 
-    # Step 1: Prefer year-only folders (nested layout)
+    # Step 1: Prefer a true year-level folder.
     year_only = []
-    for f in candidates:
+    for f in eligible:
         name_upper = f["name"].upper()
-        if year_kw in f["name"] and not any(m.upper() in name_upper for m in MONTH_ABBR):
+        if (
+            year_kw in name_upper
+            and not any(m.upper() in name_upper for m in MONTH_ABBR)
+        ):
             year_only.append(f)
+
     if year_only:
         return year_only[0]
 
-    # Step 2: If no year-only folders, try exact month match (flat per-month layout)
-    for f in candidates:
+    # Step 2: Exact month folder for the requested month/year.
+    for f in eligible:
         name_upper = f["name"].upper()
-        if month_kw and (month_kw in name_upper or (month_kw_2digit and month_kw_2digit in name_upper)):
+        if month_kw and (
+            month_kw in name_upper
+            or (month_kw_2digit and month_kw_2digit in name_upper)
+        ):
             return f
 
-    # Step 3-5: Fallback rankings
-    for f in candidates:
-        if year_kw in f["name"]:
+    # Step 3: Any remaining folder explicitly matching the requested year.
+    for f in eligible:
+        if year_kw in f["name"].upper():
             return f
-    return candidates[0]
 
+    # Step 4: Generic REVENUE REPORTS folder with no explicit year.
+    generic = [
+        f for f in eligible
+        if _explicit_folder_year(f["name"]) is None
+    ]
+
+    if generic:
+        return generic[0]
+
+    return None
 
 def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None):
     """Find the REVENUE REPORTS folder to use for a given year (and,
@@ -4785,11 +4836,16 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file
         if self_is_rev:
             rev = {"id": single_id, "name": single_name}
-        else:
-            rev = next((f for f in children
-                        if _is_rev_reports_name(f["name"]) and year_kw in f["name"]), None)
-            if not rev:
-                rev = next((f for f in children if _is_rev_reports_name(f["name"])), None)
+       else:
+    rev_candidates = [
+        f for f in children
+        if _is_rev_reports_name(f["name"])
+    ]
+    rev = _pick_rev_reports_candidate(
+        rev_candidates,
+        year_kw,
+        month_kw,
+    )
         if rev:
             rev_children = children if self_is_rev else _list_subfolders(rev["id"])
             b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
@@ -4820,17 +4876,38 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
 
         return None, f"Could not find '{month_kw}' workbook under '{single_name}'."
 
-    if hotel_id.startswith(MULTI_ID_PREFIX):
-        candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
-        candidates = []
-        for cid in candidate_ids:
-            try:
-                info = service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
-                candidates.append({"id": cid, "name": info["name"]})
-            except Exception:
-                continue
-        if not candidates:
-            return None, f"Could not read any of the shared folders for '{hotel_name}'."
+if hotel_id.startswith(MULTI_ID_PREFIX):
+    candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+    candidates = []
+
+    for cid in candidate_ids:
+        try:
+            info = service.files().get(
+                fileId=cid,
+                fields="name",
+                supportsAllDrives=True,
+            ).execute()
+            candidates.append({"id": cid, "name": info["name"]})
+        except Exception:
+            continue
+
+    if not candidates:
+        return None, f"Could not read any of the shared folders for '{hotel_name}'."
+
+    # Only consider folders for the requested calendar year.
+    # Generic folders with no explicit year are still allowed because some
+    # hotels use REVENUE REPORTS > Year > Month.
+    target_year = month_date.year
+    candidates = [
+        f for f in candidates
+        if _explicit_folder_year(f["name"]) in (None, target_year)
+    ]
+
+    if not candidates:
+        return None, (
+            f"Could not find a {target_year} Revenue Reports folder "
+            f"for '{hotel_name}'."
+        )
 
         # Try the most likely-named candidates first (pure ordering
         # optimization), but fall through to the next candidate if one
@@ -6918,8 +6995,9 @@ with tab_weekly:
         with col_ref:
             st.write("")
             if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
-                get_hotels_from_drive.clear()
-                st.rerun()
+    get_hotels_from_drive.clear()
+    _all_visible_folders.clear()
+    st.rerun()
         with col_w:
             wb_sels = st.pills(
                 "Workbooks to update",
