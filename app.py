@@ -343,13 +343,6 @@ def srp_filter_warnings(filters):
             f"absent and every on-the-books total will read low. Re-run it with "
             f"Booked Date set to the day you run it.")
 
-    dep = filters.get("departure_from")
-    if dep and dep.day > 1:
-        out.append(
-            f"**Completed days will read far too low.** Its 'Departure Date' "
-            f"filter starts {dep.day} {dep:%b}, so guests who checked out before "
-            f"then are excluded — {dep:%B} 1–{dep.day - 1} are missing most of "
-            f"their stays. Set Departure Date to start on the 1st to capture them.")
     return out
 
 
@@ -1120,7 +1113,143 @@ def _srp_seg(srp_period, seg):
     return rooms, rev
 
 
-def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
+def extract_hilton_mtd_actuals_from_forecast(raw_bytes, as_of):
+    """Return completed current-month actual rooms/revenue through as_of - 2 days.
+
+    Hilton's daily workflow intentionally overlaps by one day:
+      * Forecast actuals are populated through yesterday.
+      * ROB current-month total uses actuals only through the day before yesterday.
+      * SRP contributes yesterday through month-end.
+
+    The one-day overlap lets the SRP export supply the freshest value for
+    yesterday, while the Forecast provides the already-actualized beginning
+    of the month.
+
+    Returns {"rooms", "revenue", "sheet", "through"} or None.
+    """
+    if not as_of:
+        return None
+
+    cutoff = as_of - datetime.timedelta(days=2)
+    if cutoff.month != as_of.month or cutoff.year != as_of.year:
+        # On the first/second day of a month there may be no current-month
+        # actualized portion yet.
+        return {
+            "rooms": 0,
+            "revenue": 0.0,
+            "sheet": None,
+            "through": cutoff,
+        }
+
+    wb_formulas = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False)
+    wb_values = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+
+    candidates = []
+
+    for sname in FORECAST_SHEETS:
+        if sname not in wb_formulas.sheetnames or sname not in wb_values.sheetnames:
+            continue
+
+        wsf = wb_formulas[sname]
+        wsv = wb_values[sname]
+        rows = locate_forecast_rows(wsf)
+        if not rows:
+            continue
+
+        sheet_as_of = (
+            parse_any_date(wsv.cell(rows["as_of_row"], 1).value)
+            or parse_any_date(wsf.cell(rows["as_of_row"], 1).value)
+        )
+        if sheet_as_of is None or sheet_as_of > as_of:
+            continue
+
+        col_map = build_forecast_date_col_map(
+            wsv, wb_values, date_row=rows["date_row"]
+        )
+        if not col_map:
+            continue
+
+        # Only consider tabs that contain at least one completed actual value.
+        has_actual = any(
+            d.year == as_of.year
+            and d.month == as_of.month
+            and d <= cutoff
+            and (
+                safe_float(wsv.cell(rows["actual_rooms_row"], col).value)
+                or safe_float(wsv.cell(rows["actual_revenue_row"], col).value)
+            )
+            for d, col in col_map.items()
+        )
+        if has_actual:
+            candidates.append((sheet_as_of, sname, rows, col_map))
+
+    if not candidates:
+        return None
+
+    # The most recent filled Forecast snapshot is the trusted source.
+    _, sname, rows, col_map = max(candidates, key=lambda x: x[0])
+    ws = wb_values[sname]
+
+    rooms = 0.0
+    revenue = 0.0
+    for d, col in col_map.items():
+        if (
+            d.year == as_of.year
+            and d.month == as_of.month
+            and d <= cutoff
+        ):
+            rooms += safe_float(ws.cell(rows["actual_rooms_row"], col).value) or 0.0
+            revenue += safe_float(ws.cell(rows["actual_revenue_row"], col).value) or 0.0
+
+    return {
+        "rooms": rooms,
+        "revenue": revenue,
+        "sheet": sname,
+        "through": cutoff,
+    }
+
+
+def hilton_current_month_total(srp_days, forecast_actuals, as_of):
+    """Combine Forecast actuals + SRP exactly as the Hilton daily ROB workflow.
+
+    Current month =
+      Forecast actuals: month start through as_of - 2
+      SRP OTB/live stay values: as_of - 1 through month end
+    """
+    if not as_of:
+        return None
+    if forecast_actuals is None:
+        return None
+
+    month_end = (
+        (as_of.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        - datetime.timedelta(days=1)
+    )
+    srp_start = as_of - datetime.timedelta(days=1)
+
+    srp_rooms = 0.0
+    srp_revenue = 0.0
+    d = srp_start
+    while d <= month_end:
+        rooms, rev = _srp_seg(srp_days.get(d), "TOT")
+        srp_rooms += rooms
+        srp_revenue += rev
+        d += datetime.timedelta(days=1)
+
+    return {
+        "rooms": forecast_actuals["rooms"] + srp_rooms,
+        "revenue": forecast_actuals["revenue"] + srp_revenue,
+        "actual_rooms": forecast_actuals["rooms"],
+        "actual_revenue": forecast_actuals["revenue"],
+        "srp_rooms": srp_rooms,
+        "srp_revenue": srp_revenue,
+        "actual_through": forecast_actuals["through"],
+        "srp_from": srp_start,
+        "forecast_sheet": forecast_actuals["sheet"],
+    }
+
+
+def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month_total=None):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
     srp_months  — parse_srp_activity()[inncode]["months"]
@@ -1172,6 +1301,16 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
         srp = srp_months.get(key) or {}
         wash = wash_months.get(key) or {}
         tot_rooms, tot_rev = _srp_seg(srp, "TOT")
+
+        # The current month is different from future months. The daily SRP
+        # export does not contain a reliable full-month history once completed
+        # stays have fallen outside its Departure Date filter. For the current
+        # month, use the established Hilton workflow:
+        #   actuals through day-before-yesterday + SRP yesterday through EOM.
+        if month == as_of.month and current_month_total is not None:
+            tot_rooms = current_month_total["rooms"]
+            tot_rev = current_month_total["revenue"]
+
         g = wash.get("GRP") or {}
         p = wash.get("PRM") or {}
 
@@ -6033,12 +6172,20 @@ def render_hilton_update(hotels):
         srp_filters = None
     for msg in srp_filter_warnings(srp_filters):
         st.warning(msg)
+    hilton_as_of = (
+        srp_filters.get("run_date")
+        if srp_filters and srp_filters.get("run_date")
+        else datetime.date.today()
+    )
+
     if srp_filters and srp_filters.get("lines"):
         with st.expander("Filters this export was run with"):
             for line in srp_filters["lines"]:
                 st.markdown(f"- {line}")
-            st.caption("Booked Date should be the day you run it, and Departure "
-                       "Date should start on the 1st of the month.")
+            st.caption("Booked Date should match the report run date. For the "
+                       "current month, the ROB combines completed Forecast actuals "
+                       "with the live SRP portion instead of expecting SRP to contain "
+                       "the full month's completed stays.")
 
     # Resolved up front, not inside the run. A hotel the export doesn't cover
     # can't be updated, and finding that out only after pressing the button is
@@ -6061,7 +6208,7 @@ def render_hilton_update(hotels):
 
     if st.button("Preview changes", key="hil_preview", type="primary"):
         svc = get_drive_service()
-        next_month = (datetime.date.today().replace(day=1)
+        next_month = (hilton_as_of.replace(day=1)
                       + datetime.timedelta(days=32)).replace(day=1)
         jobs, problems = [], []
         for name, fid in selected:
@@ -6084,8 +6231,10 @@ def render_hilton_update(hotels):
             prop = srp[inn]
             for wb_type in wb_sels:
                 if wb_type == "Forecast":
-                    job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
-                                               problems)
+                    job = _hilton_forecast_job(
+                        svc, fid, name, inn, prop, wash, problems,
+                        as_of=hilton_as_of
+                    )
                     if job:
                         jobs.append(job)
                     continue
@@ -6103,11 +6252,58 @@ def render_hilton_update(hotels):
                                     f"week tabs were found.")
                     continue
                 sheet = first_uncolored_sheet(wb, avail)
+                current_month_total = None
+
+                # Current-month Hilton ROB needs completed daily actuals from
+                # the current Forecast workbook plus the live SRP tail.
+                fcst_result, fcst_err = resolve_drive_workbook(
+                    svc, fid, name, "Forecast", month_date=hilton_as_of.replace(day=1)
+                )
+                if fcst_result and not fcst_err:
+                    fcst_id, fcst_name = fcst_result
+                    try:
+                        fcst_raw = drive_download(svc, fcst_id)
+                        actuals = extract_hilton_mtd_actuals_from_forecast(
+                            fcst_raw, hilton_as_of
+                        )
+                        current_month_total = hilton_current_month_total(
+                            prop["days"], actuals, hilton_as_of
+                        )
+                        if current_month_total is None:
+                            problems.append(
+                                f"{name} — ROB: could not find completed Forecast "
+                                f"actuals through {hilton_as_of - datetime.timedelta(days=2):%b %d}; "
+                                f"current-month Revenue / Room Nights were left to "
+                                f"the plain SRP total."
+                            )
+                    except Exception as e:
+                        problems.append(
+                            f"{name} — ROB: could not read current Forecast actuals "
+                            f"for the current-month total — {e}"
+                        )
+                else:
+                    problems.append(
+                        f"{name} — ROB: current Forecast workbook was not found, so "
+                        f"the current-month Revenue / Room Nights could not be "
+                        f"reconciled with completed actuals."
+                    )
+
                 changes, rob_warns = build_hilton_rob_plan(
-                    prop["months"], wash["months"], wb[sheet])
+                    prop["months"],
+                    wash["months"],
+                    wb[sheet],
+                    as_of=hilton_as_of,
+                    current_month_total=current_month_total,
+                )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
                 note = f"  ·  InnCode {inn}"
+                if current_month_total is not None:
+                    note += (
+                        f"  ·  current month = Forecast actuals through "
+                        f"{current_month_total['actual_through']:%b %d} + SRP "
+                        f"{current_month_total['srp_from']:%b %d}–month end"
+                    )
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
                 if passed:
@@ -6120,8 +6316,10 @@ def render_hilton_update(hotels):
                 })
 
             if hil_next_month and "Forecast" in wb_sels:
-                job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
-                                           problems, month_date=next_month)
+                job = _hilton_forecast_job(
+                    svc, fid, name, inn, prop, wash, problems,
+                    month_date=next_month, as_of=hilton_as_of
+                )
                 if job:
                     jobs.append(job)
         st.session_state["hil_jobs"] = jobs
@@ -6439,7 +6637,7 @@ def _show_ihg_plan(changes):
 
 
 def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
-                         month_date=None):
+                         month_date=None, as_of=None):
     """Build the Forecast job for one Hilton hotel and one month.
 
     month_date picks which month's workbook to open; None means the current
@@ -6468,7 +6666,9 @@ def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
         return None
 
     sheet = first_unhighlighted_forecast_sheet(wb, avail)
-    changes, warns = build_hilton_forecast_plan(prop["days"], wb[sheet])
+    changes, warns = build_hilton_forecast_plan(
+        prop["days"], wb[sheet], as_of=as_of
+    )
     for w in warns:
         problems.append(f"{hotel_name} — {label} ({file_name}, {sheet}): {w}")
     if not changes:
