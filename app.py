@@ -3227,20 +3227,16 @@ def _extract_hotel_name_from_rev_folder(name):
 
 @st.cache_data(ttl=300)
 def get_hotels_from_drive():
-    """Return list of (display_name, folder_id) for every top-level folder
-    that contains a 'REVENUE REPORTS' subfolder — i.e. each hotel folder.
-    Cached for 5 minutes so it doesn't hit Drive on every rerender.
+    """Return one Drive target per known hotel.
 
-    Some hotels are shared with the service account directly at the REVENUE
-    REPORTS folder level, not its parent — this happens on Shared Drives
-    where the person granting access can only share folders they themselves
-    have permission on, and Drive permissions don't propagate upward to a
-    parent. Some of those hotels additionally have a SEPARATE REVENUE
-    REPORTS folder per year (confirmed real case: Hyannis Anchor In), each
-    shared individually since there's no common parent to share instead —
-    those get grouped into a single hotel entry by name, with folder_id set
-    to 'MULTI:<id>,<id>,...' listing every year's folder. resolve_drive_workbook
-    and _find_rev_reports_folder_for_year both know how to unpack this.
+    Drive discovery is intentionally done in two cheap stages:
+      1. Fetch all visible folders in paginated batches, including parent IDs.
+      2. Examine only folders whose names are Revenue Reports folders.
+
+    Revenue-report folders are grouped directly to the canonical hotel labels
+    already declared in PORTFOLIO_HOTELS. This keeps every year's folder ID
+    available for prior-month / prior-year lookups without scanning thousands
+    of unrelated folders or making one API request per folder.
     """
     try:
         svc = get_drive_service()
@@ -3248,78 +3244,85 @@ def get_hotels_from_drive():
 
         folders = []
         page_token = None
+
         while True:
             result = svc.files().list(
                 q=q,
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken, files(id, name, parents)",
                 pageSize=1000,
                 pageToken=page_token,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             ).execute()
+
             folders.extend(result.get("files", []))
             page_token = result.get("nextPageToken")
             if not page_token:
                 break
 
-        hotels = []
-        known_groups = {}
-        rev_groups = []
+        # Parent names let us identify a generic folder named only
+        # "REVENUE REPORTS" from the hotel folder it lives under.
+        folder_by_id = {f["id"]: f for f in folders}
+
+        # Canonical hotel label -> every Revenue Reports folder ID visible
+        # for that hotel, across all years/months.
+        grouped = {}
 
         for folder in folders:
-            name = folder["name"]
+            name = str(folder.get("name", "") or "")
             name_upper = name.upper()
 
             if "ANCILLARY" in name_upper:
                 continue
-
-            known_match = next((hn for hn, kws in KNOWN_MULTI_FOLDER_HOTELS.items()
-                                 if any(kw in name_upper for kw in kws)), None)
-            if known_match:
-                known_groups.setdefault(known_match, []).append(folder["id"])
+            if not _is_rev_reports_name(name):
                 continue
 
-            if _is_rev_reports_name(name):
-                extracted = _extract_hotel_name_from_rev_folder(name)
-                if not extracted:
-                    continue
-                norm = extracted.upper()
-                match = next((g for g in rev_groups
-                              if norm in g["display"].upper() or g["display"].upper() in norm), None)
-                if match:
-                    match["ids"].append(folder["id"])
-                    if len(extracted) > len(match["display"]):
-                        match["display"] = extracted
-                else:
-                    rev_groups.append({"display": extracted, "ids": [folder["id"]]})
+            extracted = _extract_hotel_name_from_rev_folder(name)
+
+            parent_names = []
+            for parent_id in folder.get("parents", []):
+                parent = folder_by_id.get(parent_id)
+                if parent:
+                    parent_names.append(str(parent.get("name", "") or ""))
+
+            # Search the folder name, extracted hotel name, and visible parent
+            # name against the app's existing portfolio hotel aliases.
+            haystack = " ".join(
+                [name, extracted] + parent_names
+            ).upper()
+
+            canonical = None
+            for _portfolio, members in PORTFOLIO_HOTELS.items():
+                for hotel_label, keywords in members.items():
+                    if any(keyword.upper() in haystack for keyword in keywords):
+                        canonical = hotel_label
+                        break
+                if canonical:
+                    break
+
+            if not canonical:
                 continue
 
-            if re.search(r'\b20\d{2}\b', name):
-                continue
+            grouped.setdefault(canonical, []).append(folder["id"])
 
-            child_q = ("'%s' in parents and trashed = false and "
-                       "mimeType = 'application/vnd.google-apps.folder'") % folder["id"]
-            children = svc.files().list(
-                q=child_q, fields="files(name)", pageSize=20,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute()
-            has_rev = any(_is_rev_reports_name(c["name"]) for c in children.get("files", []))
-            if has_rev:
-                hotels.append((_strip_dedup_suffix(name), folder["id"]))
+        hotels = []
+        for hotel_label, ids in grouped.items():
+            # De-duplicate IDs while preserving Drive discovery order.
+            ids = list(dict.fromkeys(ids))
+            folder_id = (
+                ids[0]
+                if len(ids) == 1
+                else MULTI_ID_PREFIX + ",".join(ids)
+            )
+            hotels.append((hotel_label, folder_id))
 
-        for hotel_name, ids in known_groups.items():
-            hotels.append((_strip_dedup_suffix(hotel_name),
-                           ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
-
-        for info in rev_groups:
-            display = _strip_dedup_suffix(info["display"])
-            if len(info["ids"]) == 1:
-                hotels.append((display, info["ids"][0]))
-            else:
-                hotels.append((display, MULTI_ID_PREFIX + ",".join(info["ids"])))
-
-        hotels = [(name, fid) for name, fid in hotels if not _is_test_folder(name)]
+        hotels = [
+            (name, fid)
+            for name, fid in hotels
+            if not _is_test_folder(name)
+        ]
         return sorted(hotels, key=lambda x: x[0])
+
     except Exception:
         return []
 
@@ -7878,4 +7881,3 @@ with tab_projection:
 # only the open section reaches the page. Must stay the last statement in the
 # file — anything added after it would render into the void.
 _offstage.empty()
-
