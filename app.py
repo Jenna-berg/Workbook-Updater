@@ -3242,39 +3242,34 @@ def get_hotels_from_drive():
     to 'MULTI:<id>,<id>,...' listing every year's folder. resolve_drive_workbook
     and _find_rev_reports_folder_for_year both know how to unpack this.
     """
-q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    try:
+        svc = get_drive_service()
+        q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
 
-folders = []
-page_token = None
-
-while True:
-    result = svc.files().list(
-        q=q,
-        fields="nextPageToken, files(id, name)",
-        pageSize=1000,
-        pageToken=page_token,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-
-    folders.extend(result.get("files", []))
-
-    page_token = result.get("nextPageToken")
-    if not page_token:
-        break
+        folders = []
+        page_token = None
+        while True:
+            result = svc.files().list(
+                q=q,
+                fields="nextPageToken, files(id, name)",
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            folders.extend(result.get("files", []))
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
 
         hotels = []
-        known_groups = {}  # hotel display name -> [folder_id, ...]
-        rev_groups = []     # list of {"display": str, "ids": [folder_id, ...]} for unregistered hotels
+        known_groups = {}
+        rev_groups = []
+
         for folder in folders:
             name = folder["name"]
             name_upper = name.upper()
 
-            # "Ancillary" folders are a different report category entirely
-            # (ancillary revenue / front desk reports, not the ROB/SR/Forecast
-            # per-month structure) — confirmed real case: "Ancillary
-            # Provincetown Surfside" showing up as its own bogus hotel entry.
-            # Exclude from grouping regardless of which hotel keyword matches.
             if "ANCILLARY" in name_upper:
                 continue
 
@@ -3287,18 +3282,8 @@ while True:
             if _is_rev_reports_name(name):
                 extracted = _extract_hotel_name_from_rev_folder(name)
                 if not extracted:
-                    # No hotel name left after stripping the date prefix and
-                    # "Revenue Reports" — an orphaned/mis-named folder with no
-                    # usable hotel name (confirmed real case: "I. SEPT2021
-                    # Revenue Reports", missing the hotel name entirely).
-                    # Skip it rather than showing a meaningless entry.
                     continue
                 norm = extracted.upper()
-                # Merge by substring containment, not exact match — the same
-                # hotel's own folders don't always spell its name the same way
-                # (confirmed real case: some of Hyannis Anchor In's folders
-                # say just "Anchor In", others "Hyannis Anchor In"). Keep the
-                # longest/most complete variant seen as the display name.
                 match = next((g for g in rev_groups
                               if norm in g["display"].upper() or g["display"].upper() in norm), None)
                 if match:
@@ -3308,8 +3293,10 @@ while True:
                 else:
                     rev_groups.append({"display": extracted, "ids": [folder["id"]]})
                 continue
+
             if re.search(r'\b20\d{2}\b', name):
                 continue
+
             child_q = ("'%s' in parents and trashed = false and "
                        "mimeType = 'application/vnd.google-apps.folder'") % folder["id"]
             children = svc.files().list(
@@ -3321,7 +3308,8 @@ while True:
                 hotels.append((_strip_dedup_suffix(name), folder["id"]))
 
         for hotel_name, ids in known_groups.items():
-            hotels.append((_strip_dedup_suffix(hotel_name), ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
+            hotels.append((_strip_dedup_suffix(hotel_name),
+                           ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
 
         for info in rev_groups:
             display = _strip_dedup_suffix(info["display"])
@@ -4836,16 +4824,17 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file
         if self_is_rev:
             rev = {"id": single_id, "name": single_name}
-       else:
-    rev_candidates = [
-        f for f in children
-        if _is_rev_reports_name(f["name"])
-    ]
-    rev = _pick_rev_reports_candidate(
-        rev_candidates,
-        year_kw,
-        month_kw,
-    )
+        else:
+            rev_candidates = [
+                f for f in children
+                if _is_rev_reports_name(f["name"])
+            ]
+            rev = _pick_rev_reports_candidate(
+                rev_candidates,
+                year_kw,
+                month_kw,
+            )
+
         if rev:
             rev_children = children if self_is_rev else _list_subfolders(rev["id"])
             b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
@@ -4876,43 +4865,36 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
 
         return None, f"Could not find '{month_kw}' workbook under '{single_name}'."
 
-if hotel_id.startswith(MULTI_ID_PREFIX):
-    candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
-    candidates = []
+    if hotel_id.startswith(MULTI_ID_PREFIX):
+        candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+        candidates = []
 
-    for cid in candidate_ids:
-        try:
-            info = service.files().get(
-                fileId=cid,
-                fields="name",
-                supportsAllDrives=True,
-            ).execute()
-            candidates.append({"id": cid, "name": info["name"]})
-        except Exception:
-            continue
+        for cid in candidate_ids:
+            try:
+                info = service.files().get(
+                    fileId=cid,
+                    fields="name",
+                    supportsAllDrives=True,
+                ).execute()
+                candidates.append({"id": cid, "name": info["name"]})
+            except Exception:
+                continue
 
-    if not candidates:
-        return None, f"Could not read any of the shared folders for '{hotel_name}'."
+        if not candidates:
+            return None, f"Could not read any of the shared folders for '{hotel_name}'."
 
-    # Only consider folders for the requested calendar year.
-    # Generic folders with no explicit year are still allowed because some
-    # hotels use REVENUE REPORTS > Year > Month.
-    target_year = month_date.year
-    candidates = [
-        f for f in candidates
-        if _explicit_folder_year(f["name"]) in (None, target_year)
-    ]
+        target_year = month_date.year
+        candidates = [
+            f for f in candidates
+            if _explicit_folder_year(f["name"]) in (None, target_year)
+        ]
 
-    if not candidates:
-        return None, (
-            f"Could not find a {target_year} Revenue Reports folder "
-            f"for '{hotel_name}'."
-        )
+        if not candidates:
+            return None, (
+                f"Could not find a {target_year} Revenue Reports folder "
+                f"for '{hotel_name}'."
+            )
 
-        # Try the most likely-named candidates first (pure ordering
-        # optimization), but fall through to the next candidate if one
-        # doesn't actually contain the file — e.g. a stale duplicate folder
-        # from a typo — instead of giving up after the first name match.
         def _sort_key(f):
             name_up = f["name"].upper()
             if month_kw in name_up or month_kw_2digit in name_up:
@@ -4920,6 +4902,7 @@ if hotel_id.startswith(MULTI_ID_PREFIX):
             if year_kw in name_up:
                 return 1
             return 2
+
         ordered = sorted(candidates, key=_sort_key)
 
         last_err = None
@@ -4928,6 +4911,7 @@ if hotel_id.startswith(MULTI_ID_PREFIX):
             if result:
                 return result, None
             last_err = err
+
         return None, last_err or f"Could not find '{month_kw}' workbook for '{hotel_name}'."
 
     return _resolve_single(hotel_id, hotel_name)
@@ -6995,9 +6979,9 @@ with tab_weekly:
         with col_ref:
             st.write("")
             if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
-    get_hotels_from_drive.clear()
-    _all_visible_folders.clear()
-    st.rerun()
+                get_hotels_from_drive.clear()
+                _all_visible_folders.clear()
+                st.rerun()
         with col_w:
             wb_sels = st.pills(
                 "Workbooks to update",
