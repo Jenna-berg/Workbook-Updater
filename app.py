@@ -11,6 +11,8 @@ import datetime
 import hashlib
 import json
 import bcrypt
+from pathlib import Path
+from copy import copy
 from xml.sax.saxutils import escape
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -5251,6 +5253,509 @@ def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_onl
         return None
 
 
+
+# ── Monthly Ancillary Revenue Report Builder ─────────────────────────────────
+# Ported from the Google Apps Script prototype v11.12. The app version is
+# upload/preview/download first so hotel-specific rules can be validated before
+# any automatic Drive overwrite is enabled.
+ANCILLARY_TEMPLATE_FILENAME = "Ancillary Revenue Report Builder.xlsx"
+
+ANCILLARY_PROPERTY_PROFILES = {
+    'ashworth by the sea': {'display':'Ashworth by the Sea','stlySource':'CANARY','journal':[
+        {'label':'1005 Early Check-In','report':'Early Check In'},
+        {'label':'1006 Late Checkout','report':'Late Checkout'},
+        {'label':'1007 Very Early Check-In','report':'Very Early Check In'},
+        {'label':'1008 Very Late Checkout','report':'Very Late Check Out'}]},
+    'inn at middletown': {'display':'Inn at Middletown','stlySource':'CANARY','journal':[
+        {'label':'6006 Early Check In / Late Checkout','report':'Early Check In / Late Checkout'}]},
+    'crowne pointe inn and spa': {'display':'Crowne Pointe Inn & Spa','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1009 Early Arrival','report':'Early Check In'},
+        {'label':'1008 Late Checkout Fee','report':'Late Checkout'}]},
+    'anchor in': {'display':'Anchor In','stlySource':'CANARY','journal':[
+        {'label':'4222 Early Check In Fee','report':'Early Check In'},
+        {'label':'Late Checkout Fee','report':'Late Checkout'}]},
+    'allegria hotel': {'display':'Allegria Hotel','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1030 Early Check In Fee','report':'Early Check In'},
+        {'label':'1031 Late Check Out Fee','report':'Late Checkout'}]},
+    'the brass key guesthouse': {'display':'The Brass Key Guesthouse','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'112 Early Check In Fee','report':'Early Check In'},
+        {'label':'121 Late Checkout','report':'Late Checkout'}]},
+    'harbor hotel provincetown': {'display':'Harbor Hotel Provincetown','stlySource':'CANARY','journal':[
+        {'label':'4006 Early Checkin/Late Departure Fee','report':'Early Check In / Late Checkout'}]},
+    'provincetown inn': {'display':'Provincetown Inn','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1009 Early Arrival','report':'Early Check In'},
+        {'label':'1008 Late Checkout Fee','report':'Late Checkout'}]},
+    'surfside hotel and suites': {'display':'Surfside Hotel & Suites','stlySource':'CANARY','journal':[
+        {'label':'4004 Early Arrival Fee','report':'Early Check In'},
+        {'label':'1004 Late Checkout Fee 12PM $25.00','report':'Late Checkout'},
+        {'label':'1005 Late Checkout 1PM $40.00','report':'Late Checkout'},
+        {'label':'1006 Late Checkout 2PM $60.00','report':'Late Checkout'}]},
+    'hotel tybee': {'display':'Hotel Tybee','stlySource':'CANARY','journal':[
+        {'label':'4011 Early Check-In','report':'Early Check In'},
+        {'label':'4012 Late Checkout','report':'Late Checkout'},
+        {'label':'4013 Very Early Check-In','report':'Very Early Check In'},
+        {'label':'4014 Very Late Checkout','report':'Very Late Check Out'}]},
+    'pleasant view inn': {'display':'Pleasant View Inn','stlySource':'CANARY','journal':[
+        {'label':'4004 Early Check In Fee','report':'Early Check In'},
+        {'label':'4024 Late Check Out Fee','report':'Late Checkout'}]},
+    'the wolfeboro inn': {'display':'The Wolfeboro Inn','stlySource':'CANARY','journal':[
+        {'label':'1005 Early Check-In Fee Before 12:00 PM','report':'Early Check In'},
+        {'label':'1006 Late Check-Out Fee 12:00 PM','report':'Late Checkout'},
+        {'label':'1026 Early Check In Fee Before 1:00 PM','report':'Early Check In'},
+        {'label':'1027 Late Check Out Fee 1:00 PM','report':'Late Checkout'}]},
+}
+
+ANCILLARY_PROPERTY_ALIASES = {
+    'brass key guesthouse': 'the brass key guesthouse',
+    'harbor hotel': 'harbor hotel provincetown',
+    'provincetown surfside': 'surfside hotel and suites',
+    'westerly': 'pleasant view inn',
+    'wolfeboro inn': 'the wolfeboro inn',
+}
+
+ANCILLARY_RULES = {
+    'ashworth by the sea': {
+        'operational':['Parking Fee','Resort Fee- $25','Booking.com $25 Resort Fee Non-Taxable',
+                       'Booking.com $20 Resort Fee Non-Taxable','Booking.com Resort Fee ADJUSTMENT -$5',
+                       'Waive Parking Fee','Waive Resort Fee'],
+        'itemized':['1pm Early Check-in','2pm Early Check-in','1pm Late Check Out','2pm Late Check-out'],
+        'exclude':[]},
+    'inn at middletown': {
+        'operational':[],
+        'itemized':['11am Very Early Check-in','1pm Early Check-in','1pm Late Checkout'],
+        'exclude':['Amenity Fee']},
+    'crowne pointe inn and spa': {
+        'operational':[],
+        'itemized':['11am Early Check In','1pm Early Check In','1 PM Late Check Out','2 PM Late Check Out'],
+        'exclude':['Resort Fee Waived','Resort Fee Waived On Season']},
+    'anchor in': {
+        'operational':['Booking.com Resort Fee','Resort Fee - $25','Parking - $10'],
+        'itemized':['Early Check in 12PM','Early check in 1PM'],
+        'exclude':[]},
+    'hotel tybee': {
+        'operational':['Amenity Fee - $20','Group Amenity Fee $10.00','Parking Fee - $10',
+                       '-$10 Parking Fee off season','Waive Amenity Fee'],
+        'itemized':[], 'exclude':[]},
+    'allegria hotel': {
+        'operational':['Waive $55 Resort Fee (Incl Tax)'],
+        'itemized':['Early Check In - 12pm - 3pm','Early Check In - 7am - 12pm',
+                    'Relax & Revel until 1pm','Relax & Revel until 2pm'],
+        'exclude':[]},
+}
+
+ANCILLARY_YOY_ALIASES = {
+    'ashworth by the sea': [
+        ('Pet Fee','Bring your furry friend'),('Cheese & Cracker Tray','Cheese and Cracker Tray'),
+        ('Cookies & Milk','Cookies and Milk'),('Bottle of Champagne','Bottle of Champagne'),
+        ('Early Check In','Early Check-in'),('Early Check In','Very Early Check-in'),
+        ('Late Checkout','Late Checkout'),('Late Checkout','Very Late Checkout'),
+        ('Very Early Check In','Very Early Check-in'),
+        ('Oceanfront Room Two Queen Beds Balcony','Ocean Front, 2 Queen Beds, Balcony'),
+        ('Oceanfront Room One King Bed Balcony','Ocean Front, 1 King Bed, Balcony'),
+        ('Ashworth Oceanfront Room One King Bed Balcony','Ashworth Ocean Front, 1 King Bed, Balcony')],
+    'inn at middletown': [
+        ('Pet Fee','Pet Accommodation'),
+        ('Early Check In / Late Checkout','Early Check-in'),
+        ('Early Check In / Late Checkout','Very Early Check-in'),
+        ('Early Check In / Late Checkout','Late Checkout'),
+        ('Early Check In / Late Checkout','Very Late Checkout'),
+        ('House Red Wine','Bottle of Red Wine')],
+    'hotel tybee': [
+        ('Pet Fee','Pet Accommodation'),('Rollaway Bed','Extra twin bed $25.00 per day'),
+        ('Very Late Check Out','Very Late Checkout'),('Bottle of Prosecco','Bottle of Sparkling Wine'),
+        ('Bottle or Red Wine','Bottle of Red Wine'),('All American Bucket of Beer','All American Beach Beer Bucket')],
+}
+
+
+def _ar_norm(v):
+    return re.sub(r'\\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(v or '').lower().replace('&','and'))).strip()
+
+
+def ancillary_profile(property_name):
+    n = _ar_norm(property_name)
+    n = ANCILLARY_PROPERTY_ALIASES.get(n, n)
+    if n in ANCILLARY_PROPERTY_PROFILES:
+        return ANCILLARY_PROPERTY_PROFILES[n], n
+    for key, prof in ANCILLARY_PROPERTY_PROFILES.items():
+        if n in key or key in n:
+            return prof, key
+    return ANCILLARY_PROPERTY_PROFILES['ashworth by the sea'], 'ashworth by the sea'
+
+
+def _ar_num(v):
+    if v is None or v == '':
+        return None
+    if isinstance(v, (int,float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip()
+    neg = '(' in s and ')' in s
+    s = re.sub(r'[$,%()\\s,]', '', s)
+    if not s:
+        return None
+    try:
+        n = float(s)
+        return -abs(n) if neg else n
+    except Exception:
+        return None
+
+
+def _ar_date(v):
+    if isinstance(v, datetime.datetime): return v
+    if isinstance(v, datetime.date): return datetime.datetime.combine(v, datetime.time())
+    if isinstance(v, (int,float)):
+        try: return datetime.datetime(1899,12,30) + datetime.timedelta(days=float(v))
+        except Exception: return None
+    if not v: return None
+    for fmt in ('%m/%d/%Y','%Y-%m-%d','%m/%d/%y','%b %d, %Y','%B %d, %Y'):
+        try: return datetime.datetime.strptime(str(v).strip(), fmt)
+        except Exception: pass
+    try: return pd.to_datetime(v).to_pydatetime()
+    except Exception: return None
+
+
+def _ar_file_rows(uploaded_file):
+    data = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
+    name = getattr(uploaded_file, 'name', '').lower()
+    if name.endswith('.csv'):
+        txt = data.decode('utf-8-sig', errors='replace')
+        return list(csv.reader(io.StringIO(txt)))
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    ws = wb.worksheets[0]
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+def _ar_header_map(row):
+    return {_ar_norm(v): i for i,v in enumerate(row)}
+
+
+def _ar_col(h, names):
+    for name in names:
+        k = _ar_norm(name)
+        if k in h: return h[k]
+    return -1
+
+
+def ancillary_parse_addon(raw, property_key):
+    rules = ANCILLARY_RULES.get(property_key, {'operational':[],'itemized':[],'exclude':[]})
+    operational_set = {_ar_norm(x) for x in rules.get('operational',[])}
+    itemized_set = {_ar_norm(x) for x in rules.get('itemized',[])}
+    exclude_set = {_ar_norm(x) for x in rules.get('exclude',[])}
+    header_row = -1
+    for i,row in enumerate(raw[:12]):
+        if len(row)>1 and not str(row[0] or '').strip() and 'total count' in str(row[1] or '').lower():
+            header_row = i; break
+    if header_row < 0: header_row = 2
+    buckets = {'main':[], 'operational':[], 'itemized':[]}
+    for r in raw[header_row+1:]:
+        name = str(r[0] or '').strip() if r else ''
+        if not name: continue
+        count = _ar_num(r[1] if len(r)>1 else None)
+        revenue = _ar_num(r[2] if len(r)>2 else None)
+        average = _ar_num(r[3] if len(r)>3 else None)
+        if count is None and revenue is None: continue
+        obj={'name':name,'count':count or 0,'revenue':revenue or 0,'average':average or 0}
+        n=_ar_norm(name)
+        if n in exclude_set: continue
+        is_operational = bool(re.search(r'\\bwaiv(?:e|ed)\\b|\\bresort\\s+fee\\b|\\bamenity\\s+fee\\b|\\bparking\\s+fee\\b|^parking\\s*-?\\s*\\$|booking\\.com.*(?:resort|amenity|parking)', name, re.I))
+        is_timing = bool(re.search(r'\\bearly\\s+(?:check\\s*-?\\s*in|arrival)\\b|\\blate\\s+(?:check\\s*-?\\s*out|checkout|departure)\\b|\\bvery\\s+early\\s+check\\s*-?\\s*in\\b|\\bvery\\s+late\\s+check\\s*-?\\s*out\\b', name, re.I))
+        if n in operational_set or is_operational: buckets['operational'].append(obj)
+        elif n in itemized_set or is_timing: buckets['itemized'].append(obj)
+        else: buckets['main'].append(obj)
+    def combine(rows):
+        m={}
+        for r in rows:
+            k=_ar_norm(r['name'])
+            if k not in m: m[k]={'name':r['name'],'count':0,'revenue':0,'average':0}
+            m[k]['count'] += _ar_num(r['count']) or 0
+            m[k]['revenue'] += _ar_num(r['revenue']) or 0
+        for r in m.values(): r['average']=r['revenue']/r['count'] if r['count'] else 0
+        return sorted(m.values(), key=lambda x:x['revenue'], reverse=True)
+    return {k:combine(v) for k,v in buckets.items()}
+
+
+def ancillary_parse_upsell(raw):
+    if not raw: return {'byRoomType':[],'byStaff':[],'byLevel':[]}
+    h=_ar_header_map(raw[0])
+    user_c=_ar_col(h,['user']); channel_c=_ar_col(h,['channel']); from_c=_ar_col(h,['from level'])
+    room_c=_ar_col(h,['to room type']); to_c=_ar_col(h,['to level']); nights_c=_ar_col(h,['nights']); total_c=_ar_col(h,['total amount'])
+    if room_c<0 or total_c<0:
+        raise ValueError('SNT Upsell file is missing To Room Type or Total Amount.')
+    room={}; staff={}; level={}
+    for r in raw[1:]:
+        def rv(c): return r[c] if c>=0 and c<len(r) else None
+        revenue=_ar_num(rv(total_c)) or 0
+        producing=1 if revenue != 0 else 0
+        nights=_ar_num(rv(nights_c)) or 0
+        from_level=_ar_num(rv(from_c)) or 0; to_level=_ar_num(rv(to_c)) or 0
+        lvl=int(to_level-from_level) if (to_level-from_level)>0 else 0
+        room_name=str(rv(room_c) or '').strip(); channel=str(rv(channel_c) or '').strip(); user=str(rv(user_c) or '').strip()
+        if not user and channel.upper() in ('URL','WEB'): user='WEB'
+        if not user: user='Unknown'
+        if room_name:
+            z=room.setdefault(room_name,{'name':room_name,'count':0,'revenue':0,'actualNights':0})
+            z['count']+=producing; z['revenue']+=revenue; z['actualNights']+=producing*nights
+        z=staff.setdefault(user,{'name':user,'count':0,'revenue':0}); z['count']+=1; z['revenue']+=revenue
+        if lvl>0: level['+'+str(lvl)] = level.get('+'+str(lvl),0)+1
+    by_room=[]
+    for x in room.values():
+        if x['revenue'] or x['actualNights']:
+            by_room.append({'name':x['name'],'count':x['actualNights'],'revenue':x['revenue'],'average':x['revenue']/x['actualNights'] if x['actualNights'] else 0})
+    by_room.sort(key=lambda x:x['revenue'], reverse=True)
+    by_staff=sorted(staff.values(), key=lambda x:(0 if x['name']=='WEB' else 1, x['name'].lower()))
+    by_level=[{'level':k,'count':level[k]} for k in sorted(level,key=lambda z:int(z[1:]))]
+    return {'byRoomType':by_room,'byStaff':by_staff,'byLevel':by_level}
+
+
+def ancillary_parse_canary_history(raw, stly_month):
+    if not raw: raise ValueError('Historical Canary file is empty.')
+    h=_ar_header_map(raw[0]); ac=_ar_col(h,['arrival date']); sc=_ar_col(h,['status']); ic=_ar_col(h,['item']); rc=_ar_col(h,['revenue'])
+    if min(ac,sc,ic,rc)<0: raise ValueError('Historical Canary file is missing Arrival Date, Status, Item, or Revenue.')
+    agg={}
+    for r in raw[1:]:
+        dt=_ar_date(r[ac] if ac<len(r) else None)
+        if not dt or dt.month!=stly_month.month or dt.year!=stly_month.year: continue
+        name=str(r[ic] or '').strip(); status=str(r[sc] or '').strip().lower(); revenue=_ar_num(r[rc]) or 0
+        if not name: continue
+        z=agg.setdefault(name,{'name':name,'approved':0,'denied':0,'expired':0})
+        if status=='approved': z['approved']+=revenue
+        elif status=='denied': z['denied']+=revenue
+        elif status=='expired': z['expired']+=revenue
+    rows=[]
+    for x in agg.values():
+        x=dict(x); x['requested']=x['approved']+x['denied']+x['expired']; rows.append(x)
+    rows.sort(key=lambda x:(-x['approved'],-x['requested']))
+    totals={k:sum(x[k] for x in rows) for k in ('requested','approved','denied','expired')}
+    return {'sourceType':'CANARY','rows':rows,'totals':totals,'byItem':{_ar_norm(x['name']):x for x in rows},'itemizedRows':[]}
+
+
+def ancillary_parse_snt_history(addon_raw, upsell_raw, property_key):
+    addon=ancillary_parse_addon(addon_raw, property_key); ups=ancillary_parse_upsell(upsell_raw)
+    rows=sorted(addon['main']+ups['byRoomType'], key=lambda x:x['revenue'], reverse=True)
+    out=[]; by={}
+    for r in rows:
+        x=dict(r,approved=r['revenue'],requested=r['revenue'],denied=0,expired=0); out.append(x); by[_ar_norm(x['name'])]=x
+    totals={'count':sum(_ar_num(x.get('count')) or 0 for x in out),'revenue':sum(x['revenue'] for x in out)}
+    totals.update({'requested':totals['revenue'],'approved':totals['revenue'],'denied':0,'expired':0})
+    return {'sourceType':'SNT','rows':out,'totals':totals,'byItem':by,'itemizedRows':[dict(x) for x in addon['itemized']]}
+
+
+def ancillary_apply_stly_journal(stly, journal_rows):
+    remove={_ar_norm(x) for x in ['11am Early Check In','1pm Early Check In','11am Early Check-in','1pm Early Check-in','1 PM Late Check Out','2 PM Late Check Out','1pm Late Checkout','2pm Late Checkout']}
+    rows=[dict(r) for r in stly.get('rows',[]) if _ar_norm(r['name']) not in remove]
+    for j in journal_rows:
+        if j.get('revenue') is None: continue
+        rev=_ar_num(j['revenue']) or 0
+        rows.append({'name':j['name'],'count':None,'revenue':rev,'average':None,'approved':rev,'requested':rev,'denied':0,'expired':0})
+    rows.sort(key=lambda x:_ar_num(x.get('revenue')) or 0, reverse=True)
+    by={_ar_norm(x['name']):x for x in rows}
+    total_rev=sum(_ar_num(x.get('revenue')) or 0 for x in rows); total_count=sum(_ar_num(x.get('count')) or 0 for x in rows if x.get('count') is not None)
+    return {'sourceType':'SNT','rows':rows,'totals':{'count':total_count,'revenue':total_rev,'requested':total_rev,'approved':total_rev,'denied':0,'expired':0},'byItem':by,'itemizedRows':stly.get('itemizedRows',[])}
+
+
+def ancillary_property_corrections(stly, property_key):
+    if property_key=='allegria hotel':
+        for r in stly.get('rows',[]):
+            if _ar_norm(r.get('name'))==_ar_norm('Rollaway Bed'):
+                r['revenue']=r['approved']=r['requested']=800
+                r['average']=800/(_ar_num(r.get('count')) or 1) if (_ar_num(r.get('count')) or 0) else None
+        stly['rows'].sort(key=lambda x:_ar_num(x.get('revenue')) or 0, reverse=True)
+        stly['byItem']={_ar_norm(x['name']):x for x in stly['rows']}
+        rev=sum(_ar_num(x.get('revenue')) or 0 for x in stly['rows']); cnt=sum(_ar_num(x.get('count')) or 0 for x in stly['rows'] if x.get('count') is not None)
+        stly['totals'].update({'count':cnt,'revenue':rev,'requested':rev,'approved':rev,'denied':0,'expired':0})
+    return stly
+
+
+def ancillary_parse_staff(raw):
+    if not raw: return []
+    h=_ar_header_map(raw[0]); nc=_ar_col(h,['staff name']); mc=_ar_col(h,['messages'])
+    if nc<0 or mc<0: return []
+    rows=[{'name':str(r[nc] or '').strip(),'messages':_ar_num(r[mc]) or 0} for r in raw[1:] if nc<len(r) and str(r[nc] or '').strip()]
+    return sorted(rows,key=lambda x:x['messages'], reverse=True)
+
+
+def ancillary_alias_map(property_key):
+    out={}
+    for cur,prev in ANCILLARY_YOY_ALIASES.get(property_key,[]): out.setdefault(_ar_norm(cur),[]).append(prev)
+    return out
+
+
+def ancillary_variance(current_rows, stly_by_item, property_key):
+    aliases=ancillary_alias_map(property_key); is_ash='ashworth' in property_key; out=[]; matched={}; cur_by={_ar_norm(r['name']):r for r in current_rows}
+    suppressed=set(); rollups={}
+    if is_ash:
+        early=_ar_norm('Early Check In'); very=_ar_norm('Very Early Check In'); rollups[early]=[early,very]; suppressed.add(very)
+    for r in current_rows:
+        n=_ar_norm(r['name'])
+        if n in suppressed: continue
+        current=sum(_ar_num(cur_by[x].get('revenue')) or 0 for x in rollups.get(n,[n]) if x in cur_by)
+        candidates=aliases.get(n,[]) or [r['name']]; prev=0
+        for name in candidates:
+            sn=_ar_norm(name)
+            if sn in matched: continue
+            x=stly_by_item.get(sn)
+            if x: prev+=_ar_num(x.get('approved')) or 0; matched[sn]=True
+        if n not in aliases:
+            x=stly_by_item.get(n)
+            if x and n not in matched: prev+=_ar_num(x.get('approved')) or 0; matched[n]=True
+        out.append({'name':r['name'],'current':current,'stly':prev,'variance':current-prev})
+    for n,x in stly_by_item.items():
+        if n in matched: continue
+        prev=_ar_num(x.get('approved')) or 0
+        if prev: out.append({'name':x['name'],'current':0,'stly':prev,'variance':-prev})
+    return out
+
+
+def _ar_is_journal_equivalent(name):
+    n=_ar_norm(name)
+    vals=['early check in','early check-in','late checkout','late check out','very early check in','very early check-in','very late checkout','very late check out','early check in / late checkout','early check in late checkout']
+    return any(n==_ar_norm(x) for x in vals)
+
+
+def _ar_copy_style_row(src_ws, src_row, dst_ws, dst_row, start_col=1, num_cols=5):
+    for c in range(start_col,start_col+num_cols):
+        s=src_ws.cell(src_row,c); d=dst_ws.cell(dst_row,c)
+        if s.has_style:
+            d._style=copy(s._style)
+        d.number_format=s.number_format
+        d.font=copy(s.font); d.fill=copy(s.fill); d.border=copy(s.border); d.alignment=copy(s.alignment); d.protection=copy(s.protection)
+    dst_ws.row_dimensions[dst_row].height=src_ws.row_dimensions[src_row].height
+
+
+def _ar_merge_name(ws,row,start_col=1,num_cols=5):
+    try: ws.merge_cells(start_row=row,start_column=start_col,end_row=row,end_column=start_col+num_cols-1)
+    except Exception: pass
+
+
+def _ar_clear_output_sheet(ws, max_row=260, max_col=17):
+    # Clear values and merges while retaining column widths. Styles will be
+    # copied from Report Template section prototypes as sections are rendered.
+    for rng in list(ws.merged_cells.ranges):
+        try: ws.unmerge_cells(str(rng))
+        except Exception: pass
+    for row in ws.iter_rows(min_row=1,max_row=max_row,min_col=1,max_col=max_col):
+        for cell in row:
+            cell.value=None
+            cell._style=copy(openpyxl.styles.Style()) if False else cell._style
+    ws._charts=[]
+
+
+def ancillary_render_report(template_bytes, property_name, property_key, report_month, main_rows, operational_rows, itemized_rows, upgrades, stly, variance_rows, staff_rows, messaging, engagement):
+    wb=openpyxl.load_workbook(io.BytesIO(template_bytes), data_only=False)
+    if 'Report Template' not in wb.sheetnames: raise ValueError('Template workbook is missing the Report Template sheet.')
+    template=wb['Report Template']
+    if 'Report' in wb.sheetnames: del wb['Report']
+    sh=wb.copy_worksheet(template); sh.title='Report'
+    # Remove template-era merges first. Dynamic sections are merged again as
+    # they are rendered; leaving Ashworth's fixed merges in place would swallow
+    # cells when another hotel's sections are longer (e.g. Allegria STLY).
+    for merged in list(sh.merged_cells.ranges):
+        sh.unmerge_cells(str(merged))
+    # clear copied Ashworth values; formatting is re-applied section-by-section
+    for row in sh.iter_rows(min_row=1,max_row=min(sh.max_row,260),min_col=1,max_col=17):
+        for cell in row: cell.value=None
+    sh._charts=[]
+    month_name=report_month.strftime('%B'); month_abbr=report_month.strftime('%b').upper(); year=report_month.year
+    short_prop=re.sub(r' by the Sea( Hotel)?$','',property_name,flags=re.I)
+    left=1
+    _ar_copy_style_row(template,1,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=f'{short_prop} Upsell Overview - {month_name}'; left+=1
+    _ar_copy_style_row(template,2,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
+    _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Name'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
+    for r in main_rows:
+        _ar_copy_style_row(template,4,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value='' if r.get('count') is None else r.get('count'); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value='' if r.get('average') is None else r.get('average'); left+=1
+    total_count=sum(_ar_num(r.get('count')) or 0 for r in main_rows if r.get('count') is not None); total_rev=sum(_ar_num(r.get('revenue')) or 0 for r in main_rows)
+    avg_rows=[r for r in main_rows if r.get('count') is not None and (_ar_num(r.get('count')) or 0)>0]; avg_den=sum(_ar_num(r.get('count')) or 0 for r in avg_rows); avg_num=sum(_ar_num(r.get('revenue')) or 0 for r in avg_rows)
+    _ar_copy_style_row(template,24,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='TOTALS'; sh.cell(left,3).value=total_count; sh.cell(left,4).value=total_rev; sh.cell(left,5).value=avg_num/avg_den if avg_den else 0; left+=1
+    _ar_copy_style_row(template,25,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value='STLY'; left+=1
+    if stly['sourceType']=='SNT':
+        _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Upsell Name'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average Revenue'; left+=1
+        for r in stly['rows']:
+            _ar_copy_style_row(template,4,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value='' if r.get('count') is None else r.get('count'); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value='' if r.get('average') is None else r.get('average'); left+=1
+        _ar_copy_style_row(template,24,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='TOTALS'; sh.cell(left,3).value=stly['totals'].get('count',0); sh.cell(left,4).value=stly['totals'].get('revenue',0); av=[r for r in stly['rows'] if r.get('average') not in (None,'')]; sh.cell(left,5).value=sum(_ar_num(r.get('average')) or 0 for r in av)/len(av) if av else 0; left+=1
+    else:
+        _ar_copy_style_row(template,26,sh,left,1,5); sh.cell(left,1).value='Name'; sh.cell(left,2).value='Revenue Requested $'; sh.cell(left,3).value='Revenue Approved $'; sh.cell(left,4).value='Revenue Denied $'; sh.cell(left,5).value='Revenue Expired $'; left+=1
+        for r in stly['rows']:
+            _ar_copy_style_row(template,27,sh,left,1,5); vals=[r['name'],r['requested'],r['approved'],r['denied'],r['expired']]
+            for c,v in enumerate(vals,1): sh.cell(left,c).value=v
+            left+=1
+        _ar_copy_style_row(template,43,sh,left,1,5); vals=['TOTALS',stly['totals']['requested'],stly['totals']['approved'],stly['totals']['denied'],stly['totals']['expired']]
+        for c,v in enumerate(vals,1): sh.cell(left,c).value=v
+        left+=1
+    _ar_copy_style_row(template,44,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value='Variance'; left+=1
+    _ar_copy_style_row(template,45,sh,left,1,5); sh.cell(left,1).value='Name'; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value='Total Revenue'; left+=1
+    for r in variance_rows:
+        _ar_copy_style_row(template,46,sh,left,1,5); sh.cell(left,1).value=r['name']; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=r['variance']; left+=1
+    _ar_copy_style_row(template,69,sh,left,1,5); sh.cell(left,1).value='TOTALS'; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=sum(_ar_num(r['variance']) or 0 for r in variance_rows); left+=4
+    _ar_copy_style_row(template,72,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
+    _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Early Check In & Late Checkout Itemized'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
+    for r in itemized_rows:
+        _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
+    if stly['sourceType']=='SNT' and stly.get('itemizedRows'):
+        left+=2; _ar_copy_style_row(template,72,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year-1; left+=1
+        _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Early Check In & Late Checkout Itemized'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
+        for r in stly['itemizedRows']:
+            _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
+    # middle stack
+    mid=3; _ar_copy_style_row(template,3,sh,mid,7,4); headers=['Name','Total Count','Total Revenue','Average revenue']
+    for i,v in enumerate(headers,7): sh.cell(mid,i).value=v
+    mid+=1
+    for r in operational_rows:
+        _ar_copy_style_row(template,4,sh,mid,7,4); vals=[r['name'],r.get('count',''),_ar_num(r.get('revenue')) or 0,r.get('average','')]
+        for i,v in enumerate(vals,7): sh.cell(mid,i).value=v
+        mid+=1
+    mid+=3; _ar_copy_style_row(template,13,sh,mid,7,3); vals=['Staff Name','Room Upgrades Produced','Revenue Produced']
+    for i,v in enumerate(vals,7): sh.cell(mid,i).value=v
+    mid+=1
+    for r in upgrades['byStaff']:
+        _ar_copy_style_row(template,14,sh,mid,7,3); sh.cell(mid,7).value=r['name']; sh.cell(mid,8).value=r['count']; sh.cell(mid,9).value=r['revenue']; mid+=1
+    mid+=3; _ar_copy_style_row(template,25,sh,mid,7,2); sh.cell(mid,7).value='Room Level Increase'; sh.cell(mid,8).value='Count'; mid+=1
+    for r in upgrades['byLevel']:
+        _ar_copy_style_row(template,26,sh,mid,7,2); sh.cell(mid,7).value=str(r['level']).replace('+','')+'+'; sh.cell(mid,8).value=r['count']; mid+=1
+    mid+=3; _ar_copy_style_row(template,30,sh,mid,7,2); sh.cell(mid,7).value='Staff Name'; sh.cell(mid,8).value='Messages'; mid+=1
+    for r in staff_rows:
+        _ar_copy_style_row(template,31,sh,mid,7,2); sh.cell(mid,7).value=r['name']; sh.cell(mid,8).value=r['messages']; mid+=1
+    # right KPI stack
+    sh['M1']=f'{short_prop} Messaging Overview - {month_name}'; sh['M2']=year; sh['N21']=f'{month_abbr} {year}'; sh['O21']='STLY'; sh['P21']='YoY'
+    labels=['Total Messages','# of messages guest sent','# of messages hotel sent','% of your guests that sent a message','Response Rate','Average minutes to respond','Median minutes to respond']
+    current=[messaging.get(k,0) for k in ['msgTotal','msgGuest','msgHotel','msgGuestPct','responseRate','avgResponse','medianResponse']]
+    prior=[messaging.get(k,0) for k in ['stlyMsgTotal','stlyMsgGuest','stlyMsgHotel','stlyMsgGuestPct','stlyResponseRate','stlyAvgResponse','stlyMedianResponse']]
+    for idx,label in enumerate(labels,22):
+        sh.cell(idx,13).value=label; sh.cell(idx,14).value=current[idx-22]; sh.cell(idx,15).value=prior[idx-22]; sh.cell(idx,16).value=(current[idx-22] or 0)-(prior[idx-22] or 0)
+    sh['M30']='Date'; sh['N30']='Engagement Rate'
+    for i,(d,v) in enumerate(engagement[:8],31): sh.cell(i,13).value=d; sh.cell(i,14).value=v
+    sh['N25'].number_format='0.0%'; sh['O25'].number_format='0.0%'; sh['P25'].number_format='0.0%'; sh['N26'].number_format='0.0%'; sh['O26'].number_format='0.0%'; sh['P26'].number_format='0.0%'
+    for i in range(31,39): sh.cell(i,14).number_format='0.0%'
+    # Put Report immediately after Report Template for convenience.
+    wb._sheets.remove(sh); wb._sheets.insert(wb._sheets.index(template)+1,sh)
+    out=io.BytesIO(); wb.save(out); return out.getvalue()
+
+
+def ancillary_build_monthly_report(template_bytes, property_name, report_month, addon_file, upsell_file, stly_addon_file=None, stly_upsell_file=None, canary_history_file=None, staff_file=None, journal_values=None, stly_journal_values=None, messaging=None, engagement=None):
+    profile,key=ancillary_profile(property_name); journal_values=journal_values or []; stly_journal_values=stly_journal_values or []; messaging=messaging or {}; engagement=engagement or []
+    addon=ancillary_parse_addon(_ar_file_rows(addon_file),key); upgrades=ancillary_parse_upsell(_ar_file_rows(upsell_file))
+    stly_month=datetime.datetime(report_month.year-1, report_month.month, 1)
+    if profile.get('stlySource')=='SNT':
+        if not stly_addon_file or not stly_upsell_file: raise ValueError('This property uses SNT for STLY and needs prior-year Add On Production + Upsell files.')
+        stly=ancillary_parse_snt_history(_ar_file_rows(stly_addon_file),_ar_file_rows(stly_upsell_file),key)
+        if profile.get('stlyJournal'):
+            rows=[]
+            for i,j in enumerate(profile.get('journal',[])[:2]): rows.append({'name':j['report'],'revenue':stly_journal_values[i] if i<len(stly_journal_values) else None})
+            stly=ancillary_apply_stly_journal(stly,rows)
+    else:
+        if not canary_history_file: raise ValueError('This property uses Canary for STLY and needs the historical Canary upsell export.')
+        stly=ancillary_parse_canary_history(_ar_file_rows(canary_history_file),stly_month)
+    stly=ancillary_property_corrections(stly,key)
+    journal_agg={}
+    for i,j in enumerate(profile.get('journal',[])):
+        v=journal_values[i] if i<len(journal_values) else None
+        if v is None: continue
+        journal_agg[j['report']]=journal_agg.get(j['report'],0)+(_ar_num(v) or 0)
+    journal_rows=[{'name':n,'count':None,'revenue':v,'average':None} for n,v in journal_agg.items()]
+    main=[r for r in addon['main'] if not _ar_is_journal_equivalent(r['name'])]
+    main=journal_rows+main+upgrades['byRoomType']; main=sorted(main,key=lambda x:(-(_ar_num(x.get('revenue')) or 0), str(x['name']).lower()))
+    variance=ancillary_variance(main,stly['byItem'],key); staff=ancillary_parse_staff(_ar_file_rows(staff_file)) if staff_file else []
+    output=ancillary_render_report(template_bytes,property_name,key,report_month,main,addon['operational'],addon['itemized'],upgrades,stly,variance,staff,messaging,engagement)
+    return output, {'mainRows':main,'stly':stly,'variance':variance,'operational':addon['operational'],'itemized':addon['itemized'],'upgrades':upgrades,'staff':staff}
+
 # ── Ancillary Revenue (Plymouth/Hotel 1620 only, for now) ────────────────────
 # Different shape from ROB/SR/Forecast: one workbook with a tab per month
 # (not a file per hotel per month), and within a month's tab, up to 5 "weeks"
@@ -7838,76 +8343,201 @@ with tab_weekly:
 
 
 with tab_ancillary:
-    st.caption("Fills in the next available week (auto-detected from the sheet's own "
-               "yellow highlighting) in the Upsell Overview table.")
-
-    ar_month = st.selectbox(
-        "Month tab", ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"],
-        index=["FEB", "MAR", "APR", "MAY", "JUN", "JUL"].index(
-            datetime.date.today().strftime("%b").upper()
-        ) if datetime.date.today().strftime("%b").upper() in
-             ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"] else 5,
-        key="ar_month",
+    st.subheader("Monthly Ancillary Revenue Report Builder")
+    st.caption(
+        "Testing build ported from the Google Apps Script prototype. It uses the "
+        "Ashworth July Report Template for formatting and generates a downloadable "
+        "monthly workbook for validation before any Drive overwrite is enabled."
     )
-    ar_addon_file = st.file_uploader(
-        "Add-on Production report (CSV)", type=["csv"], key="ar_addon_csv")
-    ar_upsell_file = st.file_uploader(
-        "Upsell Report (format not wired up yet — feeds the room-upgrade rows, "
-        "coming soon)", type=["csv", "xlsx"], key="ar_upsell_csv", disabled=True)
 
-    if ar_addon_file and st.button("Preview Ancillary Revenue Changes", key="ar_preview"):
-        try:
-            svc = get_drive_service()
-            ar_file_id, ar_file_name = find_ancillary_revenue_file(svc)
-            if not ar_file_id:
-                st.error(ar_file_name)  # error string in the name slot
-            else:
-                ar_bytes = drive_download(svc, ar_file_id)
-                ar_wb = openpyxl.load_workbook(io.BytesIO(ar_bytes), data_only=False)
-                if ar_month not in ar_wb.sheetnames:
-                    st.error(f"No '{ar_month}' tab found in {ar_file_name}.")
-                else:
-                    ar_ws = ar_wb[ar_month]
-                    ar_week = find_next_available_week(ar_ws)
-                    if ar_week is None:
-                        st.warning("No yellow-highlighted week found — every week may already be filled in.")
-                    else:
-                        daily_by_name = parse_addon_production_csv(ar_addon_file.read())
-                        ar_changes = build_ancillary_addon_change_plan(daily_by_name, ar_ws, ar_week)
-                        st.session_state["ar_file_id"]    = ar_file_id
-                        st.session_state["ar_file_name"]  = ar_file_name
-                        st.session_state["ar_bytes"]      = ar_bytes
-                        st.session_state["ar_month_sel"]  = ar_month
-                        st.session_state["ar_week_sel"]   = ar_week
-                        st.session_state["ar_changes"]    = ar_changes
-                        st.success(f"Detected **Week {ar_week}** as next available in **{ar_month}**.")
-        except Exception as e:
-            st.error(f"Preview error: {e}")
+    ar_properties = [p['display'] for p in ANCILLARY_PROPERTY_PROFILES.values()]
+    # Remove duplicate display names while preserving order.
+    ar_properties = list(dict.fromkeys(ar_properties))
+    ar_property = st.selectbox("Property", ar_properties, key="ar_monthly_property")
+    ar_profile, ar_key = ancillary_profile(ar_property)
 
-    if "ar_changes" in st.session_state:
-        ar_changes = st.session_state["ar_changes"]
-        st.write(f"**{len(ar_changes)}** cells will be written to "
-                 f"**{st.session_state['ar_file_name']}** → {st.session_state['ar_month_sel']} "
-                 f"→ Week {st.session_state['ar_week_sel']}:")
-        st.dataframe(
-            [{"Cell": f"{openpyxl.utils.get_column_letter(c['col'])}{c['row']}",
-              "Field": c["label"], "New value": c["new_value"]} for c in ar_changes],
-            use_container_width=True,
+    ar_month_date = st.date_input(
+        "Report month",
+        value=datetime.date.today().replace(day=1),
+        key="ar_monthly_report_month",
+    )
+    ar_month_dt = datetime.datetime(ar_month_date.year, ar_month_date.month, 1)
+
+    local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
+    ar_template_upload = None
+    if local_template.exists():
+        st.success(f"Using bundled template: {ANCILLARY_TEMPLATE_FILENAME}")
+    else:
+        st.info(
+            f"Add **{ANCILLARY_TEMPLATE_FILENAME}** to the GitHub repo beside app.py "
+            "for permanent use. For testing, upload it here."
         )
-        if st.button("Apply to Google Drive", key="ar_apply", type="primary"):
-            try:
-                svc = get_drive_service()
-                ar_wb = openpyxl.load_workbook(io.BytesIO(st.session_state["ar_bytes"]), data_only=False)
-                ar_ws = ar_wb[st.session_state["ar_month_sel"]]
-                apply_ancillary_changes(ar_ws, st.session_state["ar_changes"])
-                out = io.BytesIO()
-                ar_wb.save(out)
-                drive_upload(svc, st.session_state["ar_file_id"], out.getvalue(), st.session_state["ar_file_name"])
-                st.success(f"**{st.session_state['ar_file_name']}** updated.")
-                for key in ["ar_changes", "ar_bytes", "ar_file_id", "ar_file_name", "ar_month_sel", "ar_week_sel"]:
-                    del st.session_state[key]
-            except Exception as e:
-                st.error(f"Apply error: {e}")
+        ar_template_upload = st.file_uploader(
+            "Ancillary Report Builder template workbook",
+            type=["xlsx"],
+            key="ar_template_upload",
+        )
+
+    st.markdown("**Current-year source files**")
+    ar_addon = st.file_uploader(
+        "SNT Add On Production",
+        type=["csv", "xlsx"],
+        key="ar_monthly_addon",
+    )
+    ar_upsell = st.file_uploader(
+        "SNT Upsell By Day/User",
+        type=["csv", "xlsx"],
+        key="ar_monthly_upsell",
+    )
+
+    st.markdown(f"**STLY source — {ar_profile.get('stlySource')}**")
+    ar_stly_addon = ar_stly_upsell = ar_canary_history = None
+    if ar_profile.get('stlySource') == 'SNT':
+        ar_stly_addon = st.file_uploader(
+            f"{ar_month_dt.year - 1} SNT Add On Production",
+            type=["csv", "xlsx"],
+            key="ar_stly_addon",
+        )
+        ar_stly_upsell = st.file_uploader(
+            f"{ar_month_dt.year - 1} SNT Upsell By Day/User",
+            type=["csv", "xlsx"],
+            key="ar_stly_upsell",
+        )
+    else:
+        ar_canary_history = st.file_uploader(
+            "Historical Canary Upsells",
+            type=["csv", "xlsx"],
+            key="ar_canary_history",
+        )
+
+    ar_staff = st.file_uploader(
+        "Canary Message Count by Staff (optional)",
+        type=["csv", "xlsx"],
+        key="ar_staff_counts",
+    )
+
+    st.markdown("**SNT Journal revenue**")
+    ar_journal_values = []
+    journal_cols = st.columns(2)
+    for i, journal in enumerate(ar_profile.get('journal', [])):
+        with journal_cols[i % 2]:
+            v = st.number_input(
+                journal['label'],
+                min_value=-1000000.0,
+                max_value=1000000.0,
+                value=0.0,
+                step=1.0,
+                key=f"ar_journal_{ar_key}_{i}",
+                help=f"Main report line: {journal['report']}",
+            )
+            ar_journal_values.append(v)
+
+    ar_stly_journal_values = []
+    if ar_profile.get('stlySource') == 'SNT' and ar_profile.get('stlyJournal'):
+        st.markdown(f"**{ar_month_dt.year - 1} STLY Journal revenue**")
+        stly_cols = st.columns(2)
+        for i, journal in enumerate(ar_profile.get('journal', [])[:2]):
+            with stly_cols[i % 2]:
+                v = st.number_input(
+                    f"STLY — {journal['report']}",
+                    min_value=-1000000.0,
+                    max_value=1000000.0,
+                    value=0.0,
+                    step=1.0,
+                    key=f"ar_stly_journal_{ar_key}_{i}",
+                )
+                ar_stly_journal_values.append(v)
+
+    with st.expander("Canary messaging KPIs (optional)"):
+        k1,k2,k3,k4 = st.columns(4)
+        with k1:
+            msg_total=st.number_input("Total Messages",value=0.0,key="ar_msg_total")
+            msg_guest=st.number_input("Guest Messages",value=0.0,key="ar_msg_guest")
+            msg_hotel=st.number_input("Hotel Messages",value=0.0,key="ar_msg_hotel")
+        with k2:
+            msg_pct=st.number_input("% Guests Messaged",value=0.0,format="%.4f",key="ar_msg_pct")
+            resp=st.number_input("Response Rate",value=0.0,format="%.4f",key="ar_resp")
+            avg=st.number_input("Avg Minutes",value=0.0,key="ar_avg")
+            med=st.number_input("Median Minutes",value=0.0,key="ar_med")
+        with k3:
+            stly_total=st.number_input("STLY Total Messages",value=0.0,key="ar_stly_total")
+            stly_guest=st.number_input("STLY Guest Messages",value=0.0,key="ar_stly_guest")
+            stly_hotel=st.number_input("STLY Hotel Messages",value=0.0,key="ar_stly_hotel")
+        with k4:
+            stly_pct=st.number_input("STLY % Guests Messaged",value=0.0,format="%.4f",key="ar_stly_pct")
+            stly_resp=st.number_input("STLY Response Rate",value=0.0,format="%.4f",key="ar_stly_resp")
+            stly_avg=st.number_input("STLY Avg Minutes",value=0.0,key="ar_stly_avg")
+            stly_med=st.number_input("STLY Median Minutes",value=0.0,key="ar_stly_med")
+
+    ar_messaging={
+        'msgTotal':msg_total,'msgGuest':msg_guest,'msgHotel':msg_hotel,'msgGuestPct':msg_pct,
+        'responseRate':resp,'avgResponse':avg,'medianResponse':med,
+        'stlyMsgTotal':stly_total,'stlyMsgGuest':stly_guest,'stlyMsgHotel':stly_hotel,
+        'stlyMsgGuestPct':stly_pct,'stlyResponseRate':stly_resp,'stlyAvgResponse':stly_avg,'stlyMedianResponse':stly_med,
+    }
+
+    required_ok = ar_addon is not None and ar_upsell is not None
+    if ar_profile.get('stlySource') == 'SNT':
+        required_ok = required_ok and ar_stly_addon is not None and ar_stly_upsell is not None
+    else:
+        required_ok = required_ok and ar_canary_history is not None
+    template_ok = local_template.exists() or ar_template_upload is not None
+
+    if st.button(
+        "Build Ancillary Revenue Report",
+        type="primary",
+        key="ar_build_monthly",
+        disabled=not (required_ok and template_ok),
+    ):
+        try:
+            with st.spinner("Building ancillary report..."):
+                template_bytes = (
+                    local_template.read_bytes()
+                    if local_template.exists()
+                    else ar_template_upload.getvalue()
+                )
+                ar_output, ar_summary = ancillary_build_monthly_report(
+                    template_bytes=template_bytes,
+                    property_name=ar_property,
+                    report_month=ar_month_dt,
+                    addon_file=ar_addon,
+                    upsell_file=ar_upsell,
+                    stly_addon_file=ar_stly_addon,
+                    stly_upsell_file=ar_stly_upsell,
+                    canary_history_file=ar_canary_history,
+                    staff_file=ar_staff,
+                    journal_values=ar_journal_values,
+                    stly_journal_values=ar_stly_journal_values,
+                    messaging=ar_messaging,
+                    engagement=[],
+                )
+                st.session_state['ar_monthly_output'] = ar_output
+                st.session_state['ar_monthly_filename'] = (
+                    f"{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year} "
+                    f"Ancillary Revenue - {ar_property}.xlsx"
+                )
+                st.session_state['ar_monthly_summary'] = ar_summary
+            st.success("Report built. Review the summary below, then download the workbook for validation.")
+        except Exception as e:
+            st.error(f"Ancillary report build error: {e}")
+
+    if 'ar_monthly_output' in st.session_state:
+        summary=st.session_state.get('ar_monthly_summary',{})
+        main=summary.get('mainRows',[]); stly=summary.get('stly',{}); variance=summary.get('variance',[])
+        c1,c2,c3=st.columns(3)
+        c1.metric("Current Revenue", f"${sum(_ar_num(x.get('revenue')) or 0 for x in main):,.2f}")
+        c2.metric("STLY Revenue", f"${sum(_ar_num(x.get('approved')) or 0 for x in stly.get('rows',[])):,.2f}")
+        c3.metric("YoY Variance", f"${sum(_ar_num(x.get('variance')) or 0 for x in variance):,.2f}")
+        with st.expander("Preview current-year revenue rows"):
+            st.dataframe(pd.DataFrame(main),use_container_width=True)
+        st.download_button(
+            "Download Ancillary Revenue Report",
+            data=st.session_state['ar_monthly_output'],
+            file_name=st.session_state['ar_monthly_filename'],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="ar_download_monthly",
+            type="primary",
+        )
 
 with tab_ooo:
     st.caption(
