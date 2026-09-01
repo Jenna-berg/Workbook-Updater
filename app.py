@@ -4137,8 +4137,12 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     return None, None
 
 def _explicit_folder_year(name):
-    """Return an explicit 20xx year found in a folder name, or None."""
-    match = re.search(r"\b(20\d{2})\b", str(name or ""))
+    """Return an explicit 20xx year found in a folder name, or None.
+
+    Works for both spaced names like "2026 REVENUE REPORTS" and compact
+    month/year names like "JUL2027 REVENUE REPORTS".
+    """
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", str(name or ""))
     return int(match.group(1)) if match else None
 def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     """Rank REVENUE REPORTS folder candidates for a target month/year.
@@ -4771,7 +4775,7 @@ def find_rob_master(service, hotel_id: str, target_year=None):
         return None, "No ROB master file found in Drive."
 
     def explicit_year(value):
-        m = re.search(r"\b(20\d{2})\b", str(value or ""))
+        m = re.search(r"(?<!\\d)(20\\d{2})(?!\\d)", str(value or ""))
         return int(m.group(1)) if m else None
 
     parent_name_cache = {}
@@ -5615,7 +5619,7 @@ def find_sr_master(service, hotel_id: str, target_year=None):
         return None, "No STRATEGY master file found in Drive."
 
     def explicit_year(value):
-        m = re.search(r"\b(20\d{2})\b", str(value or ""))
+        m = re.search(r"(?<!\\d)(20\\d{2})(?!\\d)", str(value or ""))
         return int(m.group(1)) if m else None
 
     parent_name_cache = {}
@@ -8731,11 +8735,20 @@ def render_ihg_update(hotels):
             )
 
         if "Strategy Report" in wb_sels:
-            st.divider()
-            render_ihg_strategy_month_setup(
-                hotel_sel,
-                id_map.get(hotel_sel, ""),
+            ihg_sr_setup_toggle = st.checkbox(
+                "Set up new month — Strategy Report",
+                key="ihg_sr_new_month",
+                help=(
+                    "Show the next-month Strategy setup controls. "
+                    "Leave unchecked for a normal Strategy update."
+                ),
             )
+            if ihg_sr_setup_toggle:
+                st.divider()
+                render_ihg_strategy_month_setup(
+                    hotel_sel,
+                    id_map.get(hotel_sel, ""),
+                )
 
     if not pdf_file:
         st.info("Upload the History and Forecast PDF to continue.")
