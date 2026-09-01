@@ -6782,6 +6782,14 @@ def ancillary_render_report(
             sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
             sh.cell(left, 5).value = "" if avg_blank else r.get("average")
 
+            # Match the current-year metric formatting exactly: every populated
+            # metric cell gets the approved light gray fill, while genuinely
+            # unavailable/blank metrics are dark gray. This is especially
+            # important for SNT STLY rows (e.g. Provincetown Inn) where Journal
+            # replacement rows intentionally have no count/average values.
+            light_gray = PatternFill(fill_type="solid", fgColor="EFEFEF")
+            for metric_col in (3, 4, 5):
+                sh.cell(left, metric_col).fill = copy(light_gray)
             if count_blank:
                 unavailable_fill(sh.cell(left, 3))
             if avg_blank:
@@ -7122,6 +7130,9 @@ def ancillary_render_report(
 
     # Clone the approved charts from Report Template. copy_worksheet() does not
     # copy chart objects, so explicitly deep-copy and repoint each source range.
+    # Some older/property-specific template copies contain zero or only a subset
+    # of the chart objects; build any missing standard charts so every report
+    # arrives with the same three chart placeholders already in place.
     sh._charts = []
 
     def _ar_chart_title_text(chart):
@@ -7142,16 +7153,57 @@ def ancillary_render_report(
         if getattr(ser, "val", None) is not None and getattr(ser.val, "numRef", None) is not None:
             ser.val.numRef.f = val_formula
 
+    copied_chart_kinds = set()
     for template_chart in template._charts:
         chart = deepcopy(template_chart)
         title = _ar_chart_title_text(chart).strip().lower()
         if "engagement rate" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$31:$M$38", "'Report'!$N$31:$N$38")
+            copied_chart_kinds.add("engagement")
         elif "common guest" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$6:$M$13", "'Report'!$N$6:$N$13")
+            copied_chart_kinds.add("guest")
         elif "operational concerns" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$40:$M$44", "'Report'!$N$40:$N$44")
+            copied_chart_kinds.add("operational")
         sh._charts.append(chart)
+
+    # Fallback chart construction. These are only used when an incoming template
+    # is missing one of the approved chart objects; when the template has the
+    # chart, its existing formatting is preserved via deepcopy above.
+    from openpyxl.chart import LineChart, PieChart, BarChart, Reference
+
+    if "engagement" not in copied_chart_kinds:
+        chart = LineChart()
+        chart.title = "Engagement Rate"
+        chart.y_axis.title = "Engagement Rate"
+        chart.height = 5.0
+        chart.width = 20.0
+        chart.add_data(Reference(sh, min_col=14, min_row=31, max_row=38), titles_from_data=False)
+        chart.set_categories(Reference(sh, min_col=13, min_row=31, max_row=38))
+        chart.anchor = "L29"
+        sh.add_chart(chart)
+
+    if "guest" not in copied_chart_kinds:
+        chart = PieChart()
+        chart.title = "Common Guest Conversation Topics"
+        chart.height = 10.2
+        chart.width = 20.3
+        chart.add_data(Reference(sh, min_col=14, min_row=6, max_row=13), titles_from_data=False)
+        chart.set_categories(Reference(sh, min_col=13, min_row=6, max_row=13))
+        chart.anchor = "L3"
+        sh.add_chart(chart)
+
+    if "operational" not in copied_chart_kinds:
+        chart = BarChart()
+        chart.type = "bar"
+        chart.title = "Recurring Operational Concerns"
+        chart.height = 9.4
+        chart.width = 20.2
+        chart.add_data(Reference(sh, min_col=14, min_row=40, max_row=44), titles_from_data=False)
+        chart.set_categories(Reference(sh, min_col=13, min_row=40, max_row=44))
+        chart.anchor = "M39"
+        sh.add_chart(chart)
 
     sh.freeze_panes = None
 
