@@ -4424,6 +4424,247 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
 
+def _ancillary_normalize_drive_name(value):
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
+def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
+    """Find the hotel's existing Canary/SNT ancillary workbook in Drive.
+
+    Structure:
+      Revenue Reports folder
+        -> M: ANCILLARY REVENUE FILES <hotel>
+          -> workbook containing "Report" and either "Canary" or "SNT"
+
+    Matching is case/punctuation insensitive. When multiple valid workbooks
+    exist, the most recently modified workbook wins.
+    """
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b").upper()
+
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
+    if not rev_id:
+        return None, (
+            f"Could not find the {report_month.year} Revenue Reports folder "
+            f"for {hotel_name}."
+        )
+
+    # Find the M: ANCILLARY REVENUE FILES ... child folder.
+    q = (
+        "mimeType='application/vnd.google-apps.folder' and trashed=false "
+        f"and '{rev_id}' in parents"
+    )
+    folders = service.files().list(
+        q=q,
+        fields="files(id,name,modifiedTime)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    ancillary_folders = []
+    for f in folders:
+        n = _ancillary_normalize_drive_name(f.get("name"))
+        if "ANCILLARY REVENUE FILES" in n:
+            ancillary_folders.append(f)
+
+    if not ancillary_folders:
+        return None, (
+            f"{rev_name}: no 'M: ANCILLARY REVENUE FILES ...' folder was found."
+        )
+
+    ancillary_folders.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    anc_folder = ancillary_folders[0]
+
+    # Match Report + Canary OR SNT. These may be XLSX, XLSM, or native Sheets.
+    q = f"trashed=false and '{anc_folder['id']}' in parents"
+    files = service.files().list(
+        q=q,
+        fields="files(id,name,mimeType,modifiedTime)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    candidates = []
+    for f in files:
+        mime = f.get("mimeType", "")
+        if mime == "application/vnd.google-apps.folder":
+            continue
+        n = _ancillary_normalize_drive_name(f.get("name"))
+        if "REPORT" not in n:
+            continue
+        if "CANARY" not in n and "SNT" not in n:
+            continue
+        candidates.append(f)
+
+    if not candidates:
+        return None, (
+            f"{anc_folder['name']}: no report workbook containing "
+            f"'Canary' or 'SNT' was found."
+        )
+
+    candidates.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    target = candidates[0]
+
+    return {
+        "file_id": target["id"],
+        "file_name": target["name"],
+        "mime_type": target.get("mimeType", ""),
+        "folder_id": anc_folder["id"],
+        "folder_name": anc_folder["name"],
+        "revenue_folder_id": rev_id,
+        "revenue_folder_name": rev_name,
+    }, None
+
+
+def _ancillary_month_sheet_name(wb, report_month):
+    """Return the existing month sheet name or the standard new name."""
+    abbr = report_month.strftime("%b").upper()
+    year = str(report_month.year)
+
+    # Exact month abbreviation is the portfolio standard.
+    if abbr in wb.sheetnames:
+        return abbr
+
+    # Reuse an existing month-specific variant such as "AUG 2026" or
+    # "AUGUST" instead of creating a duplicate month tab.
+    for name in wb.sheetnames:
+        norm = _ancillary_normalize_drive_name(name)
+        if not norm.startswith(abbr):
+            continue
+        if (
+            "PIVOT" in norm
+            or "RAW" in norm
+            or "TEMPLATE" in norm
+            or "CONTROL" in norm
+        ):
+            continue
+        if year in norm or norm in {abbr, report_month.strftime("%B").upper()}:
+            return name
+
+    return abbr
+
+
+def _ancillary_copy_generated_sheet(src_ws, dst_ws):
+    """Copy a generated Report sheet into an existing monthly workbook."""
+    from copy import copy as _copy
+
+    # Column dimensions
+    for key, dim in src_ws.column_dimensions.items():
+        d = dst_ws.column_dimensions[key]
+        d.width = dim.width
+        d.hidden = dim.hidden
+        d.bestFit = dim.bestFit
+        d.outlineLevel = dim.outlineLevel
+
+    # Row dimensions
+    for idx, dim in src_ws.row_dimensions.items():
+        d = dst_ws.row_dimensions[idx]
+        d.height = dim.height
+        d.hidden = dim.hidden
+        d.outlineLevel = dim.outlineLevel
+
+    # Cells/styles
+    for row in src_ws.iter_rows():
+        for src_cell in row:
+            dst_cell = dst_ws[src_cell.coordinate]
+            dst_cell.value = src_cell.value
+            if src_cell.has_style:
+                dst_cell._style = _copy(src_cell._style)
+            if src_cell.number_format:
+                dst_cell.number_format = src_cell.number_format
+            dst_cell.font = _copy(src_cell.font)
+            dst_cell.fill = _copy(src_cell.fill)
+            dst_cell.border = _copy(src_cell.border)
+            dst_cell.alignment = _copy(src_cell.alignment)
+            dst_cell.protection = _copy(src_cell.protection)
+            if src_cell.hyperlink:
+                dst_cell._hyperlink = _copy(src_cell.hyperlink)
+            if src_cell.comment:
+                dst_cell.comment = _copy(src_cell.comment)
+
+    # Merges
+    for merged in src_ws.merged_cells.ranges:
+        dst_ws.merge_cells(str(merged))
+
+    # Sheet-level settings
+    dst_ws.freeze_panes = src_ws.freeze_panes
+    dst_ws.sheet_view.showGridLines = src_ws.sheet_view.showGridLines
+    dst_ws.sheet_format.defaultColWidth = src_ws.sheet_format.defaultColWidth
+    dst_ws.sheet_format.defaultRowHeight = src_ws.sheet_format.defaultRowHeight
+    dst_ws.page_margins = _copy(src_ws.page_margins)
+    dst_ws.page_setup = _copy(src_ws.page_setup)
+    dst_ws.print_options = _copy(src_ws.print_options)
+    dst_ws.sheet_properties = _copy(src_ws.sheet_properties)
+
+    # Conditional formatting
+    for cf_obj, rules in src_ws.conditional_formatting._cf_rules.items():
+        for rule in rules:
+            dst_ws.conditional_formatting.add(
+                _copy(cf_obj),
+                _copy(rule),
+            )
+
+
+def ancillary_insert_report_sheet(
+    destination_bytes,
+    generated_bytes,
+    report_month,
+    destination_name="",
+):
+    """Replace/create the monthly sheet inside the existing Canary/SNT report."""
+    keep_vba = str(destination_name or "").lower().endswith(".xlsm")
+
+    dest_wb = openpyxl.load_workbook(
+        io.BytesIO(destination_bytes),
+        data_only=False,
+        keep_vba=keep_vba,
+    )
+    generated_wb = openpyxl.load_workbook(
+        io.BytesIO(generated_bytes),
+        data_only=False,
+    )
+
+    if "Report" not in generated_wb.sheetnames:
+        raise ValueError("Generated ancillary workbook has no Report sheet.")
+
+    sheet_name = _ancillary_month_sheet_name(dest_wb, report_month)
+
+    # Replace only this month's sheet; preserve every other month and pivot tab.
+    if sheet_name in dest_wb.sheetnames:
+        old_idx = dest_wb.sheetnames.index(sheet_name)
+        del dest_wb[sheet_name]
+    else:
+        pivot_idx = next(
+            (
+                i
+                for i, name in enumerate(dest_wb.sheetnames)
+                if "PIVOT" in name.upper()
+            ),
+            len(dest_wb.sheetnames),
+        )
+        old_idx = pivot_idx
+
+    dst_ws = dest_wb.create_sheet(sheet_name, old_idx)
+    _ancillary_copy_generated_sheet(generated_wb["Report"], dst_ws)
+
+    out = io.BytesIO()
+    dest_wb.save(out)
+    return out.getvalue(), sheet_name
+
+
 def drive_find_month_folder(service, parent_id: str, month_kw: str):
     """Return (folder_id, folder_name) for the month folder under parent_id,
     or (None, None) if it isn't there. Never creates a folder — the month
@@ -5750,6 +5991,24 @@ ANCILLARY_PROPERTY_PROFILES = {
         {'label':'1027 Late Check Out Fee 1:00 PM','report':'Late Checkout'}]},
 }
 
+# Ancillary display/profile name -> canonical hotel label used by the shared
+# Revenue Reports Drive discovery.
+ANCILLARY_DRIVE_HOTEL_MAP = {
+    "ashworth by the sea": "Ashworth",
+    "inn at middletown": "Middletown",
+    "crowne pointe inn and spa": "Crowne Pointe",
+    "anchor in": "Anchor Inn",
+    "allegria hotel": "Long Beach",
+    "the brass key guesthouse": "Brass Key",
+    "harbor hotel provincetown": "Harbor Hotel",
+    "provincetown inn": "Provincetown Inn",
+    "surfside hotel and suites": "Surfside",
+    "hotel tybee": "Tybee",
+    "pleasant view inn": "Westerly",
+    "the wolfeboro inn": "Wolfeboro",
+}
+
+
 ANCILLARY_PROPERTY_ALIASES = {
     'brass key guesthouse': 'the brass key guesthouse',
     'harbor hotel': 'harbor hotel provincetown',
@@ -6201,7 +6460,7 @@ def ancillary_render_report(
       - Property differences remain in data/config rules, not formatting.
     """
     from openpyxl import Workbook
-    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes), data_only=False)
     if "Report Template" not in wb.sheetnames:
@@ -6646,14 +6905,23 @@ def ancillary_render_report(
     red_fill = PatternFill(fill_type="solid", fgColor="EA9999")
 
     if variance_end >= variance_start:
+        # Every variance value is stored in the top-left cell of a B:E merged
+        # box. Use formula rules that reference column B so the approved fill
+        # applies across the ENTIRE merged box, not only the value cell.
         rng = f"B{variance_start}:E{variance_end}"
         sh.conditional_formatting.add(
             rng,
-            CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
+            FormulaRule(
+                formula=[f"$B{variance_start}>0"],
+                fill=green_fill,
+            ),
         )
         sh.conditional_formatting.add(
             rng,
-            CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
+            FormulaRule(
+                formula=[f"$B{variance_start}<0"],
+                fill=red_fill,
+            ),
         )
 
     sh.conditional_formatting.add(
@@ -9482,9 +9750,9 @@ with tab_weekly:
 with tab_ancillary:
     st.subheader("Monthly Ancillary Revenue Report Builder")
     st.caption(
-        "Testing build ported from the Google Apps Script prototype. It uses the "
-        "Ashworth July Report Template for formatting and generates a downloadable "
-        "monthly workbook for validation before any Drive overwrite is enabled."
+        "Builds the monthly report from the universal template. After reviewing "
+        "the result, you can save the month directly into the hotel's existing "
+        "Canary and/or SNT Report workbook in Drive."
     )
 
     ar_properties = [p['display'] for p in ANCILLARY_PROPERTY_PROFILES.values()]
@@ -9762,14 +10030,113 @@ with tab_ancillary:
         c3.metric("YoY Variance", f"${sum(_ar_num(x.get('variance')) or 0 for x in variance):,.2f}")
         with st.expander("Preview current-year revenue rows"):
             st.dataframe(pd.DataFrame(main),use_container_width=True)
-        st.download_button(
-            "Download Ancillary Revenue Report",
-            data=st.session_state['ar_monthly_output'],
-            file_name=st.session_state['ar_monthly_filename'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="ar_download_monthly",
-            type="primary",
-        )
+        download_col, drive_col = st.columns(2)
+
+        with download_col:
+            st.download_button(
+                "Download Ancillary Revenue Report",
+                data=st.session_state['ar_monthly_output'],
+                file_name=st.session_state['ar_monthly_filename'],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ar_download_monthly",
+                use_container_width=True,
+            )
+
+        with drive_col:
+            if st.button(
+                f"Save {ar_month_dt.strftime('%b').upper()} Sheet to Drive",
+                key="ar_save_drive",
+                type="primary",
+                use_container_width=True,
+            ):
+                try:
+                    svc = get_drive_service()
+
+                    discovered = dict(get_hotels_from_drive())
+                    drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(ar_key)
+                    hotel_id = discovered.get(drive_label, "")
+
+                    if not drive_label:
+                        raise ValueError(
+                            f"No Drive hotel mapping is configured for {ar_property}."
+                        )
+                    if not hotel_id:
+                        raise ValueError(
+                            f"Could not find {drive_label}'s Revenue Reports folders "
+                            "with the current Drive connection."
+                        )
+
+                    target, target_err = ancillary_find_drive_report(
+                        svc,
+                        hotel_id,
+                        drive_label,
+                        ar_month_dt,
+                    )
+                    if target_err or not target:
+                        raise ValueError(target_err or "Ancillary Drive report not found.")
+
+                    original_bytes = drive_download(svc, target["file_id"])
+                    merged_bytes, month_sheet = ancillary_insert_report_sheet(
+                        original_bytes,
+                        st.session_state['ar_monthly_output'],
+                        ar_month_dt,
+                        destination_name=target["file_name"],
+                    )
+
+                    # Keep one-click undo until the next save.
+                    st.session_state["ar_drive_undo"] = {
+                        "file_id": target["file_id"],
+                        "file_name": target["file_name"],
+                        "bytes": original_bytes,
+                    }
+
+                    drive_upload(
+                        svc,
+                        target["file_id"],
+                        merged_bytes,
+                        target["file_name"],
+                    )
+
+                    st.session_state["ar_drive_last_target"] = {
+                        "file_name": target["file_name"],
+                        "folder_name": target["folder_name"],
+                        "sheet_name": month_sheet,
+                    }
+
+                    st.success(
+                        f"Saved **{month_sheet}** inside **{target['file_name']}** "
+                        f"in **{target['folder_name']}**."
+                    )
+
+                except Exception as e:
+                    st.error(f"Could not save ancillary report to Drive: {e}")
+
+        if st.session_state.get("ar_drive_last_target"):
+            t = st.session_state["ar_drive_last_target"]
+            st.caption(
+                f"Last Drive save: **{t['file_name']}** → "
+                f"sheet **{t['sheet_name']}**"
+            )
+
+        if st.session_state.get("ar_drive_undo"):
+            if st.button(
+                "↩ Undo Last Ancillary Drive Save",
+                key="ar_drive_undo_btn",
+            ):
+                try:
+                    undo = st.session_state["ar_drive_undo"]
+                    drive_upload(
+                        get_drive_service(),
+                        undo["file_id"],
+                        undo["bytes"],
+                        undo["file_name"],
+                    )
+                    st.session_state.pop("ar_drive_undo", None)
+                    st.session_state.pop("ar_drive_last_target", None)
+                    st.success("Restored the ancillary workbook to its previous version.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not undo ancillary Drive save: {e}")
 
 with tab_ooo:
     st.caption(
