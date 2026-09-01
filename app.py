@@ -4435,42 +4435,55 @@ def _ancillary_normalize_drive_name(value):
 def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
     """Find the hotel's existing Canary/SNT ancillary workbook in Drive.
 
-    Structure:
-      Revenue Reports folder
-        -> M: ANCILLARY REVENUE FILES <hotel>
-          -> workbook containing "Report" and either "Canary" or "SNT"
+    Important folder rule:
+      The Ancillary Revenue folder is NOT inside the monthly Revenue Reports
+      folder. It is a separate sibling/descendant under the hotel's Drive tree,
+      e.g.:
+          G: JUL2026 REVENUE REPORTS WOLFEBORO
+          M: ANCILLARY REVENUE REPORTS WOLFEBORO
 
-    Matching is case/punctuation insensitive. When multiple valid workbooks
-    exist, the most recently modified workbook wins.
+    Therefore, search from the HOTEL folder tree itself, not from the selected
+    month's Revenue Reports folder.
+
+    Folder match:
+      - ANCILLARY REVENUE REPORTS
+      - ANCILLARY REVENUE FILES
+
+    Workbook match inside that folder:
+      - filename contains REPORT
+      - and contains CANARY or SNT (or both)
+
+    Matching is case/punctuation insensitive. If multiple valid workbooks exist,
+    use the most recently modified one.
     """
+
+    # Keep the Revenue Reports folder only as a helpful diagnostic so the UI can
+    # still show which year/month tree the hotel resolver sees.
     year_kw = str(report_month.year)
     month_kw = report_month.strftime("%b").upper()
-
     rev_id, rev_name = _find_rev_reports_folder_for_year(
         service,
         hotel_id,
         year_kw,
         month_kw,
     )
-    if not rev_id:
-        return None, (
-            f"Could not find the {report_month.year} Revenue Reports folder "
-            f"for {hotel_name}."
-        )
 
-    # Find the Ancillary Revenue folder anywhere inside the selected
-    # Revenue Reports tree. Some hotels keep it directly under Revenue Reports;
-    # others nest it inside another month/property subfolder.
-    #
-    # Search breadth-first to a safe depth and still require the full phrase
-    # "ANCILLARY REVENUE" plus either "REPORTS" or "FILES".
+    # Search from every known hotel-scope folder, not from rev_id.
+    scope_ids = _hotel_search_scope_ids(service, hotel_id)
+    if not scope_ids:
+        scope_ids = [hotel_id]
+
     ancillary_folders = []
-    frontier = [(rev_id, 0)]
-    seen_folder_ids = {rev_id}
+    seen = set()
+    frontier = [(sid, 0) for sid in scope_ids]
     max_depth = 4
 
     while frontier:
         parent_id, depth = frontier.pop(0)
+        if not parent_id or parent_id in seen:
+            continue
+        seen.add(parent_id)
+
         if depth >= max_depth:
             continue
 
@@ -4492,9 +4505,8 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
 
             for f in resp.get("files", []):
                 fid = f.get("id")
-                if not fid or fid in seen_folder_ids:
+                if not fid:
                     continue
-                seen_folder_ids.add(fid)
 
                 n = _ancillary_normalize_drive_name(f.get("name"))
                 if (
@@ -4514,22 +4526,29 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
 
     if not ancillary_folders:
         return None, (
-            f"{rev_name}: no folder containing 'Ancillary Revenue Reports' "
-            f"or 'Ancillary Revenue Files' was found anywhere in the "
-            f"{report_month.year} Revenue Reports folder tree."
+            f"No folder containing 'Ancillary Revenue Reports' or "
+            f"'Ancillary Revenue Files' was found in {hotel_name}'s Drive tree."
         )
 
+    # Prefer the shallowest match; if tied, prefer most recently modified.
     ancillary_folders.sort(
         key=lambda f: (
             f.get("_depth", 99),
-            -int(
-                re.sub(r"\D", "", str(f.get("modifiedTime", "")))[:14] or "0"
-            ),
+            str(f.get("modifiedTime", "")),
         )
     )
-    anc_folder = ancillary_folders[0]
+    min_depth = ancillary_folders[0].get("_depth", 99)
+    same_depth = [
+        f for f in ancillary_folders
+        if f.get("_depth", 99) == min_depth
+    ]
+    same_depth.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    anc_folder = same_depth[0]
 
-    # Match Report + Canary OR SNT. These may be XLSX, XLSM, or native Sheets.
+    # Find the report workbook directly inside the ancillary folder.
     q = f"trashed=false and '{anc_folder['id']}' in parents"
     files = service.files().list(
         q=q,
@@ -4541,9 +4560,9 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
 
     candidates = []
     for f in files:
-        mime = f.get("mimeType", "")
-        if mime == "application/vnd.google-apps.folder":
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
             continue
+
         n = _ancillary_normalize_drive_name(f.get("name"))
         if "REPORT" not in n:
             continue
@@ -4570,7 +4589,7 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
         "folder_id": anc_folder["id"],
         "folder_name": anc_folder["name"],
         "revenue_folder_id": rev_id,
-        "revenue_folder_name": rev_name,
+        "revenue_folder_name": rev_name or f"{report_month.year} Revenue Reports",
     }, None
 
 
