@@ -5570,24 +5570,88 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
     return created_name, None
 
 
-def find_sr_master(service, hotel_id: str):
-    """Search the hotel's own Drive tree for the SR master file.
-    Returns (file_id, file_name) or (None, error_str).
+def find_sr_master(service, hotel_id: str, target_year=None):
+    """Search the hotel's Drive tree for the correct Strategy master.
+
+    If target_year is supplied:
+      - prefer a master explicitly tied to that year
+      - allow a generic/no-year master
+      - reject masters explicitly tied to another year
+
+    This prevents a 2026 Strategy setup from accidentally copying a 2027
+    master just because Drive returned that file first.
     """
     scope_ids = _hotel_search_scope_ids(service, hotel_id)
     if not scope_ids:
         return None, "Could not resolve hotel folder to search."
+
     parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
-    q = ("trashed=false and (%s) "
-         "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-         "and name contains 'MASTER' and name contains 'STRATEGY'") % parent_clause
+    q = (
+        "trashed=false and (%s) "
+        "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "and name contains 'MASTER' and name contains 'STRATEGY'"
+    ) % parent_clause
+
     result = service.files().list(
-        q=q, fields="files(id,name,parents)", pageSize=50,
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        q=q,
+        fields="files(id,name,parents,modifiedTime)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
-    for f in result.get("files", []):
-        return f["id"], f["name"]
-    return None, "No STRATEGY master file found in Drive."
+
+    candidates = result.get("files", [])
+    if not candidates:
+        return None, "No STRATEGY master file found in Drive."
+
+    def explicit_year(value):
+        m = re.search(r"\b(20\d{2})\b", str(value or ""))
+        return int(m.group(1)) if m else None
+
+    parent_name_cache = {}
+
+    def parent_years(file_obj):
+        years = set()
+        for pid in file_obj.get("parents", []) or []:
+            if pid not in parent_name_cache:
+                try:
+                    info = service.files().get(
+                        fileId=pid,
+                        fields="name",
+                        supportsAllDrives=True,
+                    ).execute()
+                    parent_name_cache[pid] = info.get("name", "")
+                except Exception:
+                    parent_name_cache[pid] = ""
+            y = explicit_year(parent_name_cache[pid])
+            if y:
+                years.add(y)
+        return years
+
+    scored = []
+    for f in candidates:
+        years = set()
+        fy = explicit_year(f.get("name"))
+        if fy:
+            years.add(fy)
+        years.update(parent_years(f))
+
+        if target_year is not None and years and target_year not in years:
+            continue
+
+        score = 2 if (target_year is not None and target_year in years) else 1
+        scored.append((score, str(f.get("modifiedTime", "")), f))
+
+    if not scored:
+        return None, (
+            f"No Strategy master for {target_year} was found in this hotel's Drive folders."
+            if target_year
+            else "No eligible Strategy master file found in Drive."
+        )
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = scored[0][2]
+    return best["id"], best["name"]
 
 
 def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
@@ -5617,7 +5681,7 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
         return existing_name, None  # already set up
 
     # Find master
-    master_id, master_name = find_sr_master(service, hotel_id)
+    master_id, master_name = find_sr_master(service, hotel_id, target_month.year)
     if not master_id:
         return None, master_name  # error string
 
@@ -8364,6 +8428,241 @@ def _render_undo_bar(undo_key: str):
                     st.rerun()
 
 
+def render_ihg_strategy_month_setup(hotel_name, hotel_id):
+    """Set up next month's IHG Strategy Report using the shared SR engine.
+
+    Structural setup matches the Stay In Touch Strategy workflow:
+      - locate/copy the correct-year Strategy master
+      - create/use the next month's workbook
+      - clear week-tab completion colors on a fresh copy
+      - rebuild the Strategy date ranges for all week tabs
+      - preload previous-month / LY reference fields where the shared
+        Strategy headers exist
+      - keep an undo snapshot
+
+    Current IHG operational values are still filled later from the IHG PDFs.
+    """
+    st.markdown("**Set Up Next Month — Strategy Report**")
+
+    today = datetime.date.today()
+    cur_month = today.replace(day=1)
+    next_month = (cur_month + datetime.timedelta(days=32)).replace(day=1)
+
+    target_month = st.selectbox(
+        "Strategy month to set up",
+        [cur_month, next_month],
+        index=1,
+        format_func=lambda d: d.strftime("%B %Y"),
+        key=f"ihg_sr_setup_month_{hotel_name}",
+    )
+
+    if st.button(
+        "Set Up New Strategy Report",
+        key=f"ihg_setup_sr_{hotel_name}",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not hotel_id:
+            st.error(f"{hotel_name}: no Drive folder found.")
+            return
+
+        try:
+            svc = get_drive_service()
+            month_kw = target_month.strftime("%b%Y").upper()
+
+            # Step 1 — locate or create the target workbook.
+            is_fresh_copy = False
+            with st.spinner("Step 1 / 3 — locating or creating Strategy workbook..."):
+                existing, find_err = resolve_drive_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    month_date=target_month,
+                )
+
+                if existing:
+                    st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                else:
+                    is_fresh_copy = True
+                    created_name, create_err = setup_new_sr_month(
+                        svc,
+                        hotel_id,
+                        hotel_name,
+                        target_month,
+                    )
+                    if create_err:
+                        master_id, master_name = find_sr_master(
+                            svc,
+                            hotel_id,
+                            target_month.year,
+                        )
+                        hotel_suffix = ""
+                        if master_name and "STRATEGY" in master_name.upper():
+                            hotel_suffix = (
+                                master_name[
+                                    master_name.upper().find("STRATEGY")
+                                    + len("STRATEGY"):
+                                ]
+                                .strip()
+                                .replace(".xlsx", "")
+                                .replace(".XLSX", "")
+                                .strip()
+                            )
+                        suggested_name = (
+                            f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
+                        )
+
+                        if "storageQuotaExceeded" in str(create_err):
+                            st.warning(
+                                f"Auto-copy requires a Shared Drive. In Google Drive:\n\n"
+                                f"1. Right-click **{master_name or 'the Strategy master'}** → *Make a copy*\n"
+                                f"2. Rename it to **`{suggested_name}`**\n"
+                                f"3. Move it into the **{month_kw}** folder\n\n"
+                                f"Then run **Set Up New Strategy Report** again."
+                            )
+                        else:
+                            st.error(f"Could not create workbook: {create_err}")
+                        return
+
+            # Step 2 — load references.
+            with st.spinner("Step 2 / 3 — loading Strategy references..."):
+                prev_month = (
+                    target_month - datetime.timedelta(days=1)
+                ).replace(day=1)
+                ly_month = target_month.replace(year=target_month.year - 1)
+
+                prev_wb = _load_wb_from_drive(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    prev_month,
+                    data_only=False,
+                )
+                ly_wb = _load_wb_from_drive(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    ly_month,
+                )
+
+            st.info(
+                "Strategy references · "
+                f"Previous month ({prev_month:%b %Y}): "
+                f"{'found' if prev_wb else 'not found'} · "
+                f"Last year ({ly_month:%b %Y}): "
+                f"{'found' if ly_wb else 'not found'}"
+            )
+
+            # Step 3 — populate all week tabs.
+            with st.spinner("Step 3 / 3 — preparing all Strategy week tabs..."):
+                result, err = resolve_drive_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    month_date=target_month,
+                )
+                if err or not result:
+                    st.error(f"Cannot open Strategy workbook: {err}")
+                    return
+
+                file_id, file_name = result
+                wb_bytes = drive_download(svc, file_id)
+                original_bytes = wb_bytes
+
+                wb = openpyxl.load_workbook(
+                    io.BytesIO(wb_bytes),
+                    data_only=False,
+                )
+
+                if is_fresh_copy:
+                    clear_tab_colors(wb, STRATEGY_SHEETS)
+
+                restructure_sr_dates(wb, target_month)
+
+                first_ws = (
+                    wb[STRATEGY_SHEETS[0]]
+                    if STRATEGY_SHEETS[0] in wb.sheetnames
+                    else None
+                )
+                num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
+                scope_start = target_month
+                scope_end = target_month + datetime.timedelta(
+                    days=max(0, num_rows - 1)
+                )
+
+                total_written = 0
+                for sheet_name in STRATEGY_SHEETS:
+                    if sheet_name not in wb.sheetnames:
+                        continue
+
+                    # No current IHG PDF data is written during setup.
+                    # This call only carries forward prior-month / LY reference
+                    # data that can be mapped by the shared Strategy headers.
+                    changes = build_strategy_change_plan(
+                        None,
+                        wb,
+                        sheet_name,
+                        prev_month_wb=prev_wb,
+                        ly_wb=ly_wb,
+                        scope_start=scope_start,
+                        scope_end=scope_end,
+                    )
+                    apply_strategy_changes(wb, sheet_name, changes)
+                    total_written += len(
+                        [c for c in changes if not c.get("skip_reason")]
+                    )
+
+                strip_tables(wb)
+                out = io.BytesIO()
+                wb.save(out)
+                drive_upload(
+                    svc,
+                    file_id,
+                    out.getvalue(),
+                    file_name,
+                )
+
+                st.session_state["ihg_setup_undo_sr"] = {
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "bytes": original_bytes,
+                }
+
+            st.success(
+                f"**{file_name}** is set up for {target_month:%B %Y}. "
+                f"Prepared all Strategy week tabs."
+            )
+
+        except Exception as e:
+            st.error(f"Strategy setup error: {e}")
+
+    if "ihg_setup_undo_sr" in st.session_state:
+        if st.button(
+            "↩ Reset Strategy Report to Original",
+            key=f"ihg_setup_reset_sr_{hotel_name}",
+            type="secondary",
+            use_container_width=True,
+        ):
+            try:
+                info = st.session_state["ihg_setup_undo_sr"]
+                drive_upload(
+                    get_drive_service(),
+                    info["file_id"],
+                    info["bytes"],
+                    info["file_name"],
+                )
+                del st.session_state["ihg_setup_undo_sr"]
+                st.success(
+                    f"**{info['file_name']}** restored to its original state."
+                )
+            except Exception as e:
+                st.error(f"Reset error: {e}")
+
+
 def render_ihg_update(hotels):
     """IHG portfolio run.
 
@@ -8419,6 +8718,13 @@ def render_ihg_update(hotels):
             render_portfolio_rob_month_setup(
                 [(hotel_sel, id_map.get(hotel_sel, ""))],
                 "ihg",
+            )
+
+        if "Strategy Report" in wb_sels:
+            st.divider()
+            render_ihg_strategy_month_setup(
+                hotel_sel,
+                id_map.get(hotel_sel, ""),
             )
 
     if not pdf_file:
@@ -9312,7 +9618,7 @@ with tab_weekly:
                                 is_fresh_copy = True
                                 created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
                                 if create_err:
-                                    master_id, master_name = find_sr_master(svc, hotel_id_nm)
+                                    master_id, master_name = find_sr_master(svc, hotel_id_nm, setup_month_dt.year)
                                     hotel_suffix = ""
                                     if master_name and "STRATEGY" in master_name.upper():
                                         hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
