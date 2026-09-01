@@ -4458,43 +4458,74 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
             f"for {hotel_name}."
         )
 
-    # Find the M: ANCILLARY REVENUE FILES ... child folder.
-    q = (
-        "mimeType='application/vnd.google-apps.folder' and trashed=false "
-        f"and '{rev_id}' in parents"
-    )
-    folders = service.files().list(
-        q=q,
-        fields="files(id,name,modifiedTime)",
-        pageSize=200,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
-
+    # Find the Ancillary Revenue folder anywhere inside the selected
+    # Revenue Reports tree. Some hotels keep it directly under Revenue Reports;
+    # others nest it inside another month/property subfolder.
+    #
+    # Search breadth-first to a safe depth and still require the full phrase
+    # "ANCILLARY REVENUE" plus either "REPORTS" or "FILES".
     ancillary_folders = []
-    for f in folders:
-        n = _ancillary_normalize_drive_name(f.get("name"))
+    frontier = [(rev_id, 0)]
+    seen_folder_ids = {rev_id}
+    max_depth = 4
 
-        # Portfolio folder naming varies slightly, but the full phrase
-        # "ANCILLARY REVENUE" must be present. Accept either:
-        #   - ANCILLARY REVENUE REPORTS
-        #   - ANCILLARY REVENUE FILES
-        # Matching is case/punctuation insensitive because names are normalized.
-        if (
-            "ANCILLARY REVENUE REPORTS" in n
-            or "ANCILLARY REVENUE FILES" in n
-        ):
-            ancillary_folders.append(f)
+    while frontier:
+        parent_id, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+
+        q = (
+            "mimeType='application/vnd.google-apps.folder' and trashed=false "
+            f"and '{parent_id}' in parents"
+        )
+
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=q,
+                fields="nextPageToken,files(id,name,modifiedTime,parents)",
+                pageSize=200,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            for f in resp.get("files", []):
+                fid = f.get("id")
+                if not fid or fid in seen_folder_ids:
+                    continue
+                seen_folder_ids.add(fid)
+
+                n = _ancillary_normalize_drive_name(f.get("name"))
+                if (
+                    "ANCILLARY REVENUE REPORTS" in n
+                    or "ANCILLARY REVENUE FILES" in n
+                ):
+                    ancillary_folders.append({
+                        **f,
+                        "_depth": depth + 1,
+                    })
+                else:
+                    frontier.append((fid, depth + 1))
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
 
     if not ancillary_folders:
         return None, (
             f"{rev_name}: no folder containing 'Ancillary Revenue Reports' "
-            f"or 'Ancillary Revenue Files' was found."
+            f"or 'Ancillary Revenue Files' was found anywhere in the "
+            f"{report_month.year} Revenue Reports folder tree."
         )
 
     ancillary_folders.sort(
-        key=lambda f: str(f.get("modifiedTime", "")),
-        reverse=True,
+        key=lambda f: (
+            f.get("_depth", 99),
+            -int(
+                re.sub(r"\D", "", str(f.get("modifiedTime", "")))[:14] or "0"
+            ),
+        )
     )
     anc_folder = ancillary_folders[0]
 
@@ -10097,6 +10128,51 @@ with tab_ancillary:
     )
     ar_month_dt = datetime.datetime(ar_month_date.year, ar_month_date.month, 1)
 
+    # Verify the Drive destination before the user fills out the full report.
+    test_drive_col, _ = st.columns([2, 3])
+    with test_drive_col:
+        if st.button(
+            "Test Drive Location",
+            key="ar_test_drive_location",
+            use_container_width=True,
+        ):
+            try:
+                svc = get_drive_service()
+                discovered = dict(get_hotels_from_drive())
+                drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(ar_key)
+                hotel_id = discovered.get(drive_label, "")
+
+                if not drive_label:
+                    raise ValueError(
+                        f"No Drive hotel mapping is configured for {ar_property}."
+                    )
+                if not hotel_id:
+                    raise ValueError(
+                        f"Could not find {drive_label}'s Revenue Reports folders "
+                        "with the current Drive connection."
+                    )
+
+                target, target_err = ancillary_find_drive_report(
+                    svc,
+                    hotel_id,
+                    drive_label,
+                    ar_month_dt,
+                )
+                if target_err or not target:
+                    raise ValueError(
+                        target_err or "Ancillary Drive report not found."
+                    )
+
+                st.success("Drive location found.")
+                st.info(
+                    f"Revenue Reports: **{target['revenue_folder_name']}**\n\n"
+                    f"Ancillary folder: **{target['folder_name']}**\n\n"
+                    f"Workbook: **{target['file_name']}**"
+                )
+
+            except Exception as e:
+                st.error(f"Drive location test failed: {e}")
+
     local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
     ar_template_upload = None
     if local_template.exists():
@@ -10757,4 +10833,3 @@ with tab_projection:
 # only the open section reaches the page. Must stay the last statement in the
 # file — anything added after it would render into the void.
 _offstage.empty()
-
