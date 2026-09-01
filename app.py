@@ -6328,8 +6328,10 @@ def ancillary_parse_addon(raw, property_key):
             r'|\bresort\s+fee\b'
             r'|\bamenity\s+fee\b'
             r'|\bparking\s+fee\b'
+            r'|\bdestination\s+fee\b'
+            r'|\bgroup\s+destination\s+fee\b'
             r'|^parking\s*-?\s*\$'
-            r'|booking\.com.*(?:resort|amenity|parking)',
+            r'|booking\.com.*(?:resort|amenity|parking|destination)',
             name,
             re.I,
         ))
