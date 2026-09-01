@@ -4622,11 +4622,17 @@ def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
 
 
 def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
-    """Fill Week 1 Previous Sheet using one prior-month week snapshot.
+    """Fill Week 1 Previous Sheet from one prior-month completed week.
 
-    Pick the last completed week from the previous month's ROB (WK5 if used,
-    otherwise WK4, etc.). Then copy only each month's total Revenue row from
-    that one week tab into the next month's Week 1 Previous table.
+    Source rule:
+      1. Look at the previous month's ROB workbook.
+      2. Starting with the latest week tab, find the last week where the
+         PREVIOUS MONTH's current-year Revenue / Room Nights cells are
+         actually populated in the data-only workbook.
+      3. Once that week is selected, copy ONLY each month's Revenue row from
+         that one sheet into the Week 1 Previous table.
+
+    This table must never use Pickup WoW rows or mix source weeks.
     """
     month_abbrs = [
         "jan", "feb", "mar", "apr", "may", "jun",
@@ -4642,7 +4648,10 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
                 return iv
             if 40000 <= iv <= 60000:
                 try:
-                    return (datetime.date(1899, 12, 30) + datetime.timedelta(days=iv)).year
+                    return (
+                        datetime.date(1899, 12, 30)
+                        + datetime.timedelta(days=iv)
+                    ).year
                 except Exception:
                     pass
         if isinstance(v, str):
@@ -4651,26 +4660,36 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
                 return int(m.group(1))
         return None
 
+    # ----- Locate Week 1 Previous table -----
     hdr_row = hdr_col = None
     for r in range(1, min(wk1_ws.max_row + 1, 80)):
         for c in range(1, wk1_ws.max_column + 1):
             val = str(wk1_ws.cell(r, c).value or "").strip().lower()
-            if "week 1 previous" in val or ("calculation only" in val and "week" in val):
+            if (
+                "week 1 previous" in val
+                or ("calculation only" in val and "week" in val)
+            ):
                 hdr_row, hdr_col = r, c
                 break
         if hdr_row:
             break
+
     if not hdr_row:
         return "Week 1 Previous Sheet table not found in wk one"
 
+    # ----- Destination month rows -----
     month_label_col = None
     for r in range(hdr_row + 1, min(wk1_ws.max_row + 1, hdr_row + 40)):
-        for c in range(max(1, hdr_col - 5), min(wk1_ws.max_column + 1, hdr_col + 8)):
+        for c in range(
+            max(1, hdr_col - 5),
+            min(wk1_ws.max_column + 1, hdr_col + 8)
+        ):
             if str(wk1_ws.cell(r, c).value or "").strip().lower() in month_abbrs:
                 month_label_col = c
                 break
         if month_label_col:
             break
+
     if not month_label_col:
         return "Could not find month label column in Week 1 Previous Sheet table"
 
@@ -4680,16 +4699,21 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
         if v in month_abbrs:
             dest_month_row[month_abbrs.index(v)] = r
 
-    years_in_order = [
+    # ----- Destination year columns -----
+    expected_years = [
         target_month.year - 3,
         target_month.year - 2,
         target_month.year - 1,
         target_month.year,
     ]
+
     dest_year_col = {}
     for r in range(hdr_row, min(wk1_ws.max_row + 1, hdr_row + 10)):
         parsed = {}
-        for c in range(month_label_col + 1, min(wk1_ws.max_column + 1, month_label_col + 20)):
+        for c in range(
+            month_label_col + 1,
+            min(wk1_ws.max_column + 1, month_label_col + 20)
+        ):
             yr = _as_year(wk1_ws.cell(r, c).value)
             if yr:
                 parsed[yr] = c
@@ -4697,59 +4721,70 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
             dest_year_col = parsed
             break
 
+    # The standard Week 1 Previous table is four consecutive year columns.
+    # Its headers may themselves be formulas (=B3, =C3, etc.), so if the
+    # literal years cannot be read, use their known left-to-right order.
     if not dest_year_col:
-        for c, year in zip(range(month_label_col + 1, month_label_col + 5), years_in_order):
+        for c, year in zip(
+            range(month_label_col + 1, month_label_col + 5),
+            expected_years
+        ):
             dest_year_col[year] = c
 
-    prev_month = (target_month - datetime.timedelta(days=1)).replace(day=1)
+    # ----- Select ONE last completed week from previous month's ROB -----
+    prev_month = (
+        target_month - datetime.timedelta(days=1)
+    ).replace(day=1)
     prev_month_idx = prev_month.month - 1
 
     source_sheet = None
+
     for candidate in reversed(ROB_SHEETS):
         if candidate not in prev_wb.sheetnames:
             continue
-        ws = prev_wb[candidate]
-        labels = rob_month_blocks(ws).get(prev_month_idx, {})
+
+        src_ws = prev_wb[candidate]  # data_only=True workbook
+        labels = rob_month_blocks(src_ws).get(prev_month_idx, {})
         rev_row = labels.get("revenue")
-        rms_row = labels.get("room nights") or labels.get("rms sold") or labels.get("rooms sold")
+        rms_row = (
+            labels.get("room nights")
+            or labels.get("rms sold")
+            or labels.get("rooms sold")
+        )
+
         if not rev_row:
             continue
 
-        rev = _resolve_cell(prev_wb, prev_wb_formulas, candidate, rev_row, 5)
-        rms = _resolve_cell(prev_wb, prev_wb_formulas, candidate, rms_row, 5) if rms_row else None
+        # Current-year is column E in the ROB structure.
+        rev_val = src_ws.cell(rev_row, 5).value
+        rms_val = src_ws.cell(rms_row, 5).value if rms_row else None
 
-        def used(v):
-            if v is None or isinstance(v, bool):
-                return False
-            if isinstance(v, (int, float)):
-                return v != 0
-            if is_formula(str(v)):
-                return "!" not in str(v)
-            return str(v).strip() not in {"", "0", "0.0", "0.00"}
-
-        if used(rev) or used(rms):
+        # "Completed/used" means the cells are populated, even if the real
+        # numeric value happens to be zero. Blank cells indicate that week
+        # was not used for that month.
+        if rev_val is not None or rms_val is not None:
             source_sheet = candidate
             break
 
     if source_sheet is None:
-        return f"Could not identify the last completed week in the {prev_month:%b %Y} ROB."
+        return (
+            f"Could not identify the last completed week in the "
+            f"{prev_month:%b %Y} ROB."
+        )
 
-    src_ws = prev_wb[source_sheet]
+    # ----- Copy literal Revenue values from that one sheet -----
+    src_ws = prev_wb[source_sheet]  # data_only=True
+    source_blocks = rob_month_blocks(src_ws)
+
+    # ROB year columns are B:E. Row 4 may contain date headers instead of
+    # literal year labels, so preserve the standard chronological mapping.
     src_year_col = {
         target_month.year - 3: 2,
         target_month.year - 2: 3,
         target_month.year - 1: 4,
         target_month.year: 5,
     }
-    detected = {}
-    for c in range(1, min(src_ws.max_column + 1, 20)):
-        yr = _as_year(src_ws.cell(4, c).value)
-        if yr:
-            detected[yr] = c
-    if len(detected) >= 3:
-        src_year_col = detected
 
-    source_blocks = rob_month_blocks(src_ws)
     for month_idx, dest_row in dest_month_row.items():
         rev_row = source_blocks.get(month_idx, {}).get("revenue")
         if not rev_row:
@@ -4759,9 +4794,14 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
             src_col = src_year_col.get(year)
             if not src_col:
                 continue
-            v = _resolve_cell(prev_wb, prev_wb_formulas, source_sheet, rev_row, src_col)
-            if v is not None and not is_formula(str(v)):
-                wk1_ws.cell(dest_row, dest_col).value = v
+
+            # IMPORTANT: read only the cached/literal Revenue value from the
+            # data-only workbook. Do not resolve formulas through Pickup WoW
+            # or another row/sheet.
+            value = src_ws.cell(rev_row, src_col).value
+
+            if value is not None:
+                wk1_ws.cell(dest_row, dest_col).value = value
 
     return None
 
