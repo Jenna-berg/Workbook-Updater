@@ -5785,6 +5785,16 @@ ANCILLARY_RULES = {
         'itemized':['Early Check In - 12pm - 3pm','Early Check In - 7am - 12pm',
                     'Relax & Revel until 1pm','Relax & Revel until 2pm'],
         'exclude':[]},
+    'pleasant view inn': {
+        'operational': ['$42 Resort Fee', 'Waive Resort Fee'],
+        'itemized': [
+            '1PM Late Check Out - On Season',
+            '2PM Early Check In - On Season',
+            '2PM Early Check In - On Season - Fr, Sat',
+        ],
+        'exclude': [],
+    },
+
 }
 
 ANCILLARY_YOY_ALIASES = {
@@ -5812,7 +5822,7 @@ ANCILLARY_YOY_ALIASES = {
 
 
 def _ar_norm(v):
-    return re.sub(r'\\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(v or '').lower().replace('&','and'))).strip()
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(v or '').lower().replace('&','and'))).strip()
 
 
 def ancillary_profile(property_name):
@@ -5833,7 +5843,7 @@ def _ar_num(v):
         return float(v)
     s = str(v).strip()
     neg = '(' in s and ')' in s
-    s = re.sub(r'[$,%()\\s,]', '', s)
+    s = re.sub(r'[$,%()\s,]', '', s)
     if not s:
         return None
     try:
@@ -5880,41 +5890,109 @@ def _ar_col(h, names):
 
 
 def ancillary_parse_addon(raw, property_key):
-    rules = ANCILLARY_RULES.get(property_key, {'operational':[],'itemized':[],'exclude':[]})
-    operational_set = {_ar_norm(x) for x in rules.get('operational',[])}
-    itemized_set = {_ar_norm(x) for x in rules.get('itemized',[])}
-    exclude_set = {_ar_norm(x) for x in rules.get('exclude',[])}
+    rules = ANCILLARY_RULES.get(
+        property_key,
+        {'operational': [], 'itemized': [], 'exclude': []},
+    )
+    operational_set = {_ar_norm(x) for x in rules.get('operational', [])}
+    itemized_set = {_ar_norm(x) for x in rules.get('itemized', [])}
+    exclude_set = {_ar_norm(x) for x in rules.get('exclude', [])}
+
     header_row = -1
-    for i,row in enumerate(raw[:12]):
-        if len(row)>1 and not str(row[0] or '').strip() and 'total count' in str(row[1] or '').lower():
-            header_row = i; break
-    if header_row < 0: header_row = 2
-    buckets = {'main':[], 'operational':[], 'itemized':[]}
-    for r in raw[header_row+1:]:
+    for i, row in enumerate(raw[:12]):
+        if (
+            len(row) > 1
+            and not str(row[0] or '').strip()
+            and 'total count' in str(row[1] or '').lower()
+        ):
+            header_row = i
+            break
+    if header_row < 0:
+        header_row = 2
+
+    buckets = {'main': [], 'operational': [], 'itemized': []}
+
+    for r in raw[header_row + 1:]:
         name = str(r[0] or '').strip() if r else ''
-        if not name: continue
-        count = _ar_num(r[1] if len(r)>1 else None)
-        revenue = _ar_num(r[2] if len(r)>2 else None)
-        average = _ar_num(r[3] if len(r)>3 else None)
-        if count is None and revenue is None: continue
-        obj={'name':name,'count':count or 0,'revenue':revenue or 0,'average':average or 0}
-        n=_ar_norm(name)
-        if n in exclude_set: continue
-        is_operational = bool(re.search(r'\\bwaiv(?:e|ed)\\b|\\bresort\\s+fee\\b|\\bamenity\\s+fee\\b|\\bparking\\s+fee\\b|^parking\\s*-?\\s*\\$|booking\\.com.*(?:resort|amenity|parking)', name, re.I))
-        is_timing = bool(re.search(r'\\bearly\\s+(?:check\\s*-?\\s*in|arrival)\\b|\\blate\\s+(?:check\\s*-?\\s*out|checkout|departure)\\b|\\bvery\\s+early\\s+check\\s*-?\\s*in\\b|\\bvery\\s+late\\s+check\\s*-?\\s*out\\b', name, re.I))
-        if n in operational_set or is_operational: buckets['operational'].append(obj)
-        elif n in itemized_set or is_timing: buckets['itemized'].append(obj)
-        else: buckets['main'].append(obj)
+        if not name:
+            continue
+
+        count = _ar_num(r[1] if len(r) > 1 else None)
+        revenue = _ar_num(r[2] if len(r) > 2 else None)
+        average = _ar_num(r[3] if len(r) > 3 else None)
+        if count is None and revenue is None:
+            continue
+
+        obj = {
+            'name': name,
+            'count': count or 0,
+            'revenue': revenue or 0,
+            'average': average or 0,
+        }
+
+        n = _ar_norm(name)
+        if n in exclude_set:
+            continue
+
+        # Portfolio-wide operational/non-ancillary fee rules.
+        is_operational = bool(re.search(
+            r'\bwaiv(?:e|ed)\b'
+            r'|\bresort\s+fee\b'
+            r'|\bamenity\s+fee\b'
+            r'|\bparking\s+fee\b'
+            r'|^parking\s*-?\s*\$'
+            r'|booking\.com.*(?:resort|amenity|parking)',
+            name,
+            re.I,
+        ))
+
+        # Detailed ECI/LCO timing products belong only in the itemized section.
+        is_timing = bool(re.search(
+            r'\bearly\s+(?:check\s*-?\s*in|arrival)\b'
+            r'|\blate\s+(?:check\s*-?\s*out|checkout|departure)\b'
+            r'|\bvery\s+early\s+check\s*-?\s*in\b'
+            r'|\bvery\s+late\s+check\s*-?\s*out\b',
+            name,
+            re.I,
+        ))
+
+        # Main-table ECI/LCO revenue is Journal-only.
+        # Raw generic Early Check In / Late Checkout rows are not retained.
+        is_journal_equivalent = _ar_is_journal_equivalent(name)
+
+        if n in operational_set or is_operational:
+            buckets['operational'].append(obj)
+        elif n in itemized_set or (is_timing and not is_journal_equivalent):
+            buckets['itemized'].append(obj)
+        elif is_journal_equivalent:
+            continue
+        else:
+            buckets['main'].append(obj)
+
     def combine(rows):
-        m={}
+        grouped = {}
         for r in rows:
-            k=_ar_norm(r['name'])
-            if k not in m: m[k]={'name':r['name'],'count':0,'revenue':0,'average':0}
-            m[k]['count'] += _ar_num(r['count']) or 0
-            m[k]['revenue'] += _ar_num(r['revenue']) or 0
-        for r in m.values(): r['average']=r['revenue']/r['count'] if r['count'] else 0
-        return sorted(m.values(), key=lambda x:x['revenue'], reverse=True)
-    return {k:combine(v) for k,v in buckets.items()}
+            key = _ar_norm(r['name'])
+            if key not in grouped:
+                grouped[key] = {
+                    'name': r['name'],
+                    'count': 0,
+                    'revenue': 0,
+                    'average': 0,
+                }
+            grouped[key]['count'] += _ar_num(r['count']) or 0
+            grouped[key]['revenue'] += _ar_num(r['revenue']) or 0
+
+        for r in grouped.values():
+            r['average'] = r['revenue'] / r['count'] if r['count'] else 0
+
+        return sorted(
+            grouped.values(),
+            key=lambda x: x['revenue'],
+            reverse=True,
+        )
+
+    return {k: combine(v) for k, v in buckets.items()}
 
 
 def ancillary_parse_upsell(raw):
@@ -6065,6 +6143,22 @@ def _ar_copy_style_row(src_ws, src_row, dst_ws, dst_row, start_col=1, num_cols=5
     dst_ws.row_dimensions[dst_row].height=src_ws.row_dimensions[src_row].height
 
 
+def _ar_copy_style_shifted(src_ws, src_row, src_col, dst_ws, dst_row, dst_col, num_cols):
+    """Copy a styled template row to a different column position."""
+    for offset in range(num_cols):
+        s = src_ws.cell(src_row, src_col + offset)
+        d = dst_ws.cell(dst_row, dst_col + offset)
+        if s.has_style:
+            d._style = copy(s._style)
+        d.number_format = s.number_format
+        d.font = copy(s.font)
+        d.fill = copy(s.fill)
+        d.border = copy(s.border)
+        d.alignment = copy(s.alignment)
+        d.protection = copy(s.protection)
+    dst_ws.row_dimensions[dst_row].height = src_ws.row_dimensions[src_row].height
+
+
 def _ar_merge_name(ws,row,start_col=1,num_cols=5):
     try: ws.merge_cells(start_row=row,start_column=start_col,end_row=row,end_column=start_col+num_cols-1)
     except Exception: pass
@@ -6100,10 +6194,12 @@ def ancillary_render_report(template_bytes, property_name, property_key, report_
     sh._charts=[]
     month_name=report_month.strftime('%B'); month_abbr=report_month.strftime('%b').upper(); year=report_month.year
     short_prop=re.sub(r' by the Sea( Hotel)?$','',property_name,flags=re.I)
+    if property_key == 'pleasant view inn':
+        short_prop = 'Westerly'
     left=1
     _ar_copy_style_row(template,1,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=f'{short_prop} Upsell Overview - {month_name}'; left+=1
     _ar_copy_style_row(template,2,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
-    _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Name'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
+    _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=('Upsell Name' if property_key == 'pleasant view inn' else 'Name'); sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
     for r in main_rows:
         _ar_copy_style_row(template,4,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value='' if r.get('count') is None else r.get('count'); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value='' if r.get('average') is None else r.get('average'); left+=1
     total_count=sum(_ar_num(r.get('count')) or 0 for r in main_rows if r.get('count') is not None); total_rev=sum(_ar_num(r.get('revenue')) or 0 for r in main_rows)
@@ -6130,7 +6226,7 @@ def ancillary_render_report(template_bytes, property_name, property_key, report_
         _ar_copy_style_row(template,46,sh,left,1,5); sh.cell(left,1).value=r['name']; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=r['variance']; left+=1
     _ar_copy_style_row(template,69,sh,left,1,5); sh.cell(left,1).value='TOTALS'; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=sum(_ar_num(r['variance']) or 0 for r in variance_rows); left+=4
     _ar_copy_style_row(template,72,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
-    _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Early Check In & Late Checkout Itemized'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
+    _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=('Check In & Checkout Itemized' if property_key == 'pleasant view inn' else 'Early Check In & Late Checkout Itemized'); sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
     for r in itemized_rows:
         _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
     if stly['sourceType']=='SNT' and stly.get('itemizedRows'):
@@ -6138,36 +6234,248 @@ def ancillary_render_report(template_bytes, property_name, property_key, report_
         _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Early Check In & Late Checkout Itemized'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
         for r in stly['itemizedRows']:
             _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
-    # middle stack
-    mid=3; _ar_copy_style_row(template,3,sh,mid,7,4); headers=['Name','Total Count','Total Revenue','Average revenue']
-    for i,v in enumerate(headers,7): sh.cell(mid,i).value=v
-    mid+=1
-    for r in operational_rows:
-        _ar_copy_style_row(template,4,sh,mid,7,4); vals=[r['name'],r.get('count',''),_ar_num(r.get('revenue')) or 0,r.get('average','')]
-        for i,v in enumerate(vals,7): sh.cell(mid,i).value=v
-        mid+=1
-    mid+=3; _ar_copy_style_row(template,13,sh,mid,7,3); vals=['Staff Name','Room Upgrades Produced','Revenue Produced']
-    for i,v in enumerate(vals,7): sh.cell(mid,i).value=v
-    mid+=1
-    for r in upgrades['byStaff']:
-        _ar_copy_style_row(template,14,sh,mid,7,3); sh.cell(mid,7).value=r['name']; sh.cell(mid,8).value=r['count']; sh.cell(mid,9).value=r['revenue']; mid+=1
-    mid+=3; _ar_copy_style_row(template,25,sh,mid,7,2); sh.cell(mid,7).value='Room Level Increase'; sh.cell(mid,8).value='Count'; mid+=1
-    for r in upgrades['byLevel']:
-        _ar_copy_style_row(template,26,sh,mid,7,2); sh.cell(mid,7).value=str(r['level']).replace('+','')+'+'; sh.cell(mid,8).value=r['count']; mid+=1
-    mid+=3; _ar_copy_style_row(template,30,sh,mid,7,2); sh.cell(mid,7).value='Staff Name'; sh.cell(mid,8).value='Messages'; mid+=1
-    for r in staff_rows:
-        _ar_copy_style_row(template,31,sh,mid,7,2); sh.cell(mid,7).value=r['name']; sh.cell(mid,8).value=r['messages']; mid+=1
-    # right KPI stack
-    sh['M1']=f'{short_prop} Messaging Overview - {month_name}'; sh['M2']=year; sh['N21']=f'{month_abbr} {year}'; sh['O21']='STLY'; sh['P21']='YoY'
-    labels=['Total Messages','# of messages guest sent','# of messages hotel sent','% of your guests that sent a message','Response Rate','Average minutes to respond','Median minutes to respond']
-    current=[messaging.get(k,0) for k in ['msgTotal','msgGuest','msgHotel','msgGuestPct','responseRate','avgResponse','medianResponse']]
-    prior=[messaging.get(k,0) for k in ['stlyMsgTotal','stlyMsgGuest','stlyMsgHotel','stlyMsgGuestPct','stlyResponseRate','stlyAvgResponse','stlyMedianResponse']]
-    for idx,label in enumerate(labels,22):
-        sh.cell(idx,13).value=label; sh.cell(idx,14).value=current[idx-22]; sh.cell(idx,15).value=prior[idx-22]; sh.cell(idx,16).value=(current[idx-22] or 0)-(prior[idx-22] or 0)
-    sh['M30']='Date'; sh['N30']='Engagement Rate'
-    for i,(d,v) in enumerate(engagement[:8],31): sh.cell(i,13).value=d; sh.cell(i,14).value=v
-    sh['N25'].number_format='0.0%'; sh['O25'].number_format='0.0%'; sh['P25'].number_format='0.0%'; sh['N26'].number_format='0.0%'; sh['O26'].number_format='0.0%'; sh['P26'].number_format='0.0%'
-    for i in range(31,39): sh.cell(i,14).number_format='0.0%'
+    # middle + right stacks
+    if property_key == 'pleasant view inn':
+        # Match the completed July PVI/Westerly layout.
+
+        # Staff messaging at the top: G:H.
+        mid = 4
+        _ar_copy_style_row(template, 30, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = 'Staff Name'
+        sh.cell(mid, 8).value = 'Messages'
+        mid += 1
+        for r in staff_rows:
+            _ar_copy_style_row(template, 31, sh, mid, 7, 2)
+            sh.cell(mid, 7).value = r['name']
+            sh.cell(mid, 8).value = r['messages']
+            mid += 1
+
+        # Room-upgrade production below staff messaging.
+        mid = max(mid + 2, 10)
+        _ar_copy_style_row(template, 13, sh, mid, 7, 3)
+        for i, v in enumerate(
+            ['Staff Name', 'Room Upgrades Produced', 'Total Revenue'],
+            7,
+        ):
+            sh.cell(mid, i).value = v
+        mid += 1
+        for r in upgrades['byStaff']:
+            _ar_copy_style_row(template, 14, sh, mid, 7, 3)
+            sh.cell(mid, 7).value = r['name']
+            sh.cell(mid, 8).value = r['count']
+            sh.cell(mid, 9).value = r['revenue']
+            mid += 1
+
+        # Room-level increase table.
+        mid = max(mid + 2, 20)
+        _ar_copy_style_row(template, 25, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = 'Room Level Increase'
+        sh.cell(mid, 8).value = 'Count'
+        mid += 1
+        for r in upgrades['byLevel']:
+            _ar_copy_style_row(template, 26, sh, mid, 7, 2)
+            sh.cell(mid, 7).value = str(r['level']).replace('+', '') + '+'
+            sh.cell(mid, 8).value = r['count']
+            mid += 1
+
+        # Operational/non-ancillary fees shown separately.
+        if operational_rows:
+            mid += 2
+            _ar_copy_style_row(template, 3, sh, mid, 7, 4)
+            for i, v in enumerate(
+                ['Name', 'Total Count', 'Total Revenue', 'Average revenue'],
+                7,
+            ):
+                sh.cell(mid, i).value = v
+            mid += 1
+            for r in operational_rows:
+                _ar_copy_style_row(template, 4, sh, mid, 7, 4)
+                vals = [
+                    r['name'],
+                    r.get('count', ''),
+                    _ar_num(r.get('revenue')) or 0,
+                    r.get('average', ''),
+                ]
+                for i, v in enumerate(vals, 7):
+                    sh.cell(mid, i).value = v
+                mid += 1
+
+        # Messaging Overview in K:N, as in the completed July PVI report.
+        for rr in range(1, 41):
+            try:
+                _ar_copy_style_shifted(template, rr, 13, sh, rr, 11, 4)
+            except Exception:
+                pass
+
+        sh['K1'] = f'{short_prop} Messaging Overview - {month_name}'
+        sh['K2'] = year
+        sh['L22'] = month_abbr
+        sh['M22'] = 'STLY'
+        sh['N22'] = 'YoY'
+
+        labels = [
+            'Total Messages',
+            '# of messages guest sent',
+            '# of messages hotel sent',
+            '% of your guests that sent a message',
+            'Response Rate',
+            'Average minutes to respond',
+            'Median minutes to respond',
+        ]
+        current = [
+            messaging.get(k, 0)
+            for k in [
+                'msgTotal', 'msgGuest', 'msgHotel', 'msgGuestPct',
+                'responseRate', 'avgResponse', 'medianResponse',
+            ]
+        ]
+        prior = [
+            messaging.get(k, 0)
+            for k in [
+                'stlyMsgTotal', 'stlyMsgGuest', 'stlyMsgHotel',
+                'stlyMsgGuestPct', 'stlyResponseRate',
+                'stlyAvgResponse', 'stlyMedianResponse',
+            ]
+        ]
+
+        for idx, label in enumerate(labels, 23):
+            sh.cell(idx, 11).value = label
+            sh.cell(idx, 12).value = current[idx - 23]
+            sh.cell(idx, 13).value = prior[idx - 23]
+            sh.cell(idx, 14).value = (
+                (current[idx - 23] or 0) - (prior[idx - 23] or 0)
+            )
+
+        sh['K32'] = 'Date'
+        sh['L32'] = 'Engagement Rate'
+        for i, (d, v) in enumerate(engagement[:8], 33):
+            sh.cell(i, 11).value = d
+            sh.cell(i, 12).value = v
+
+        for c in ['L26', 'M26', 'N26', 'L27', 'M27', 'N27']:
+            sh[c].number_format = '0.0%'
+        for i in range(33, 41):
+            sh.cell(i, 12).number_format = '0.0%'
+
+        # Remove generic right-side remnants.
+        for row in range(1, 45):
+            for col in range(15, 17):
+                sh.cell(row, col).value = None
+
+    else:
+        # Generic portfolio layout.
+        mid = 3
+        _ar_copy_style_row(template, 3, sh, mid, 7, 4)
+        headers = ['Name', 'Total Count', 'Total Revenue', 'Average revenue']
+        for i, v in enumerate(headers, 7):
+            sh.cell(mid, i).value = v
+        mid += 1
+
+        for r in operational_rows:
+            _ar_copy_style_row(template, 4, sh, mid, 7, 4)
+            vals = [
+                r['name'],
+                r.get('count', ''),
+                _ar_num(r.get('revenue')) or 0,
+                r.get('average', ''),
+            ]
+            for i, v in enumerate(vals, 7):
+                sh.cell(mid, i).value = v
+            mid += 1
+
+        mid += 3
+        _ar_copy_style_row(template, 13, sh, mid, 7, 3)
+        vals = ['Staff Name', 'Room Upgrades Produced', 'Revenue Produced']
+        for i, v in enumerate(vals, 7):
+            sh.cell(mid, i).value = v
+        mid += 1
+
+        for r in upgrades['byStaff']:
+            _ar_copy_style_row(template, 14, sh, mid, 7, 3)
+            sh.cell(mid, 7).value = r['name']
+            sh.cell(mid, 8).value = r['count']
+            sh.cell(mid, 9).value = r['revenue']
+            mid += 1
+
+        mid += 3
+        _ar_copy_style_row(template, 25, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = 'Room Level Increase'
+        sh.cell(mid, 8).value = 'Count'
+        mid += 1
+
+        for r in upgrades['byLevel']:
+            _ar_copy_style_row(template, 26, sh, mid, 7, 2)
+            sh.cell(mid, 7).value = str(r['level']).replace('+', '') + '+'
+            sh.cell(mid, 8).value = r['count']
+            mid += 1
+
+        mid += 3
+        _ar_copy_style_row(template, 30, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = 'Staff Name'
+        sh.cell(mid, 8).value = 'Messages'
+        mid += 1
+
+        for r in staff_rows:
+            _ar_copy_style_row(template, 31, sh, mid, 7, 2)
+            sh.cell(mid, 7).value = r['name']
+            sh.cell(mid, 8).value = r['messages']
+            mid += 1
+
+        # right KPI stack
+        sh['M1'] = f'{short_prop} Messaging Overview - {month_name}'
+        sh['M2'] = year
+        sh['N21'] = f'{month_abbr} {year}'
+        sh['O21'] = 'STLY'
+        sh['P21'] = 'YoY'
+
+        labels = [
+            'Total Messages',
+            '# of messages guest sent',
+            '# of messages hotel sent',
+            '% of your guests that sent a message',
+            'Response Rate',
+            'Average minutes to respond',
+            'Median minutes to respond',
+        ]
+        current = [
+            messaging.get(k, 0)
+            for k in [
+                'msgTotal', 'msgGuest', 'msgHotel', 'msgGuestPct',
+                'responseRate', 'avgResponse', 'medianResponse',
+            ]
+        ]
+        prior = [
+            messaging.get(k, 0)
+            for k in [
+                'stlyMsgTotal', 'stlyMsgGuest', 'stlyMsgHotel',
+                'stlyMsgGuestPct', 'stlyResponseRate',
+                'stlyAvgResponse', 'stlyMedianResponse',
+            ]
+        ]
+
+        for idx, label in enumerate(labels, 22):
+            sh.cell(idx, 13).value = label
+            sh.cell(idx, 14).value = current[idx - 22]
+            sh.cell(idx, 15).value = prior[idx - 22]
+            sh.cell(idx, 16).value = (
+                (current[idx - 22] or 0) - (prior[idx - 22] or 0)
+            )
+
+        sh['M30'] = 'Date'
+        sh['N30'] = 'Engagement Rate'
+        for i, (d, v) in enumerate(engagement[:8], 31):
+            sh.cell(i, 13).value = d
+            sh.cell(i, 14).value = v
+
+        sh['N25'].number_format = '0.0%'
+        sh['O25'].number_format = '0.0%'
+        sh['P25'].number_format = '0.0%'
+        sh['N26'].number_format = '0.0%'
+        sh['O26'].number_format = '0.0%'
+        sh['P26'].number_format = '0.0%'
+        for i in range(31, 39):
+            sh.cell(i, 14).number_format = '0.0%'
+
     # Put Report immediately after Report Template for convenience.
     wb._sheets.remove(sh); wb._sheets.insert(wb._sheets.index(template)+1,sh)
     out=io.BytesIO(); wb.save(out); return out.getvalue()
@@ -9071,26 +9379,121 @@ with tab_ancillary:
                 )
                 ar_stly_journal_values.append(v)
 
-    with st.expander("Canary messaging KPIs (optional)"):
-        k1,k2,k3,k4 = st.columns(4)
-        with k1:
-            msg_total=st.number_input("Total Messages",value=0.0,key="ar_msg_total")
-            msg_guest=st.number_input("Guest Messages",value=0.0,key="ar_msg_guest")
-            msg_hotel=st.number_input("Hotel Messages",value=0.0,key="ar_msg_hotel")
-        with k2:
-            msg_pct=st.number_input("% Guests Messaged",value=0.0,format="%.4f",key="ar_msg_pct")
-            resp=st.number_input("Response Rate",value=0.0,format="%.4f",key="ar_resp")
-            avg=st.number_input("Avg Minutes",value=0.0,key="ar_avg")
-            med=st.number_input("Median Minutes",value=0.0,key="ar_med")
-        with k3:
-            stly_total=st.number_input("STLY Total Messages",value=0.0,key="ar_stly_total")
-            stly_guest=st.number_input("STLY Guest Messages",value=0.0,key="ar_stly_guest")
-            stly_hotel=st.number_input("STLY Hotel Messages",value=0.0,key="ar_stly_hotel")
-        with k4:
-            stly_pct=st.number_input("STLY % Guests Messaged",value=0.0,format="%.4f",key="ar_stly_pct")
-            stly_resp=st.number_input("STLY Response Rate",value=0.0,format="%.4f",key="ar_stly_resp")
-            stly_avg=st.number_input("STLY Avg Minutes",value=0.0,key="ar_stly_avg")
-            stly_med=st.number_input("STLY Median Minutes",value=0.0,key="ar_stly_med")
+    st.divider()
+    st.markdown("### Canary Messaging Overview")
+    st.caption(
+        "Enter the monthly Canary Insights values here. Percentage fields use "
+        "normal percentage points — enter 5.0 for 5%, not 0.05."
+    )
+
+    current_col, stly_col = st.columns(2)
+
+    with current_col:
+        st.markdown(f"**{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year}**")
+        msg_total = st.number_input(
+            "Total Messages", value=0.0, key="ar_msg_total"
+        )
+        msg_guest = st.number_input(
+            "Guest Messages", value=0.0, key="ar_msg_guest"
+        )
+        msg_hotel = st.number_input(
+            "Hotel Messages", value=0.0, key="ar_msg_hotel"
+        )
+        msg_pct_ui = st.number_input(
+            "% Guests Messaged",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            key="ar_msg_pct",
+        )
+        resp_ui = st.number_input(
+            "Response Rate %",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            key="ar_resp",
+        )
+        avg = st.number_input(
+            "Average Minutes to Respond", value=0.0, key="ar_avg"
+        )
+        med = st.number_input(
+            "Median Minutes to Respond", value=0.0, key="ar_med"
+        )
+
+    with stly_col:
+        st.markdown(f"**STLY — {ar_month_dt.year - 1}**")
+        stly_total = st.number_input(
+            "STLY Total Messages", value=0.0, key="ar_stly_total"
+        )
+        stly_guest = st.number_input(
+            "STLY Guest Messages", value=0.0, key="ar_stly_guest"
+        )
+        stly_hotel = st.number_input(
+            "STLY Hotel Messages", value=0.0, key="ar_stly_hotel"
+        )
+        stly_pct_ui = st.number_input(
+            "STLY % Guests Messaged",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            key="ar_stly_pct",
+        )
+        stly_resp_ui = st.number_input(
+            "STLY Response Rate %",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            key="ar_stly_resp",
+        )
+        stly_avg = st.number_input(
+            "STLY Average Minutes to Respond",
+            value=0.0,
+            key="ar_stly_avg",
+        )
+        stly_med = st.number_input(
+            "STLY Median Minutes to Respond",
+            value=0.0,
+            key="ar_stly_med",
+        )
+
+    msg_pct = msg_pct_ui / 100.0
+    resp = resp_ui / 100.0
+    stly_pct = stly_pct_ui / 100.0
+    stly_resp = stly_resp_ui / 100.0
+
+    engagement_rows = []
+    with st.expander("Engagement Rate points (optional)"):
+        st.caption(
+            "Add up to eight Canary engagement-rate points for the monthly table."
+        )
+        for i in range(8):
+            c_date, c_rate = st.columns([2, 1])
+            with c_date:
+                e_date = st.date_input(
+                    f"Date {i + 1}",
+                    value=None,
+                    key=f"ar_eng_date_{i}",
+                )
+            with c_rate:
+                e_rate = st.number_input(
+                    f"Rate % {i + 1}",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key=f"ar_eng_rate_{i}",
+                )
+            if e_date is not None:
+                engagement_rows.append(
+                    (
+                        datetime.datetime.combine(e_date, datetime.time()),
+                        e_rate / 100.0,
+                    )
+                )
 
     ar_messaging={
         'msgTotal':msg_total,'msgGuest':msg_guest,'msgHotel':msg_hotel,'msgGuestPct':msg_pct,
@@ -9132,7 +9535,7 @@ with tab_ancillary:
                     journal_values=ar_journal_values,
                     stly_journal_values=ar_stly_journal_values,
                     messaging=ar_messaging,
-                    engagement=[],
+                    engagement=engagement_rows,
                 )
                 st.session_state['ar_monthly_output'] = ar_output
                 st.session_state['ar_monthly_filename'] = (
