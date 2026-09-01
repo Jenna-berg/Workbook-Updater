@@ -1316,8 +1316,12 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month
         g = wash.get("GRP") or {}
         p = wash.get("PRM") or {}
 
-        if not tot_rooms:
-            continue                      # nothing on the books for this month
+        # Zero is a real ROB value, not "missing data". A month with no rooms
+        # on the books must still write 0 to Rooms and Revenue so the workbook
+        # does not misleadingly retain blanks/stale values.
+        #
+        # _srp_seg() returns (0, 0.0) for a genuinely empty month, so do not
+        # skip merely because tot_rooms is zero.
 
         # The two reports have to describe the same hotel. Pick-up is a subset
         # of what is on the books, so it cannot exceed it — when it does, one
@@ -1468,8 +1472,17 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
         month_index = month - 1
         block_start = 4 + block_step * month_index
 
-        rev     = safe_float(row[5])
-        rms     = safe_float(row[1])
+        rev_raw = row[5]
+        rms_raw = row[1]
+        rev     = safe_float(rev_raw)
+        rms     = safe_float(rms_raw)
+
+        # Preserve an explicit 0 from the source as a literal zero in Excel.
+        # Only truly blank/unparseable source cells remain None.
+        if rev is None and str(rev_raw).strip() in {"0", "0.0", "0.00", "$0", "$0.00"}:
+            rev = 0.0
+        if rms is None and str(rms_raw).strip() in {"0", "0.0", "0.00"}:
+            rms = 0.0
         grp_pu  = safe_float(row[7])
         grp_npu = safe_float(row[8])
         grp_rvn = safe_float(row[9])
@@ -3072,6 +3085,67 @@ def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_
     return changes, warnings
 
 
+def _snt_rate_and_mlos_from_row(row):
+    """Read SNT rate + minimum-stay fields without relying on one exact header.
+
+    Different SNT exports have used headers such as Double, Double Rate, Rate,
+    BAR, Min Length of Stay, Minimum Length of Stay, and MLOS. Restrictions
+    could still work while the rate silently read None if only the rate header
+    changed, which is what happened on Brass Key.
+    """
+    def norm_header(v):
+        return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
+
+    rate = None
+    mlos = None
+
+    # Exact/common names first.
+    for key in ("Double", "Double Rate", "Rate", "BAR", "BAR Rate"):
+        if key in row.index:
+            v = safe_float(row.get(key))
+            if v is not None:
+                rate = v
+                break
+
+    for key in ("Min Length of Stay", "Minimum Length of Stay", "MLOS", "Min LOS"):
+        if key in row.index:
+            v = safe_float(row.get(key))
+            if v is not None:
+                mlos = v
+                break
+
+    # Fuzzy fallback for vendor-header variations.
+    if rate is None or mlos is None:
+        for col in row.index:
+            nh = norm_header(col)
+            val = row.get(col)
+
+            if rate is None:
+                is_rate = (
+                    nh in {"double", "doublerate", "rate", "bar", "barrate"}
+                    or ("double" in nh and "rate" in nh)
+                )
+                # Avoid things like "Rate Change" / "Average Rate".
+                if is_rate and "change" not in nh and "average" not in nh:
+                    v = safe_float(val)
+                    if v is not None:
+                        rate = v
+
+            if mlos is None:
+                is_mlos = (
+                    "minlengthofstay" in nh
+                    or "minimumlengthofstay" in nh
+                    or nh == "mlos"
+                    or "minlos" in nh
+                )
+                if is_mlos:
+                    v = safe_float(val)
+                    if v is not None:
+                        mlos = v
+
+    return rate, mlos
+
+
 def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
     today = datetime.date.today()
     # include previous month — final numbers arrive on the 1st of the following month
@@ -3122,25 +3196,27 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
             continue
 
         excel_row  = date_row_map[d]
-        double_val = safe_float(
-            row.get("Double",
-            row.get("Rate",
-            row.get("BAR", "")))
-        )
-        mlos_val = safe_float(
-            row.get("Min Length of Stay",
-            row.get("Minimum Length of Stay",
-            row.get("MLOS", "")))
-        )
+        double_val, mlos_val = _snt_rate_and_mlos_from_row(row)
 
-        if hotel_col:
-            skip = "formula" if is_formula(ws.cell(excel_row, hotel_col).value) else None
-            changes.append({"date": d, "row": excel_row, "col": hotel_col,
-                            "label": "Hotel Rate", "new_value": double_val, "skip_reason": skip})
-        if restric_col:
+        if hotel_col and double_val is not None:
+            existing = ws.cell(excel_row, hotel_col).value
+            skip = (
+                "formula"
+                if is_formula(existing) and "!" not in str(existing)
+                else None
+            )
+            changes.append({
+                "date": d, "row": excel_row, "col": hotel_col,
+                "label": "Hotel Rate (SNT)", "new_value": double_val,
+                "skip_reason": skip
+            })
+        if restric_col and mlos_val is not None:
             skip = "formula" if is_formula(ws.cell(excel_row, restric_col).value) else None
-            changes.append({"date": d, "row": excel_row, "col": restric_col,
-                            "label": "Restrictions (MLOS)", "new_value": mlos_val, "skip_reason": skip})
+            changes.append({
+                "date": d, "row": excel_row, "col": restric_col,
+                "label": "Restrictions (MLOS)", "new_value": mlos_val,
+                "skip_reason": skip
+            })
 
     return changes, warnings
 
@@ -3798,7 +3874,7 @@ PORTFOLIO_HOTELS = {
         "Brass Key":      ["BRASS"],
         "Long Beach":     ["LONG BEACH", "ALLEGRIA"],
         "Westerly":       ["WESTERLY", "PLEASANT VIEW"],
-        "Crown Point":    ["CROWN", "CROWNE"],
+        "Crowne Pointe":  ["CROWN", "CROWNE"],
         "Ashworth":       ["ASHWORTH", "HAMPTON BEACH"],
         "Anchor Inn":     ["ANCHOR"],
         "Surfside":       ["SURFSIDE"],
@@ -6955,6 +7031,133 @@ if st.session_state.get("view") == "admin_settings" and st.session_state.get("is
     render_admin_settings(_admin_svc, _users_file_id, _users_err)
     st.stop()
 
+def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
+    """Shared ROB new-month setup for Hilton and IHG.
+
+    Uses the exact same setup_new_rob_month() engine as Stay In Touch:
+      - finds/copies the ROB master
+      - carries prior-month / last-year values
+      - preserves each week tab's own as-of date for completed months
+      - rebuilds Pickup WoW formulas across every month/year
+      - leaves an undo snapshot
+
+    selected_hotels is [(display_name, drive_folder_id), ...].
+    """
+    if not selected_hotels:
+        return
+
+    setup_toggle = st.checkbox(
+        "Set up new month",
+        key=f"{key_prefix}_new_month",
+        help="Uses the same ROB month-setup logic as the Stay In Touch portfolio."
+    )
+    if not setup_toggle:
+        return
+
+    with st.container(border=True):
+        today = datetime.date.today()
+        cur_month = today.replace(day=1)
+        prev_month = (cur_month - datetime.timedelta(days=1)).replace(day=1)
+        next_month = (cur_month + datetime.timedelta(days=32)).replace(day=1)
+
+        options = {
+            prev_month.strftime("%B %Y"): prev_month,
+            cur_month.strftime("%B %Y"): cur_month,
+            next_month.strftime("%B %Y"): next_month,
+        }
+        labels = list(options.keys())
+        default_dt = next_month if today.day >= 22 else cur_month
+
+        sel = st.selectbox(
+            "Month to set up",
+            labels,
+            index=labels.index(default_dt.strftime("%B %Y")),
+            key=f"{key_prefix}_setup_month",
+        )
+        target_month = options[sel]
+
+        names = ", ".join(n for n, _ in selected_hotels)
+        st.caption(f"ROB setup will run for: **{names}**")
+
+        if st.button(
+            "Set Up New ROB",
+            key=f"{key_prefix}_setup_rob_btn",
+            type="primary",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            undo_items = []
+            successes = 0
+
+            for hotel_name, hotel_id in selected_hotels:
+                if not hotel_id:
+                    st.error(f"{hotel_name}: no Drive folder found.")
+                    continue
+                try:
+                    with st.spinner(f"Setting up {hotel_name} ROB..."):
+                        name, err, file_id, original = setup_new_rob_month(
+                            svc, hotel_id, hotel_name, target_month
+                        )
+
+                    if err and not name:
+                        st.error(f"{hotel_name}: {err}")
+                        continue
+
+                    if err:
+                        st.warning(f"{hotel_name}: {err}")
+
+                    if file_id and original is not None:
+                        undo_items.append({
+                            "file_id": file_id,
+                            "file_name": name,
+                            "bytes": original,
+                        })
+
+                    st.success(
+                        f"{hotel_name}: **{name}** ready for "
+                        f"{target_month:%B %Y}."
+                    )
+                    successes += 1
+                except Exception as e:
+                    st.error(f"{hotel_name}: ROB setup error — {e}")
+
+            if undo_items:
+                st.session_state[f"{key_prefix}_setup_rob_undo"] = undo_items
+
+            if successes:
+                st.info(
+                    "The same week-date carryover and Pickup WoW formula setup "
+                    "used for Stay In Touch was applied."
+                )
+
+        undo_key = f"{key_prefix}_setup_rob_undo"
+        if undo_key in st.session_state:
+            if st.button(
+                "↩ Reset ROB setup to original",
+                key=f"{key_prefix}_setup_rob_reset",
+                use_container_width=True,
+            ):
+                svc = get_drive_service()
+                errors = []
+                for item in st.session_state[undo_key]:
+                    try:
+                        drive_upload(
+                            svc,
+                            item["file_id"],
+                            item["bytes"],
+                            item["file_name"],
+                        )
+                    except Exception as e:
+                        errors.append(f"{item['file_name']}: {e}")
+
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    del st.session_state[undo_key]
+                    st.success("ROB workbook(s) restored to their original state.")
+
+
 def render_hilton_update(hotels):
     """Hilton portfolio run.
 
@@ -7005,6 +7208,9 @@ def render_hilton_update(hotels):
                  "ahead. Everything that far out is still on the books, so it "
                  "all lands on the OTB rows and none on the actuals.",
         )
+
+        if "ROB" in wb_sels and selected:
+            render_portfolio_rob_month_setup(selected, "hil")
 
         srp_file = st.file_uploader(
             "SRP Activity — all Hilton properties (one file)",
@@ -7309,6 +7515,12 @@ def render_ihg_update(hotels):
             key="ihg_fcst_next",
             help="Fills next month's Forecast workbook from the Business on the "
                  "Books daily rows. Needs that PDF.")
+
+        if "ROB" in wb_sels:
+            render_portfolio_rob_month_setup(
+                [(hotel_sel, id_map.get(hotel_sel, ""))],
+                "ihg",
+            )
 
     if not pdf_file:
         st.info("Upload the History and Forecast PDF to continue.")
