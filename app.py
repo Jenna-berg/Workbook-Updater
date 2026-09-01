@@ -4470,12 +4470,22 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
     ancillary_folders = []
     for f in folders:
         n = _ancillary_normalize_drive_name(f.get("name"))
-        if "ANCILLARY REVENUE FILES" in n:
+
+        # Portfolio folder naming varies slightly, but the full phrase
+        # "ANCILLARY REVENUE" must be present. Accept either:
+        #   - ANCILLARY REVENUE REPORTS
+        #   - ANCILLARY REVENUE FILES
+        # Matching is case/punctuation insensitive because names are normalized.
+        if (
+            "ANCILLARY REVENUE REPORTS" in n
+            or "ANCILLARY REVENUE FILES" in n
+        ):
             ancillary_folders.append(f)
 
     if not ancillary_folders:
         return None, (
-            f"{rev_name}: no 'M: ANCILLARY REVENUE FILES ...' folder was found."
+            f"{rev_name}: no folder containing 'Ancillary Revenue Reports' "
+            f"or 'Ancillary Revenue Files' was found."
         )
 
     ancillary_folders.sort(
