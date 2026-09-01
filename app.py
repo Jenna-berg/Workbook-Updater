@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import column_index_from_string, get_column_letter
 import io
 import csv
@@ -6177,309 +6178,509 @@ def _ar_clear_output_sheet(ws, max_row=260, max_col=17):
     ws._charts=[]
 
 
-def ancillary_render_report(template_bytes, property_name, property_key, report_month, main_rows, operational_rows, itemized_rows, upgrades, stly, variance_rows, staff_rows, messaging, engagement):
-    wb=openpyxl.load_workbook(io.BytesIO(template_bytes), data_only=False)
-    if 'Report Template' not in wb.sheetnames: raise ValueError('Template workbook is missing the Report Template sheet.')
-    template=wb['Report Template']
-    if 'Report' in wb.sheetnames: del wb['Report']
-    sh=wb.copy_worksheet(template); sh.title='Report'
-    # Remove template-era merges first. Dynamic sections are merged again as
-    # they are rendered; leaving Ashworth's fixed merges in place would swallow
-    # cells when another hotel's sections are longer (e.g. Allegria STLY).
+def ancillary_render_report(
+    template_bytes,
+    property_name,
+    property_key,
+    report_month,
+    main_rows,
+    operational_rows,
+    itemized_rows,
+    upgrades,
+    stly,
+    variance_rows,
+    staff_rows,
+    messaging,
+    engagement,
+):
+    """Render all hotels from one universal Report Template.
+
+    Direct Python translation of the Apps Script renderReport_() structure:
+      - A:J is cleared and rebuilt dynamically from style prototype rows.
+      - M:P keeps the fixed Messaging Overview template layout.
+      - Property differences remain in data/config rules, not formatting.
+    """
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule
+
+    wb = openpyxl.load_workbook(io.BytesIO(template_bytes), data_only=False)
+    if "Report Template" not in wb.sheetnames:
+        raise ValueError('Template workbook is missing the "Report Template" sheet.')
+
+    template = wb["Report Template"]
+    if "Report" in wb.sheetnames:
+        del wb["Report"]
+
+    sh = wb.copy_worksheet(template)
+    sh.title = "Report"
+
+    # Apps Script equivalent:
+    # A1:J250.breakApart().clearContent().clearFormat()
+    blank_style = copy(Workbook().active["A1"]._style)
+
+    # Only unmerge dynamic A:J. Do not destroy fixed Messaging Overview merges.
     for merged in list(sh.merged_cells.ranges):
-        sh.unmerge_cells(str(merged))
-    # clear copied Ashworth values; formatting is re-applied section-by-section
-    for row in sh.iter_rows(min_row=1,max_row=min(sh.max_row,260),min_col=1,max_col=17):
-        for cell in row: cell.value=None
-    sh._charts=[]
-    month_name=report_month.strftime('%B'); month_abbr=report_month.strftime('%b').upper(); year=report_month.year
-    short_prop=re.sub(r' by the Sea( Hotel)?$','',property_name,flags=re.I)
-    if property_key == 'pleasant view inn':
-        short_prop = 'Westerly'
-    left=1
-    _ar_copy_style_row(template,1,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=f'{short_prop} Upsell Overview - {month_name}'; left+=1
-    _ar_copy_style_row(template,2,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
-    _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=('Upsell Name' if property_key == 'pleasant view inn' else 'Name'); sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
-    for r in main_rows:
-        _ar_copy_style_row(template,4,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value='' if r.get('count') is None else r.get('count'); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value='' if r.get('average') is None else r.get('average'); left+=1
-    total_count=sum(_ar_num(r.get('count')) or 0 for r in main_rows if r.get('count') is not None); total_rev=sum(_ar_num(r.get('revenue')) or 0 for r in main_rows)
-    avg_rows=[r for r in main_rows if r.get('count') is not None and (_ar_num(r.get('count')) or 0)>0]; avg_den=sum(_ar_num(r.get('count')) or 0 for r in avg_rows); avg_num=sum(_ar_num(r.get('revenue')) or 0 for r in avg_rows)
-    _ar_copy_style_row(template,24,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='TOTALS'; sh.cell(left,3).value=total_count; sh.cell(left,4).value=total_rev; sh.cell(left,5).value=avg_num/avg_den if avg_den else 0; left+=1
-    _ar_copy_style_row(template,25,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value='STLY'; left+=1
-    if stly['sourceType']=='SNT':
-        _ar_copy_style_row(template,3,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Upsell Name'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average Revenue'; left+=1
-        for r in stly['rows']:
-            _ar_copy_style_row(template,4,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value='' if r.get('count') is None else r.get('count'); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value='' if r.get('average') is None else r.get('average'); left+=1
-        _ar_copy_style_row(template,24,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='TOTALS'; sh.cell(left,3).value=stly['totals'].get('count',0); sh.cell(left,4).value=stly['totals'].get('revenue',0); av=[r for r in stly['rows'] if r.get('average') not in (None,'')]; sh.cell(left,5).value=sum(_ar_num(r.get('average')) or 0 for r in av)/len(av) if av else 0; left+=1
-    else:
-        _ar_copy_style_row(template,26,sh,left,1,5); sh.cell(left,1).value='Name'; sh.cell(left,2).value='Revenue Requested $'; sh.cell(left,3).value='Revenue Approved $'; sh.cell(left,4).value='Revenue Denied $'; sh.cell(left,5).value='Revenue Expired $'; left+=1
-        for r in stly['rows']:
-            _ar_copy_style_row(template,27,sh,left,1,5); vals=[r['name'],r['requested'],r['approved'],r['denied'],r['expired']]
-            for c,v in enumerate(vals,1): sh.cell(left,c).value=v
-            left+=1
-        _ar_copy_style_row(template,43,sh,left,1,5); vals=['TOTALS',stly['totals']['requested'],stly['totals']['approved'],stly['totals']['denied'],stly['totals']['expired']]
-        for c,v in enumerate(vals,1): sh.cell(left,c).value=v
-        left+=1
-    _ar_copy_style_row(template,44,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value='Variance'; left+=1
-    _ar_copy_style_row(template,45,sh,left,1,5); sh.cell(left,1).value='Name'; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value='Total Revenue'; left+=1
-    for r in variance_rows:
-        _ar_copy_style_row(template,46,sh,left,1,5); sh.cell(left,1).value=r['name']; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=r['variance']; left+=1
-    _ar_copy_style_row(template,69,sh,left,1,5); sh.cell(left,1).value='TOTALS'; sh.merge_cells(start_row=left,start_column=2,end_row=left,end_column=4); sh.cell(left,2).value=sum(_ar_num(r['variance']) or 0 for r in variance_rows); left+=4
-    _ar_copy_style_row(template,72,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year; left+=1
-    _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=('Check In & Checkout Itemized' if property_key == 'pleasant view inn' else 'Early Check In & Late Checkout Itemized'); sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
-    for r in itemized_rows:
-        _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
-    if stly['sourceType']=='SNT' and stly.get('itemizedRows'):
-        left+=2; _ar_copy_style_row(template,72,sh,left,1,5); _ar_merge_name(sh,left); sh.cell(left,1).value=year-1; left+=1
-        _ar_copy_style_row(template,73,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value='Early Check In & Late Checkout Itemized'; sh.cell(left,3).value='Total Count'; sh.cell(left,4).value='Total Revenue'; sh.cell(left,5).value='Average revenue'; left+=1
-        for r in stly['itemizedRows']:
-            _ar_copy_style_row(template,74,sh,left,1,5); sh.merge_cells(start_row=left,start_column=1,end_row=left,end_column=2); sh.cell(left,1).value=r['name']; sh.cell(left,3).value=r.get('count',''); sh.cell(left,4).value=_ar_num(r.get('revenue')) or 0; sh.cell(left,5).value=r.get('average',''); left+=1
-    # middle + right stacks
-    if property_key == 'pleasant view inn':
-        # Match the completed July PVI/Westerly layout.
-
-        # Staff messaging at the top: G:H.
-        mid = 4
-        _ar_copy_style_row(template, 30, sh, mid, 7, 2)
-        sh.cell(mid, 7).value = 'Staff Name'
-        sh.cell(mid, 8).value = 'Messages'
-        mid += 1
-        for r in staff_rows:
-            _ar_copy_style_row(template, 31, sh, mid, 7, 2)
-            sh.cell(mid, 7).value = r['name']
-            sh.cell(mid, 8).value = r['messages']
-            mid += 1
-
-        # Room-upgrade production below staff messaging.
-        mid = max(mid + 2, 10)
-        _ar_copy_style_row(template, 13, sh, mid, 7, 3)
-        for i, v in enumerate(
-            ['Staff Name', 'Room Upgrades Produced', 'Total Revenue'],
-            7,
-        ):
-            sh.cell(mid, i).value = v
-        mid += 1
-        for r in upgrades['byStaff']:
-            _ar_copy_style_row(template, 14, sh, mid, 7, 3)
-            sh.cell(mid, 7).value = r['name']
-            sh.cell(mid, 8).value = r['count']
-            sh.cell(mid, 9).value = r['revenue']
-            mid += 1
-
-        # Room-level increase table.
-        mid = max(mid + 2, 20)
-        _ar_copy_style_row(template, 25, sh, mid, 7, 2)
-        sh.cell(mid, 7).value = 'Room Level Increase'
-        sh.cell(mid, 8).value = 'Count'
-        mid += 1
-        for r in upgrades['byLevel']:
-            _ar_copy_style_row(template, 26, sh, mid, 7, 2)
-            sh.cell(mid, 7).value = str(r['level']).replace('+', '') + '+'
-            sh.cell(mid, 8).value = r['count']
-            mid += 1
-
-        # Operational/non-ancillary fees shown separately.
-        if operational_rows:
-            mid += 2
-            _ar_copy_style_row(template, 3, sh, mid, 7, 4)
-            for i, v in enumerate(
-                ['Name', 'Total Count', 'Total Revenue', 'Average revenue'],
-                7,
-            ):
-                sh.cell(mid, i).value = v
-            mid += 1
-            for r in operational_rows:
-                _ar_copy_style_row(template, 4, sh, mid, 7, 4)
-                vals = [
-                    r['name'],
-                    r.get('count', ''),
-                    _ar_num(r.get('revenue')) or 0,
-                    r.get('average', ''),
-                ]
-                for i, v in enumerate(vals, 7):
-                    sh.cell(mid, i).value = v
-                mid += 1
-
-        # Messaging Overview in K:N, as in the completed July PVI report.
-        for rr in range(1, 41):
+        if merged.min_row <= 250 and merged.min_col <= 10 and merged.max_col >= 1:
             try:
-                _ar_copy_style_shifted(template, rr, 13, sh, rr, 11, 4)
+                sh.unmerge_cells(str(merged))
             except Exception:
                 pass
 
-        sh['K1'] = f'{short_prop} Messaging Overview - {month_name}'
-        sh['K2'] = year
-        sh['L22'] = month_abbr
-        sh['M22'] = 'STLY'
-        sh['N22'] = 'YoY'
+    # Clear content + formatting in the dynamic area, preserving dimensions.
+    for row in sh.iter_rows(min_row=1, max_row=250, min_col=1, max_col=10):
+        for cell in row:
+            cell.value = None
+            cell._style = copy(blank_style)
 
-        labels = [
-            'Total Messages',
-            '# of messages guest sent',
-            '# of messages hotel sent',
-            '% of your guests that sent a message',
-            'Response Rate',
-            'Average minutes to respond',
-            'Median minutes to respond',
+    # Clear month-specific right-side values but keep right-side formatting.
+    for cell_range in ("M6:O18", "M22:P28", "M31:N38", "M40:O60"):
+        for row in sh[cell_range]:
+            for cell in row:
+                cell.value = None
+
+    month_name = report_month.strftime("%B")
+    month_abbr = report_month.strftime("%b").upper()
+    year = report_month.year
+
+    short_prop = re.sub(
+        r" by the Sea( Hotel)?$",
+        "",
+        property_name,
+        flags=re.I,
+    )
+    # Keep the established display name, but not a separate template.
+    if property_key == "pleasant view inn":
+        short_prop = "Westerly"
+
+    def unavailable_fill(cell):
+        cell.fill = PatternFill(fill_type="solid", fgColor="CCCCCC")
+
+    # ============================================================
+    # LEFT SIDE
+    # ============================================================
+    left = 1
+
+    _ar_copy_style_row(template, 1, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = f"{short_prop} Upsell Overview - {month_name}"
+    left += 1
+
+    _ar_copy_style_row(template, 2, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = year
+    left += 1
+
+    _ar_copy_style_row(template, 3, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "Name"
+    sh.cell(left, 3).value = "Total Count"
+    sh.cell(left, 4).value = "Total Revenue"
+    sh.cell(left, 5).value = "Average revenue"
+    left += 1
+
+    for r in main_rows:
+        _ar_copy_style_row(template, 4, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = r["name"]
+
+        count_blank = r.get("count") is None or r.get("count") == ""
+        avg_blank = r.get("average") is None or r.get("average") == ""
+
+        sh.cell(left, 3).value = "" if count_blank else r.get("count")
+        sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+        sh.cell(left, 5).value = "" if avg_blank else r.get("average")
+
+        if count_blank:
+            unavailable_fill(sh.cell(left, 3))
+        if avg_blank:
+            unavailable_fill(sh.cell(left, 5))
+        left += 1
+
+    main_count = sum(_ar_num(r.get("count")) or 0 for r in main_rows)
+    main_revenue = sum(_ar_num(r.get("revenue")) or 0 for r in main_rows)
+    avg_rows = [
+        r for r in main_rows
+        if r.get("count") is not None and (_ar_num(r.get("count")) or 0) > 0
+    ]
+    avg_den = sum(_ar_num(r.get("count")) or 0 for r in avg_rows)
+    avg_num = sum(_ar_num(r.get("revenue")) or 0 for r in avg_rows)
+
+    _ar_copy_style_row(template, 24, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "TOTALS"
+    sh.cell(left, 3).value = main_count
+    sh.cell(left, 4).value = main_revenue
+    sh.cell(left, 5).value = avg_num / avg_den if avg_den else 0
+    left += 1
+
+    _ar_copy_style_row(template, 25, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = "STLY"
+    left += 1
+
+    if stly["sourceType"] == "SNT":
+        _ar_copy_style_row(template, 3, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "Upsell Name"
+        sh.cell(left, 3).value = "Total Count"
+        sh.cell(left, 4).value = "Total Revenue"
+        sh.cell(left, 5).value = "Average Revenue"
+        left += 1
+
+        for r in stly["rows"]:
+            _ar_copy_style_row(template, 4, sh, left, 1, 5)
+            sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+            sh.cell(left, 1).value = r["name"]
+
+            count_blank = r.get("count") is None or r.get("count") == ""
+            avg_blank = r.get("average") is None or r.get("average") == ""
+
+            sh.cell(left, 3).value = "" if count_blank else r.get("count")
+            sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+            sh.cell(left, 5).value = "" if avg_blank else r.get("average")
+
+            if count_blank:
+                unavailable_fill(sh.cell(left, 3))
+            if avg_blank:
+                unavailable_fill(sh.cell(left, 5))
+            left += 1
+
+        _ar_copy_style_row(template, 24, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "TOTALS"
+        sh.cell(left, 3).value = _ar_num(stly["totals"].get("count")) or 0
+        sh.cell(left, 4).value = _ar_num(stly["totals"].get("revenue")) or 0
+
+        avg_values = [
+            _ar_num(r.get("average"))
+            for r in stly["rows"]
+            if r.get("average") not in (None, "")
         ]
-        current = [
-            messaging.get(k, 0)
-            for k in [
-                'msgTotal', 'msgGuest', 'msgHotel', 'msgGuestPct',
-                'responseRate', 'avgResponse', 'medianResponse',
-            ]
-        ]
-        prior = [
-            messaging.get(k, 0)
-            for k in [
-                'stlyMsgTotal', 'stlyMsgGuest', 'stlyMsgHotel',
-                'stlyMsgGuestPct', 'stlyResponseRate',
-                'stlyAvgResponse', 'stlyMedianResponse',
-            ]
-        ]
-
-        for idx, label in enumerate(labels, 23):
-            sh.cell(idx, 11).value = label
-            sh.cell(idx, 12).value = current[idx - 23]
-            sh.cell(idx, 13).value = prior[idx - 23]
-            sh.cell(idx, 14).value = (
-                (current[idx - 23] or 0) - (prior[idx - 23] or 0)
-            )
-
-        sh['K32'] = 'Date'
-        sh['L32'] = 'Engagement Rate'
-        for i, (d, v) in enumerate(engagement[:8], 33):
-            sh.cell(i, 11).value = d
-            sh.cell(i, 12).value = v
-
-        for c in ['L26', 'M26', 'N26', 'L27', 'M27', 'N27']:
-            sh[c].number_format = '0.0%'
-        for i in range(33, 41):
-            sh.cell(i, 12).number_format = '0.0%'
-
-        # Remove generic right-side remnants.
-        for row in range(1, 45):
-            for col in range(15, 17):
-                sh.cell(row, col).value = None
+        avg_values = [v for v in avg_values if v is not None]
+        sh.cell(left, 5).value = sum(avg_values) / len(avg_values) if avg_values else 0
+        left += 1
 
     else:
-        # Generic portfolio layout.
-        mid = 3
-        _ar_copy_style_row(template, 3, sh, mid, 7, 4)
-        headers = ['Name', 'Total Count', 'Total Revenue', 'Average revenue']
-        for i, v in enumerate(headers, 7):
-            sh.cell(mid, i).value = v
+        _ar_copy_style_row(template, 26, sh, left, 1, 5)
+        for col, value in enumerate(
+            [
+                "Name",
+                "Revenue Requested $",
+                "Revenue Approved $",
+                "Revenue Denied $",
+                "Revenue Expired $",
+            ],
+            1,
+        ):
+            sh.cell(left, col).value = value
+        left += 1
+
+        for r in stly["rows"]:
+            _ar_copy_style_row(template, 27, sh, left, 1, 5)
+            for col, value in enumerate(
+                [r["name"], r["requested"], r["approved"], r["denied"], r["expired"]],
+                1,
+            ):
+                sh.cell(left, col).value = value
+            left += 1
+
+        _ar_copy_style_row(template, 43, sh, left, 1, 5)
+        for col, value in enumerate(
+            [
+                "TOTALS",
+                stly["totals"]["requested"],
+                stly["totals"]["approved"],
+                stly["totals"]["denied"],
+                stly["totals"]["expired"],
+            ],
+            1,
+        ):
+            sh.cell(left, col).value = value
+        left += 1
+
+    # Variance
+    _ar_copy_style_row(template, 44, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = "Variance"
+    left += 1
+
+    _ar_copy_style_row(template, 45, sh, left, 1, 5)
+    sh.cell(left, 1).value = "Name"
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+    sh.cell(left, 2).value = "Total Revenue"
+    left += 1
+
+    variance_start = left
+    for r in variance_rows:
+        _ar_copy_style_row(template, 46, sh, left, 1, 5)
+        sh.cell(left, 1).value = r["name"]
+        sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+        sh.cell(left, 2).value = _ar_num(r.get("variance")) or 0
+        left += 1
+    variance_end = left - 1
+
+    variance_total = sum(_ar_num(r.get("variance")) or 0 for r in variance_rows)
+    _ar_copy_style_row(template, 69, sh, left, 1, 5)
+    sh.cell(left, 1).value = "TOTALS"
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+    sh.cell(left, 2).value = variance_total
+    sh.cell(left, 2).number_format = '$#,##0.00;$(#,##0.00);$-'
+
+    sh.cell(left, 1).fill = PatternFill(fill_type="solid", fgColor="1C4587")
+    sh.cell(left, 1).font = copy(template.cell(69, 1).font)
+    sh.cell(left, 1).font = Font(
+        name=sh.cell(left, 1).font.name or "Arial",
+        size=sh.cell(left, 1).font.sz,
+        bold=True,
+        color="FFFFFF",
+    )
+    sh.cell(left, 1).alignment = Alignment(horizontal="center")
+
+    variance_total_fill = "EA9999" if variance_total < 0 else "B6D7A8"
+    for col in range(2, 6):
+        sh.cell(left, col).fill = PatternFill(fill_type="solid", fgColor=variance_total_fill)
+        base_font = sh.cell(left, col).font
+        sh.cell(left, col).font = Font(
+            name=base_font.name or "Arial",
+            size=base_font.sz,
+            bold=True,
+            color="000000",
+        )
+    left += 1
+
+    left += 3
+
+    # Current-year itemized section
+    _ar_copy_style_row(template, 72, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = year
+    left += 1
+
+    _ar_copy_style_row(template, 73, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "Early Check In & Late Checkout Itemized"
+    sh.cell(left, 3).value = "Total Count"
+    sh.cell(left, 4).value = "Total Revenue"
+    sh.cell(left, 5).value = "Average revenue"
+    left += 1
+
+    for r in itemized_rows:
+        _ar_copy_style_row(template, 74, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = r["name"]
+        sh.cell(left, 3).value = "" if r.get("count") is None else r.get("count")
+        sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+        sh.cell(left, 5).value = "" if r.get("average") is None else (_ar_num(r.get("average")) or 0)
+        left += 1
+
+    # STLY itemized section for SNT historical source
+    if stly["sourceType"] == "SNT" and stly.get("itemizedRows"):
+        left += 2
+
+        _ar_copy_style_row(template, 72, sh, left, 1, 5)
+        _ar_merge_name(sh, left, 1, 5)
+        sh.cell(left, 1).value = year - 1
+        left += 1
+
+        _ar_copy_style_row(template, 73, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "Early Check In & Late Checkout Itemized"
+        sh.cell(left, 3).value = "Total Count"
+        sh.cell(left, 4).value = "Total Revenue"
+        sh.cell(left, 5).value = "Average revenue"
+        left += 1
+
+        for r in stly["itemizedRows"]:
+            _ar_copy_style_row(template, 74, sh, left, 1, 5)
+            sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+            sh.cell(left, 1).value = r["name"]
+            sh.cell(left, 3).value = "" if r.get("count") is None else r.get("count")
+            sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+            sh.cell(left, 5).value = "" if r.get("average") is None else (_ar_num(r.get("average")) or 0)
+            left += 1
+
+    # ============================================================
+    # MIDDLE SIDE — universal independent dynamic stack
+    # ============================================================
+    mid = 3
+
+    _ar_copy_style_row(template, 3, sh, mid, 7, 4)
+    for col, value in enumerate(
+        ["Name", "Total Count", "Total Revenue", "Average revenue"],
+        7,
+    ):
+        sh.cell(mid, col).value = value
+    mid += 1
+
+    for r in operational_rows:
+        _ar_copy_style_row(template, 4, sh, mid, 7, 4)
+        for col, value in enumerate(
+            [
+                r["name"],
+                "" if r.get("count") is None else r.get("count"),
+                _ar_num(r.get("revenue")) or 0,
+                "" if r.get("average") is None else (_ar_num(r.get("average")) or 0),
+            ],
+            7,
+        ):
+            sh.cell(mid, col).value = value
         mid += 1
 
-        for r in operational_rows:
-            _ar_copy_style_row(template, 4, sh, mid, 7, 4)
-            vals = [
-                r['name'],
-                r.get('count', ''),
-                _ar_num(r.get('revenue')) or 0,
-                r.get('average', ''),
-            ]
-            for i, v in enumerate(vals, 7):
-                sh.cell(mid, i).value = v
-            mid += 1
+    mid += 3
 
-        mid += 3
-        _ar_copy_style_row(template, 13, sh, mid, 7, 3)
-        vals = ['Staff Name', 'Room Upgrades Produced', 'Revenue Produced']
-        for i, v in enumerate(vals, 7):
-            sh.cell(mid, i).value = v
+    _ar_copy_style_row(template, 13, sh, mid, 7, 3)
+    for col, value in enumerate(
+        ["Staff Name", "Room Upgrades Produced", "Revenue Produced"],
+        7,
+    ):
+        sh.cell(mid, col).value = value
+    mid += 1
+
+    for r in upgrades["byStaff"]:
+        _ar_copy_style_row(template, 14, sh, mid, 7, 3)
+        sh.cell(mid, 7).value = r["name"]
+        sh.cell(mid, 8).value = r["count"]
+        sh.cell(mid, 9).value = r["revenue"]
         mid += 1
 
-        for r in upgrades['byStaff']:
-            _ar_copy_style_row(template, 14, sh, mid, 7, 3)
-            sh.cell(mid, 7).value = r['name']
-            sh.cell(mid, 8).value = r['count']
-            sh.cell(mid, 9).value = r['revenue']
-            mid += 1
+    mid += 3
 
-        mid += 3
-        _ar_copy_style_row(template, 25, sh, mid, 7, 2)
-        sh.cell(mid, 7).value = 'Room Level Increase'
-        sh.cell(mid, 8).value = 'Count'
+    _ar_copy_style_row(template, 25, sh, mid, 7, 2)
+    sh.cell(mid, 7).value = "Room Level Increase"
+    sh.cell(mid, 8).value = "Count"
+    mid += 1
+
+    for r in upgrades["byLevel"]:
+        _ar_copy_style_row(template, 26, sh, mid, 7, 2)
+        level = str(r.get("level") or "")
+        match = re.match(r"^\+(\d+)$", level)
+        sh.cell(mid, 7).value = f"{match.group(1)}+" if match else level
+        sh.cell(mid, 8).value = r["count"]
         mid += 1
 
-        for r in upgrades['byLevel']:
-            _ar_copy_style_row(template, 26, sh, mid, 7, 2)
-            sh.cell(mid, 7).value = str(r['level']).replace('+', '') + '+'
-            sh.cell(mid, 8).value = r['count']
-            mid += 1
+    mid += 3
 
-        mid += 3
-        _ar_copy_style_row(template, 30, sh, mid, 7, 2)
-        sh.cell(mid, 7).value = 'Staff Name'
-        sh.cell(mid, 8).value = 'Messages'
+    _ar_copy_style_row(template, 30, sh, mid, 7, 2)
+    sh.cell(mid, 7).value = "Staff Name"
+    sh.cell(mid, 8).value = "Messages"
+    mid += 1
+
+    for r in staff_rows:
+        _ar_copy_style_row(template, 31, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = r["name"]
+        sh.cell(mid, 8).value = r["messages"]
         mid += 1
 
-        for r in staff_rows:
-            _ar_copy_style_row(template, 31, sh, mid, 7, 2)
-            sh.cell(mid, 7).value = r['name']
-            sh.cell(mid, 8).value = r['messages']
-            mid += 1
+    # ============================================================
+    # RIGHT SIDE — fixed universal Messaging Overview M:P
+    # ============================================================
+    sh["M1"] = f"{short_prop} Messaging Overview - {month_name}"
+    sh["M2"] = year
+    sh["M21"] = ""
+    sh["N21"] = f"{month_abbr} {year}"
+    sh["O21"] = "STLY"
+    sh["P21"] = "YoY"
 
-        # right KPI stack
-        sh['M1'] = f'{short_prop} Messaging Overview - {month_name}'
-        sh['M2'] = year
-        sh['N21'] = f'{month_abbr} {year}'
-        sh['O21'] = 'STLY'
-        sh['P21'] = 'YoY'
+    labels = [
+        "Total Messages",
+        "# of messages guest sent",
+        "# of messages hotel sent",
+        "% of your guests that sent a message",
+        "Response Rate",
+        "Average minutes to respond",
+        "Median minutes to respond",
+    ]
+    current = [
+        _ar_num(messaging.get("msgTotal")) or 0,
+        _ar_num(messaging.get("msgGuest")) or 0,
+        _ar_num(messaging.get("msgHotel")) or 0,
+        messaging.get("msgGuestPct", 0) or 0,
+        messaging.get("responseRate", 0) or 0,
+        _ar_num(messaging.get("avgResponse")) or 0,
+        _ar_num(messaging.get("medianResponse")) or 0,
+    ]
+    prior = [
+        _ar_num(messaging.get("stlyMsgTotal")) or 0,
+        _ar_num(messaging.get("stlyMsgGuest")) or 0,
+        _ar_num(messaging.get("stlyMsgHotel")) or 0,
+        messaging.get("stlyMsgGuestPct", 0) or 0,
+        messaging.get("stlyResponseRate", 0) or 0,
+        _ar_num(messaging.get("stlyAvgResponse")) or 0,
+        _ar_num(messaging.get("stlyMedianResponse")) or 0,
+    ]
 
-        labels = [
-            'Total Messages',
-            '# of messages guest sent',
-            '# of messages hotel sent',
-            '% of your guests that sent a message',
-            'Response Rate',
-            'Average minutes to respond',
-            'Median minutes to respond',
-        ]
-        current = [
-            messaging.get(k, 0)
-            for k in [
-                'msgTotal', 'msgGuest', 'msgHotel', 'msgGuestPct',
-                'responseRate', 'avgResponse', 'medianResponse',
-            ]
-        ]
-        prior = [
-            messaging.get(k, 0)
-            for k in [
-                'stlyMsgTotal', 'stlyMsgGuest', 'stlyMsgHotel',
-                'stlyMsgGuestPct', 'stlyResponseRate',
-                'stlyAvgResponse', 'stlyMedianResponse',
-            ]
-        ]
+    for i, label in enumerate(labels):
+        row = 22 + i
+        sh.cell(row, 13).value = label
+        sh.cell(row, 14).value = current[i]
+        sh.cell(row, 15).value = prior[i]
+        sh.cell(row, 16).value = current[i] - prior[i]
 
-        for idx, label in enumerate(labels, 22):
-            sh.cell(idx, 13).value = label
-            sh.cell(idx, 14).value = current[idx - 22]
-            sh.cell(idx, 15).value = prior[idx - 22]
-            sh.cell(idx, 16).value = (
-                (current[idx - 22] or 0) - (prior[idx - 22] or 0)
-            )
+    for row in range(22, 25):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0"
+    for row in range(25, 27):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0.0%"
+    for row in range(27, 29):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0.0"
 
-        sh['M30'] = 'Date'
-        sh['N30'] = 'Engagement Rate'
-        for i, (d, v) in enumerate(engagement[:8], 31):
-            sh.cell(i, 13).value = d
-            sh.cell(i, 14).value = v
+    for i, (d, rate) in enumerate(engagement[:8], start=31):
+        sh.cell(i, 13).value = d
+        sh.cell(i, 14).value = rate
+        sh.cell(i, 13).number_format = "m/d/yyyy"
+        sh.cell(i, 14).number_format = "0.0%"
 
-        sh['N25'].number_format = '0.0%'
-        sh['O25'].number_format = '0.0%'
-        sh['P25'].number_format = '0.0%'
-        sh['N26'].number_format = '0.0%'
-        sh['O26'].number_format = '0.0%'
-        sh['P26'].number_format = '0.0%'
-        for i in range(31, 39):
-            sh.cell(i, 14).number_format = '0.0%'
+    # ============================================================
+    # Conditional formatting
+    # ============================================================
+    sh.conditional_formatting = openpyxl.formatting.formatting.ConditionalFormattingList()
 
-    # Put Report immediately after Report Template for convenience.
-    wb._sheets.remove(sh); wb._sheets.insert(wb._sheets.index(template)+1,sh)
-    out=io.BytesIO(); wb.save(out); return out.getvalue()
+    green_fill = PatternFill(fill_type="solid", fgColor="B6D7A8")
+    red_fill = PatternFill(fill_type="solid", fgColor="EA9999")
 
+    if variance_end >= variance_start:
+        rng = f"B{variance_start}:E{variance_end}"
+        sh.conditional_formatting.add(
+            rng,
+            CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
+        )
+        sh.conditional_formatting.add(
+            rng,
+            CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
+        )
+
+    sh.conditional_formatting.add(
+        "P22:P26",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
+    )
+    sh.conditional_formatting.add(
+        "P22:P26",
+        CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
+    )
+    sh.conditional_formatting.add(
+        "P27:P28",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=red_fill),
+    )
+    sh.conditional_formatting.add(
+        "P27:P28",
+        CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
+    )
+
+    sh.freeze_panes = None
+
+    # Put Report immediately after Report Template.
+    try:
+        wb._sheets.remove(sh)
+        idx = wb._sheets.index(template)
+        wb._sheets.insert(idx + 1, sh)
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 def ancillary_build_monthly_report(template_bytes, property_name, report_month, addon_file, upsell_file, stly_addon_file=None, stly_upsell_file=None, canary_history_file=None, staff_file=None, journal_values=None, stly_journal_values=None, messaging=None, engagement=None):
     profile,key=ancillary_profile(property_name); journal_values=journal_values or []; stly_journal_values=stly_journal_values or []; messaging=messaging or {}; engagement=engagement or []
