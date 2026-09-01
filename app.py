@@ -6290,6 +6290,11 @@ def ancillary_render_report(
         sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
         sh.cell(left, 5).value = "" if avg_blank else r.get("average")
 
+        # Approved template rule: populated current-year metric cells are
+        # light gray. Dark gray is reserved only for unavailable/blank metrics.
+        light_gray = PatternFill(fill_type="solid", fgColor="EFEFEF")
+        for metric_col in (3, 4, 5):
+            sh.cell(left, metric_col).fill = copy(light_gray)
         if count_blank:
             unavailable_fill(sh.cell(left, 3))
         if avg_blank:
@@ -6406,7 +6411,7 @@ def ancillary_render_report(
 
     _ar_copy_style_row(template, 45, sh, left, 1, 5)
     sh.cell(left, 1).value = "Name"
-    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
     sh.cell(left, 2).value = "Total Revenue"
     left += 1
 
@@ -6414,7 +6419,7 @@ def ancillary_render_report(
     for r in variance_rows:
         _ar_copy_style_row(template, 46, sh, left, 1, 5)
         sh.cell(left, 1).value = r["name"]
-        sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+        sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
         sh.cell(left, 2).value = _ar_num(r.get("variance")) or 0
         left += 1
     variance_end = left - 1
@@ -6422,7 +6427,7 @@ def ancillary_render_report(
     variance_total = sum(_ar_num(r.get("variance")) or 0 for r in variance_rows)
     _ar_copy_style_row(template, 69, sh, left, 1, 5)
     sh.cell(left, 1).value = "TOTALS"
-    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=4)
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
     sh.cell(left, 2).value = variance_total
     sh.cell(left, 2).number_format = '$#,##0.00;$(#,##0.00);$-'
 
