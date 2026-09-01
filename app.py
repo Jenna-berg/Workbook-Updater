@@ -2789,49 +2789,287 @@ def _strategy_norm(v):
 
 
 def _strategy_hotel_aliases(hotel_name):
-    aliases = {_strategy_norm(hotel_name)}
+    """Return safe aliases for the selected Strategy hotel."""
+    base = _strategy_norm(hotel_name)
+    aliases = {base}
+
     for _portfolio, members in PORTFOLIO_HOTELS.items():
         for label, keywords in members.items():
-            if label == hotel_name:
-                aliases.add(_strategy_norm(label))
-                aliases.update(_strategy_norm(k) for k in keywords)
+            label_norm = _strategy_norm(label)
+            keyword_norms = {_strategy_norm(k) for k in keywords}
+
+            # The UI label may be shorter than the workbook header, e.g.
+            # "Middletown" vs "Inn at Middletown". Match the portfolio entry
+            # by containment as well as exact label equality.
+            belongs = (
+                label == hotel_name
+                or (base and (base in label_norm or label_norm in base))
+                or any(base and (base in k or k in base) for k in keyword_norms)
+            )
+            if belongs:
+                aliases.add(label_norm)
+                aliases.update(keyword_norms)
+
     return {a for a in aliases if len(a) >= 4}
 
 
 def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
-    """Map Rates/Restrictions to the selected hotel's header, never by position."""
-    aliases = _strategy_hotel_aliases(hotel_name)
-    def matches(v):
-        n = _strategy_norm(v)
-        return bool(n) and any(a in n or n in a for a in aliases)
+    """Find selected hotel's SNT Rate and Restrictions columns.
 
-    spans = []
+    Real SNT Strategy layout uses rows 1-4 as headers. Some labels are split
+    vertically, e.g. X3='Restric' and X4='tions'. The selected hotel's own
+    rate is the column headed by that hotel's name.
+    """
+    aliases = _strategy_hotel_aliases(hotel_name)
+    header_max_row = min(4, ws.max_row)
+
+    def col_header_text(col):
+        parts = []
+        for r in range(1, header_max_row + 1):
+            v = ws.cell(r, col).value
+            if v not in (None, ""):
+                parts.append(str(v).strip())
+        return " ".join(parts).strip()
+
+    def matches_hotel(value):
+        n = _strategy_norm(value)
+        return bool(n) and any(
+            a == n or a in n or n in a
+            for a in aliases
+        )
+
+    hotel_candidates = []
+    for c in range(1, ws.max_column + 1):
+        header = col_header_text(c)
+        if matches_hotel(header):
+            hotel_candidates.append((c, header))
+
+    # Merged hotel headings, if present.
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row > header_max_row:
+            continue
+        value = ws.cell(rng.min_row, rng.min_col).value
+        if matches_hotel(value):
+            for c in range(rng.min_col, rng.max_col + 1):
+                hotel_candidates.append((c, str(value or "").strip()))
+
+    if not hotel_candidates:
+        return None, None, (
+            f"Could not match selected hotel '{hotel_name}' to a Strategy Report header."
+        )
+
+    rate_col, matched_header = min(hotel_candidates, key=lambda x: x[0])
+
+    restriction_candidates = []
+    for c in range(1, ws.max_column + 1):
+        compact = re.sub(r"[^A-Z]", "", col_header_text(c).upper())
+        if "RESTRICTIONS" in compact or compact.startswith("RESTRIC"):
+            restriction_candidates.append(c)
+
+    restric_col = None
+    left = [c for c in restriction_candidates if c < rate_col]
+    if left:
+        restric_col = max(left)
+    elif restriction_candidates:
+        restric_col = min(
+            restriction_candidates,
+            key=lambda c: abs(c - rate_col)
+        )
+
+    diag = (
+        f"Matched '{hotel_name}' to Strategy header '{matched_header}' "
+        f"(rate col {rate_col}"
+        + (f", restrictions col {restric_col})"
+           if restric_col else ", restrictions not found)")
+    )
+    return rate_col, restric_col, diag
+
+
+def parse_lighthouse_rates_xlsx(file_bytes):
+    """Parse a Lighthouse rate-shopping workbook."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "Rates" not in wb.sheetnames:
+        raise ValueError("Lighthouse workbook does not contain a 'Rates' tab.")
+
+    ws = wb["Rates"]
+    header_row = None
+    date_col = None
+    for r in range(1, min(ws.max_row, 20) + 1):
+        row_vals = [str(ws.cell(r, c).value or "").strip().lower()
+                    for c in range(1, ws.max_column + 1)]
+        if "date" in row_vals and "day" in row_vals:
+            header_row = r
+            date_col = row_vals.index("date") + 1
+            break
+
+    if header_row is None or date_col is None:
+        raise ValueError(
+            "Could not locate the hotel/date header row on the Lighthouse 'Rates' tab."
+        )
+
+    hotel_cols = {}
+    for c in range(date_col + 2, ws.max_column + 1):
+        name = str(ws.cell(header_row, c).value or "").strip()
+        if not name:
+            continue
+        if _strategy_norm(name) in {"RATECHANGES", "GUESTS", "UPDATED", "MARKETDEMAND"}:
+            continue
+        hotel_cols[c] = name
+
+    if not hotel_cols:
+        raise ValueError("No hotel rate columns were found on the Lighthouse 'Rates' tab.")
+
+    rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        d = parse_any_date(ws.cell(r, date_col).value)
+        if not d:
+            continue
+        rates = {}
+        for c, hotel in hotel_cols.items():
+            val = ws.cell(r, c).value
+            if val is None or val == "":
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                rates[hotel] = float(val)
+            else:
+                rates[hotel] = str(val).strip()
+        rows.append({"date": d, "rates": rates})
+
+    return {"hotels": list(hotel_cols.values()), "rows": rows}
+
+
+def _strategy_name_tokens(value):
+    raw = re.findall(r"[A-Z0-9]+", str(value or "").upper())
+    stop = {"THE", "HOTEL", "INN", "AND", "BY", "AT", "OF", "SUITES", "RESORT", "SPA"}
+    return {t for t in raw if len(t) >= 3 and t not in stop}
+
+
+def _strategy_names_match(a, b):
+    na = _strategy_norm(a)
+    nb = _strategy_norm(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    ta = _strategy_name_tokens(a)
+    tb = _strategy_name_tokens(b)
+    if not ta or not tb:
+        return False
+    overlap = ta & tb
+    if len(overlap) >= 2:
+        return True
+    if len(ta) == 1 and len(tb) == 1 and ta == tb:
+        return True
+    return False
+
+
+def _strategy_header_candidates(ws):
+    out = []
     for rng in ws.merged_cells.ranges:
         if rng.min_row <= 4 and rng.max_row >= 1:
-            v = ws.cell(rng.min_row, rng.min_col).value
-            if matches(v):
-                spans.append((rng.min_col, rng.max_col, str(v or "")))
-    for r in range(1,5):
-        for c in range(1, ws.max_column+1):
-            v=ws.cell(r,c).value
-            if matches(v):
-                spans.append((c,c,str(v or "")))
-    if not spans:
-        return None, None, f"Could not match selected hotel '{hotel_name}' to a Strategy Report header."
+            label = str(ws.cell(rng.min_row, rng.min_col).value or "").strip()
+            if label:
+                out.append({"label": label, "start": rng.min_col, "end": rng.max_col})
+    for r in range(1, 5):
+        for c in range(1, ws.max_column + 1):
+            label = str(ws.cell(r, c).value or "").strip()
+            if label:
+                out.append({"label": label, "start": c, "end": c})
+    return out
 
-    start,end,label=max(spans,key=lambda x:(x[1]-x[0],-x[0]))
-    lo=max(1,start-2); hi=min(ws.max_column,end+3); center=(start+end)/2
-    rates=[]; restrictions=[]
-    for c in range(lo,hi+1):
-        hdr=' '.join(str(ws.cell(r,c).value or '') for r in range(2,5)).upper()
-        compact=hdr.replace(' ','').replace('-','')
-        if ('RATE' in hdr or 'DOUBLE' in hdr) and 'BALLROOM' not in hdr and 'COMP SET' not in hdr:
-            rates.append(c)
-        if 'REST' in compact and 'TION' in compact:
-            restrictions.append(c)
-    rate=min(rates,key=lambda c:abs(c-center)) if rates else None
-    restr=min(restrictions,key=lambda c:abs(c-center)) if restrictions else None
-    return rate, restr, f"Matched '{hotel_name}' to Strategy header '{label}'"
+
+def find_strategy_compset_rate_col(ws, lighthouse_hotel):
+    """Find an existing Strategy competitor rate column by hotel name.
+
+    Only rows 1-4 are considered header rows. Extra Lighthouse competitors
+    that are not already present in the Strategy Report are ignored.
+    """
+    header_max_row = min(4, ws.max_row)
+
+    def combined(col):
+        return " ".join(
+            str(ws.cell(r, col).value or "").strip()
+            for r in range(1, header_max_row + 1)
+            if ws.cell(r, col).value not in (None, "")
+        ).strip()
+
+    candidates = []
+    for c in range(1, ws.max_column + 1):
+        header = combined(c)
+        if not header:
+            continue
+        compact = re.sub(r"[^A-Z]", "", header.upper())
+        if compact.startswith("RESTRIC"):
+            continue
+        if _strategy_names_match(lighthouse_hotel, header):
+            candidates.append((c, header))
+
+    if not candidates:
+        return None, None
+
+    return min(candidates, key=lambda x: x[0])
+
+
+def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_name):
+    if not lighthouse_data:
+        return [], []
+
+    ws = wb[sheet_name]
+    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
+    if not date_row_map:
+        return [], ["Lighthouse: no Strategy Report date rows could be mapped."]
+
+    selected_aliases = _strategy_hotel_aliases(hotel_name)
+    changes = []
+    warnings = []
+    matched = {}
+    ignored = []
+
+    for lh_hotel in lighthouse_data.get("hotels", []):
+        lh_norm = _strategy_norm(lh_hotel)
+        if any(alias == lh_norm or alias in lh_norm or lh_norm in alias for alias in selected_aliases):
+            continue
+
+        rate_col, strategy_label = find_strategy_compset_rate_col(ws, lh_hotel)
+        if not rate_col:
+            ignored.append(lh_hotel)
+            continue
+        if rate_col in matched.values():
+            ignored.append(lh_hotel)
+            continue
+        matched[lh_hotel] = rate_col
+
+    for entry in lighthouse_data.get("rows", []):
+        d = entry.get("date")
+        if d not in date_row_map:
+            continue
+        excel_row = date_row_map[d]
+
+        for lh_hotel, value in entry.get("rates", {}).items():
+            rate_col = matched.get(lh_hotel)
+            if not rate_col:
+                continue
+            skip = "formula" if is_formula(ws.cell(excel_row, rate_col).value) else None
+            changes.append({
+                "date": d,
+                "row": excel_row,
+                "col": rate_col,
+                "label": f"Lighthouse Rate — {lh_hotel}",
+                "new_value": value,
+                "skip_reason": skip,
+            })
+
+    if matched:
+        warnings.append("Lighthouse compset matched: " + ", ".join(matched.keys()))
+    else:
+        warnings.append(
+            "Lighthouse compset: none of the competitor hotel names matched existing Strategy Report headers."
+        )
+    if ignored:
+        warnings.append(
+            "Lighthouse compset ignored (not already in Strategy Report or ambiguous): " + ", ".join(ignored)
+        )
+    return changes, warnings
 
 
 def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
@@ -2863,14 +3101,19 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
         warnings.append(f"Could not locate the Restrictions column for selected hotel '{hotel_name or 'Unknown'}'; restrictions will not be changed.")
 
     for _, row in rate_df.iterrows():
-        date_str = str(row.get("Date", "")).strip()
-        d = None
-        for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
+        # SNT exports can represent Date as M/D/YYYY, ISO text, an Excel
+        # date, or a pandas/datetime value depending on how the CSV was saved.
+        # Use the app-wide parser instead of accepting only three string formats.
+        raw_date = row.get("Date", "")
+        d = parse_any_date(raw_date)
+        if d is None:
+            # pandas may stringify Timestamp values with a time suffix.
             try:
-                d = datetime.datetime.strptime(date_str, fmt).date()
-                break
-            except ValueError:
-                continue
+                parsed = pd.to_datetime(raw_date, errors="coerce")
+                if not pd.isna(parsed):
+                    d = parsed.date()
+            except Exception:
+                d = None
         if d is None:
             continue
         if d < scope_start or d > scope_end:
@@ -2879,8 +3122,16 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
             continue
 
         excel_row  = date_row_map[d]
-        double_val = safe_float(row.get("Double", ""))
-        mlos_val   = safe_float(row.get("Min Length of Stay", ""))
+        double_val = safe_float(
+            row.get("Double",
+            row.get("Rate",
+            row.get("BAR", "")))
+        )
+        mlos_val = safe_float(
+            row.get("Min Length of Stay",
+            row.get("Minimum Length of Stay",
+            row.get("MLOS", "")))
+        )
 
         if hotel_col:
             skip = "formula" if is_formula(ws.cell(excel_row, hotel_col).value) else None
@@ -7822,8 +8073,23 @@ with tab_weekly:
         # applied to a different hotel.
         drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}")
         drive_rate_csv = None
+        drive_lighthouse_xlsx = None
         if "Strategy Report" in (wb_sels or []):
-            drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}")
+            drive_rate_csv = st.file_uploader(
+                "CSV — SNT Rates & Restrictions",
+                type=["csv"],
+                key=f"drive_rate_csv_{hotel_sel}",
+            )
+            drive_lighthouse_xlsx = st.file_uploader(
+                "Optional — Lighthouse Compset Rates (.xlsx)",
+                type=["xlsx"],
+                key=f"drive_lighthouse_{hotel_sel}",
+                help=(
+                    "Optional for SNT hotels that use Lighthouse. The selected "
+                    "hotel's own rate still comes from SNT; Lighthouse only fills "
+                    "competitors already listed in the Strategy Report."
+                ),
+            )
         drive_npu_compare_csv = None
         if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
             drive_npu_compare_csv = st.file_uploader(
@@ -8022,7 +8288,17 @@ with tab_weekly:
 
 
 
-    def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False, npu_compare_df=None):
+    def build_all_plans(
+        svc,
+        hotel_sel,
+        hotel_id,
+        wb_sels,
+        df,
+        rate_df,
+        forecast_next_month=False,
+        npu_compare_df=None,
+        lighthouse_data=None,
+    ):
         today = datetime.date.today()
         current_month = today.replace(day=1)
         all_plans = {}
@@ -8118,9 +8394,18 @@ with tab_weekly:
                                                        ly_wb=None)
                 warnings = []
                 if rate_df is not None:
-                    rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet, hotel_name=hotel_sel)
-                    changes  += rate_changes
+                    rate_changes, rate_warnings = build_rates_change_plan(
+                        rate_df, wb, sheet, hotel_name=hotel_sel
+                    )
+                    changes += rate_changes
                     warnings += rate_warnings
+
+                if lighthouse_data is not None:
+                    lh_changes, lh_warnings = build_lighthouse_compset_change_plan(
+                        lighthouse_data, wb, sheet, hotel_sel
+                    )
+                    changes += lh_changes
+                    warnings += lh_warnings
             else:  # Forecast — current month (no Month Ending Forecast fill here)
                 avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
                 auto     = first_unhighlighted_forecast_sheet(wb, avail)
@@ -8271,8 +8556,15 @@ with tab_weekly:
                 svc = get_drive_service()
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                lighthouse_data = (
+                    parse_lighthouse_rates_xlsx(drive_lighthouse_xlsx.read())
+                    if drive_lighthouse_xlsx else None
+                )
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
-                st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                st.session_state["drive_plans"] = build_all_plans(
+                    svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
+                    df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                )
                 st.session_state["drive_hotel_sel"] = hotel_sel
             except Exception as e:
                 st.error(f"Drive error: {e}")
@@ -8314,10 +8606,17 @@ with tab_weekly:
                 svc = get_drive_service()
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                lighthouse_data = (
+                    parse_lighthouse_rates_xlsx(drive_lighthouse_xlsx.read())
+                    if drive_lighthouse_xlsx else None
+                )
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
                 with st.spinner("Updating workbooks in Google Drive..."):
-                    all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
-                    saved, errors   = apply_and_upload(svc, all_plans)
+                    all_plans = build_all_plans(
+                        svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
+                        df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                    )
+                    saved, errors = apply_and_upload(svc, all_plans)
                 for name in saved:
                     st.success(f"Saved **{name}** to Google Drive.")
                 for err in errors:
