@@ -13,7 +13,7 @@ import hashlib
 import json
 import bcrypt
 from pathlib import Path
-from copy import copy
+from copy import copy, deepcopy
 from xml.sax.saxutils import escape
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -2027,6 +2027,22 @@ def detect_strategy_columns(ws):
         else:
             col_map[field] = None  # will surface as a warning, not a crash
 
+    # Casino Ballroom is a special two-column section on Ashworth/Hampton.
+    casino_cols = []
+    for c, (r3v, r4v) in headers.items():
+        combined = f"{r3v} {r4v}".upper()
+        if "CASINO" in combined and "BALLROOM" in combined:
+            casino_cols.append(c)
+
+    if casino_cols:
+        casino_cols = sorted(set(casino_cols))
+        col_map["casino_ballroom"] = casino_cols[0]
+        if len(casino_cols) >= 2:
+            col_map["casino_ballroom_ly"] = casino_cols[1]
+        else:
+            next_col = casino_cols[0] + 1
+            col_map["casino_ballroom_ly"] = next_col if next_col <= max_col else None
+
     return col_map
 
 
@@ -2413,122 +2429,96 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
 
 
 def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
-    """Read all LY source fields + comp set TY col from an in-memory workbook.
-    Returns {this_year_date: {field: value}} (dates shifted to match TY sheet's year).
+    """Read prior-year Strategy values and align them to TY by weekday.
 
-    Robust to year mismatches in LY file (e.g., AUG2025 file has 2024 dates due to
-    copy/paste error). Detects target year from TY sheet and shifts LY dates accordingly.
+    Portfolio-wide STLY rule: a TY date receives the value from the nearest
+    date in the prior calendar year that falls on the SAME weekday.
+    Example: Tue 09/01/2026 <- Tue 09/02/2025.
     """
     if sheet_name not in ly_wb.sheetnames:
         return {}
 
-    # Detect target year from TY sheet if provided, otherwise infer from LY year + 1
-    # For fiscal year files (Aug-Jul), use the LAST date to get the correct year,
-    # not the first date (e.g., AUG2026 starts 2026-08-01 but ends 2027-07-31, so target_year=2027)
-    target_year = None
+    ly_ws = ly_wb[sheet_name]
+    ly_col_map = detect_strategy_columns(ly_ws)
+    ly_date_map = build_date_row_map(
+        ly_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
+    )
+    if not ly_date_map:
+        return {}
+
+    ty_date_map = {}
     if ty_wb and sheet_name in ty_wb.sheetnames:
-        ty_ws = ty_wb[sheet_name]
-        ty_date_col = detect_date_column(ty_ws, wb=ty_wb)
-        # Scan to find last date in column
-        last_date_year = None
-        for r in range(ty_ws.max_row, 4, -1):
-            v = ty_ws.cell(r, ty_date_col).value
-            if isinstance(v, datetime.datetime):
-                last_date_year = v.year
-                break
-            elif isinstance(v, datetime.date):
-                last_date_year = v.year
-                break
-        if last_date_year and last_date_year >= 2025:
-            target_year = last_date_year
+        ty_date_map = build_date_row_map(
+            ty_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
+        )
 
-    # If target_year not detected, infer from LY source file's max year
-    if not target_year:
-        ws = ly_wb[sheet_name]
-        max_year = None
-        for col in range(1, ws.max_column + 1):
-            for row in range(5, min(50, ws.max_row + 1)):
-                v = ws.cell(row, col).value
-                if isinstance(v, datetime.datetime):
-                    if max_year is None or v.year > max_year:
-                        max_year = v.year
-                elif isinstance(v, datetime.date):
-                    if max_year is None or v.year > max_year:
-                        max_year = v.year
-        if max_year:
-            target_year = max_year + 1
-
-    ws = ly_wb[sheet_name]
-    col_map  = detect_strategy_columns(ws)
-
-    # For LY extraction in multi-year files, use the HIGHEST year-labeled date column.
-    # AUG2025 has: col 1 labeled "2024" (old), col 3 labeled "2025" (current)
-    # We want the "2025" dates (col 3) for extraction.
-    # Find the highest year label in row 4 and use its date column.
-    date_col = detect_date_column(ws, wb=ly_wb)  # Default: column 3 (2025 TY)
-
-    # Look for year labels in row 4 and find the highest year
-    max_year_in_file = None
-    max_year_col = None
-    for col in range(1, ws.max_column + 1):
-        cell_val = ws.cell(4, col).value
-        if isinstance(cell_val, (int, float)):
-            year_val = int(cell_val)
-            if year_val >= 2020 and (max_year_in_file is None or year_val > max_year_in_file):
-                max_year_in_file = year_val
-                max_year_col = col
-
-    # If we found a year label, use the date column for that year
-    if max_year_col:
-        for test_col in [max_year_col, max_year_col + 1]:  # Year label might be in col, date in col+1
-            if test_col <= ws.max_column:
-                test_val = ws.cell(5, test_col).value
-                if isinstance(test_val, (datetime.datetime, datetime.date)):
-                    date_col = test_col
+    if not ty_date_map:
+        # Defensive fallback for callers without TY workbook context.
+        for src_date in ly_date_map:
+            try:
+                nominal = datetime.date(src_date.year + 1, src_date.month, src_date.day)
+            except ValueError:
+                nominal = datetime.date(src_date.year + 1, 2, 28)
+            for offset in range(-3, 4):
+                candidate = nominal + datetime.timedelta(days=offset)
+                if candidate.weekday() == src_date.weekday():
+                    ty_date_map[candidate] = None
                     break
 
-    comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
-
+    comp_ty_col, _ = detect_comp_set_columns(ly_ws, ly_col_map)
+    source_dates = sorted(ly_date_map.keys())
     out = {}
-    for r in range(5, ws.max_row + 1):
-        v = ws.cell(r, date_col).value
-        if isinstance(v, datetime.datetime): d = v.date()
-        elif isinstance(v, datetime.date):   d = v
-        else: continue
 
-        # Shift to target year, applying DOW adjustment (-1 day for non-leap year).
-        # CRITICAL: Only subtract the -1 day if it doesn't cross a month boundary.
-        # At year/month boundaries (e.g., Jan 1), -1 day crosses to previous month/year
-        # and breaks the date matching. In those cases, use the date as-is.
+    for ty_date in sorted(ty_date_map.keys()):
+        prior_year = ty_date.year - 1
         try:
-            # Shift to target year and apply -1 day for DOW alignment.
-            # This matches day-of-week across years (Mon 2025 → Mon 2026).
-            # Example: 2025-08-02 (Fri) → 2026-08-01 (Fri)
-            base_date = datetime.date(d.year + 1, d.month, d.day)
-            this_year = base_date - datetime.timedelta(days=1)
+            nominal = datetime.date(prior_year, ty_date.month, ty_date.day)
         except ValueError:
-            # Feb 29 in non-leap year: use Feb 28 instead
-            if d.month == 2 and d.day == 29:
-                base_date = datetime.date(d.year + 1, 2, 28)
-                this_year = base_date - datetime.timedelta(days=1)
-            else:
-                # Other date error: skip this row
-                continue
+            nominal = datetime.date(prior_year, 2, 28)
 
+        candidates = [
+            d for d in source_dates
+            if d.year == prior_year
+            and d.weekday() == ty_date.weekday()
+            and abs((d - nominal).days) <= 7
+        ]
+        if candidates:
+            src_date = min(candidates, key=lambda d: (abs((d - nominal).days), d))
+        else:
+            # If the source workbook has a bad printed year, preserve weekday
+            # alignment and choose the nearest month/day as a fallback.
+            candidates = [d for d in source_dates if d.weekday() == ty_date.weekday()]
+            if not candidates:
+                continue
+            src_date = min(
+                candidates,
+                key=lambda d: (
+                    abs(d.month - nominal.month) * 31 + abs(d.day - nominal.day),
+                    abs(d.year - prior_year),
+                ),
+            )
+
+        src_row = ly_date_map[src_date]
         row_data = {}
-        # Read from TY columns — for SR LY extraction, this year's TY becomes next year's LY
         for ly_dest, ty_src in LY_FROM_TY.items():
-            src_col = col_map.get(ty_src)
-            if src_col:
-                val = ws.cell(r, src_col).value
-                if val is not None and not is_formula(val):
-                    row_data[ly_dest] = safe_float(val)
-        if comp_ty_col:
-            val = ws.cell(r, comp_ty_col).value
+            src_col = ly_col_map.get(ty_src)
+            if not src_col:
+                continue
+            val = ly_ws.cell(src_row, src_col).value
             if val is not None and not is_formula(val):
-                row_data["comp_set_ly"] = val  # preserve text values like "Sold out", "LOS2"
+                if ly_dest == "casino_ballroom_ly":
+                    row_data[ly_dest] = val
+                else:
+                    row_data[ly_dest] = safe_float(val)
+
+        if comp_ty_col:
+            val = ly_ws.cell(src_row, comp_ty_col).value
+            if val is not None and not is_formula(val):
+                row_data["comp_set_ly"] = val
+
         if row_data:
-            out[this_year] = row_data
+            out[ty_date] = row_data
+
     return out
 
 
@@ -2580,10 +2570,31 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
         if src_sheet:
             prev_otb_map = _extract_otb_trans_by_date(prev_month_wb, src_sheet, scope_start)
 
-    # LY data — every week, from last year's same month/week tab (already in memory)
+    # LY data — every week, aligned by weekday rather than calendar date.
     ly_data = {}
     if ly_wb:
         ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=wb)
+
+    # Ashworth Casino Ballroom TY/current events carry forward week-over-week.
+    # Prior-year Casino events are sourced separately from ly_wb above.
+    casino_prev_map = {}
+    is_ashworth_sheet = "ASHWORTH" in _strategy_norm(ws["A1"].value)
+    if is_ashworth_sheet and sheet_name in STRATEGY_SHEETS:
+        sheet_idx = STRATEGY_SHEETS.index(sheet_name)
+        if sheet_idx > 0:
+            prev_sheet_name = STRATEGY_SHEETS[sheet_idx - 1]
+            if prev_sheet_name in wb.sheetnames:
+                prev_ws_same_month = wb[prev_sheet_name]
+                prev_cols = detect_strategy_columns(prev_ws_same_month)
+                prev_casino_col = prev_cols.get("casino_ballroom")
+                if prev_casino_col:
+                    prev_date_rows = build_date_row_map(
+                        wb, prefer_sheet=prev_sheet_name, fallback_to_wkone=False
+                    )
+                    for prev_date, prev_row in prev_date_rows.items():
+                        val = prev_ws_same_month.cell(prev_row, prev_casino_col).value
+                        if val is not None and not is_formula(val):
+                            casino_prev_map[prev_date] = val
 
     changes = []
 
@@ -2666,7 +2677,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             })
 
     # ── Drive-sourced columns (run every time, no CSV needed) ─────────────────
-    all_dates = set(date_row_map.keys()) & (set(prev_otb_map) | set(ly_data))
+    all_dates = set(date_row_map.keys()) & (set(prev_otb_map) | set(ly_data) | set(casino_prev_map))
     for d in sorted(all_dates):
         if d < scope_start or d > scope_end:
             continue
@@ -2681,6 +2692,15 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 "label": "OTB Lst Wek", "new_value": prev_otb_map[d], "skip_reason": skip,
             })
 
+        # Ashworth Casino Ballroom TY/current event from the prior week tab.
+        casino_ty_col = col_map.get("casino_ballroom")
+        if casino_ty_col and d in casino_prev_map:
+            changes.append({
+                "date": d, "row": excel_row, "col": casino_ty_col,
+                "label": "Casino Ballroom TY (week-over-week)",
+                "new_value": casino_prev_map[d], "skip_reason": None,
+            })
+
         # LY columns
         if d in ly_data:
             row_ly = ly_data[d]
@@ -2691,6 +2711,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 ("trans_rev_ly",   "LY Trans Rev"),
                 ("grp_rev_ly",     "GRP LY Rev"),
                 ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+                ("casino_ballroom_ly", "Casino Ballroom LY"),
             ]:
                 dest_col = col_map.get(ly_field)
                 if dest_col and ly_field in row_ly:
@@ -2718,6 +2739,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             ("trans_rev_ly",   "LY Trans Rev"),
             ("grp_rev_ly",     "GRP LY Rev"),
             ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+            ("casino_ballroom_ly", "Casino Ballroom LY"),
         ]
         for d, excel_row in date_row_map.items():
             if d < scope_start or d > scope_end:
@@ -2851,6 +2873,33 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
             a == n or a in n or n in a
             for a in aliases
         )
+
+    # Ashworth/Hampton has a Casino Ballroom block before its far-right
+    # rate-shopping section. Its own SNT rate belongs in the exact ASH column.
+    sheet_title = _strategy_norm(ws["A1"].value)
+    requested = _strategy_norm(hotel_name)
+    is_ashworth = (
+        "ASHWORTH" in sheet_title
+        or "ASHWORTH" in requested
+        or "HAMPTON" in requested
+    )
+    if is_ashworth:
+        rate_col = None
+        for c in range(1, ws.max_column + 1):
+            hdr = " ".join(
+                str(ws.cell(r, c).value).strip()
+                for r in range(1, header_max_row + 1)
+                if ws.cell(r, c).value not in (None, "")
+            )
+            if _strategy_norm(hdr) == "ASH":
+                rate_col = c
+                break
+        restric_col = _find_restrictions_col(ws)
+        if rate_col:
+            return rate_col, restric_col, (
+                f"Matched Ashworth Strategy rate to ASH column "
+                f"(rate col {rate_col}, restrictions col {restric_col})"
+            )
 
     hotel_candidates = []
     for c in range(1, ws.max_column + 1):
@@ -7071,6 +7120,39 @@ def ancillary_render_report(
         CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
     )
 
+    # Clone the approved charts from Report Template. copy_worksheet() does not
+    # copy chart objects, so explicitly deep-copy and repoint each source range.
+    sh._charts = []
+
+    def _ar_chart_title_text(chart):
+        try:
+            return chart.title.tx.rich.p[0].r[0].t or ""
+        except Exception:
+            return ""
+
+    def _ar_set_chart_series_range(chart, cat_formula, val_formula):
+        if not getattr(chart, "ser", None):
+            return
+        ser = chart.ser[0]
+        if getattr(ser, "cat", None) is not None:
+            if getattr(ser.cat, "strRef", None) is not None:
+                ser.cat.strRef.f = cat_formula
+            elif getattr(ser.cat, "numRef", None) is not None:
+                ser.cat.numRef.f = cat_formula
+        if getattr(ser, "val", None) is not None and getattr(ser.val, "numRef", None) is not None:
+            ser.val.numRef.f = val_formula
+
+    for template_chart in template._charts:
+        chart = deepcopy(template_chart)
+        title = _ar_chart_title_text(chart).strip().lower()
+        if "engagement rate" in title:
+            _ar_set_chart_series_range(chart, "'Report'!$M$31:$M$38", "'Report'!$N$31:$N$38")
+        elif "common guest" in title:
+            _ar_set_chart_series_range(chart, "'Report'!$M$6:$M$13", "'Report'!$N$6:$N$13")
+        elif "operational concerns" in title:
+            _ar_set_chart_series_range(chart, "'Report'!$M$40:$M$44", "'Report'!$N$40:$N$44")
+        sh._charts.append(chart)
+
     sh.freeze_panes = None
 
     # Put Report immediately after Report Template.
@@ -10148,51 +10230,6 @@ with tab_ancillary:
         key="ar_monthly_report_month",
     )
     ar_month_dt = datetime.datetime(ar_month_date.year, ar_month_date.month, 1)
-
-    # Verify the Drive destination before the user fills out the full report.
-    test_drive_col, _ = st.columns([2, 3])
-    with test_drive_col:
-        if st.button(
-            "Test Drive Location",
-            key="ar_test_drive_location",
-            use_container_width=True,
-        ):
-            try:
-                svc = get_drive_service()
-                discovered = dict(get_hotels_from_drive())
-                drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(ar_key)
-                hotel_id = discovered.get(drive_label, "")
-
-                if not drive_label:
-                    raise ValueError(
-                        f"No Drive hotel mapping is configured for {ar_property}."
-                    )
-                if not hotel_id:
-                    raise ValueError(
-                        f"Could not find {drive_label}'s Revenue Reports folders "
-                        "with the current Drive connection."
-                    )
-
-                target, target_err = ancillary_find_drive_report(
-                    svc,
-                    hotel_id,
-                    drive_label,
-                    ar_month_dt,
-                )
-                if target_err or not target:
-                    raise ValueError(
-                        target_err or "Ancillary Drive report not found."
-                    )
-
-                st.success("Drive location found.")
-                st.info(
-                    f"Revenue Reports: **{target['revenue_folder_name']}**\n\n"
-                    f"Ancillary folder: **{target['folder_name']}**\n\n"
-                    f"Workbook: **{target['file_name']}**"
-                )
-
-            except Exception as e:
-                st.error(f"Drive location test failed: {e}")
 
     local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
     ar_template_upload = None
