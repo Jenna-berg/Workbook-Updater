@@ -2778,9 +2778,135 @@ def apply_strategy_changes(wb, sheet_name, changes):
 
 
 def parse_rate_csv(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8-sig")
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    """Parse StayNTouch Rates & Restrictions from CSV or XLSX.
+
+    Handles title/metadata rows above the real header, variable-width metadata,
+    and common CSV delimiters. The true header is detected before pandas reads
+    the table, preventing metadata rows from hiding the Date/Rate columns.
+    """
+    if not file_bytes:
+        return pd.DataFrame()
+
+    def norm(v):
+        return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
+
+    def looks_like_header(values):
+        vals = [norm(v) for v in values if str(v or "").strip()]
+        if not vals:
+            return False
+
+        has_date = any(
+            v in {"date", "staydate", "businessdate", "arrivaldate"}
+            or v.endswith("date")
+            for v in vals
+        )
+        has_rate_or_restriction = any(
+            (
+                v in {
+                    "double", "doublerate", "doubleoccupancy",
+                    "doubleoccupancyrate", "rate", "roomrate",
+                    "bar", "barrate", "baserate", "sellrate",
+                    "2guests", "2guestrate",
+                    "mlos", "minlos", "minstay", "minimumstay",
+                    "minlengthofstay", "minimumlengthofstay",
+                }
+                or ("double" in v and ("rate" in v or "occupancy" in v))
+                or ("lengthofstay" in v)
+            )
+            for v in vals
+        )
+        return has_date and has_rate_or_restriction
+
+    def clean_df(df):
+        df.columns = [
+            re.sub(r"\s+", " ", str(c or "")).strip()
+            for c in df.columns
+        ]
+        keep_cols = [
+            c for c in df.columns
+            if c and not str(c).lower().startswith("unnamed:")
+        ]
+        df = df.loc[:, keep_cols]
+        return df.dropna(how="all").reset_index(drop=True)
+
+    # XLSX export
+    if file_bytes[:4] == b"PK\x03\x04":
+        raw = pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=object)
+        header_idx = None
+        for i in range(min(len(raw), 30)):
+            if looks_like_header(raw.iloc[i].tolist()):
+                header_idx = i
+                break
+        if header_idx is None:
+            raise ValueError(
+                "Could not locate the Date / Rate header row in the "
+                "Rates & Restrictions workbook."
+            )
+        df = pd.read_excel(
+            io.BytesIO(file_bytes),
+            header=header_idx,
+            dtype=object,
+        )
+        return clean_df(df)
+
+    # CSV/text export
+    decoded = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            decoded = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        decoded = file_bytes.decode("utf-8", errors="replace")
+
+    lines = decoded.splitlines()
+    best = None
+
+    # Use Python's csv reader for header detection so variable-width metadata
+    # rows do not interfere with finding the real table header.
+    for sep in (",", "\t", ";", "|"):
+        header_idx = None
+        for i, line in enumerate(lines[:30]):
+            try:
+                row = next(csv.reader([line], delimiter=sep))
+            except Exception:
+                continue
+            if looks_like_header(row):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        table_text = "\n".join(lines[header_idx:])
+        try:
+            parsed = pd.read_csv(
+                io.StringIO(table_text),
+                header=0,
+                dtype=str,
+                sep=sep,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        except Exception:
+            continue
+
+        score = len([
+            c for c in parsed.columns
+            if str(c or "").strip()
+            and not str(c).lower().startswith("unnamed:")
+        ])
+        if best is None or score > best[0]:
+            best = (score, parsed)
+
+    if best is None:
+        raise ValueError(
+            "Could not locate the Date / Rate header row in the "
+            "Rates & Restrictions CSV."
+        )
+
+    return clean_df(best[1])
 
 
 def find_header_col(ws, keyword, header_rows=(2, 3, 4)):
@@ -3229,36 +3355,83 @@ def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_
     return changes, warnings
 
 
-def _snt_rate_and_mlos_from_row(row):
-    """Read SNT rate + minimum-stay fields without relying on one exact header.
+def _snt_rate_numeric(value):
+    """Parse SNT numeric fields, including currency-formatted rates."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        return float(value)
 
-    Different SNT exports have used headers such as Double, Double Rate, Rate,
-    BAR, Min Length of Stay, Minimum Length of Stay, and MLOS. Restrictions
-    could still work while the rate silently read None if only the rate header
-    changed, which is what happened on Brass Key.
-    """
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "n/a", "na", "-", "--"}:
+        return None
+
+    negative = s.startswith("(") and s.endswith(")")
+    s = (
+        s.replace("$", "")
+         .replace(",", "")
+         .replace("%", "")
+         .replace("(", "")
+         .replace(")", "")
+         .strip()
+    )
+    try:
+        val = float(s)
+        return -val if negative else val
+    except ValueError:
+        return None
+
+
+def _snt_rate_and_mlos_from_row(row):
+    """Read selected-hotel rate + MLOS from StayNTouch R&R exports."""
     def norm_header(v):
         return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
 
     rate = None
     mlos = None
 
-    # Exact/common names first.
-    for key in ("Double", "Double Rate", "Rate", "BAR", "BAR Rate"):
+    rate_exact = (
+        "Double",
+        "Double Rate",
+        "Double Occupancy",
+        "Double Occupancy Rate",
+        "Rate",
+        "Room Rate",
+        "BAR",
+        "BAR Rate",
+        "Base Rate",
+        "Sell Rate",
+        "2 Guests",
+        "2 Guest Rate",
+    )
+    mlos_exact = (
+        "Min Length of Stay",
+        "Minimum Length of Stay",
+        "Minimum Stay",
+        "Min Stay",
+        "MLOS",
+        "Min LOS",
+    )
+
+    for key in rate_exact:
         if key in row.index:
-            v = safe_float(row.get(key))
+            v = _snt_rate_numeric(row.get(key))
             if v is not None:
                 rate = v
                 break
 
-    for key in ("Min Length of Stay", "Minimum Length of Stay", "MLOS", "Min LOS"):
+    for key in mlos_exact:
         if key in row.index:
-            v = safe_float(row.get(key))
+            v = _snt_rate_numeric(row.get(key))
             if v is not None:
                 mlos = v
                 break
 
-    # Fuzzy fallback for vendor-header variations.
     if rate is None or mlos is None:
         for col in row.index:
             nh = norm_header(col)
@@ -3266,12 +3439,21 @@ def _snt_rate_and_mlos_from_row(row):
 
             if rate is None:
                 is_rate = (
-                    nh in {"double", "doublerate", "rate", "bar", "barrate"}
-                    or ("double" in nh and "rate" in nh)
+                    nh in {
+                        "double", "doublerate", "doubleoccupancy",
+                        "doubleoccupancyrate", "rate", "roomrate",
+                        "bar", "barrate", "baserate", "sellrate",
+                        "2guests", "2guest", "2guestrate",
+                    }
+                    or ("double" in nh and ("rate" in nh or "occupancy" in nh))
                 )
-                # Avoid things like "Rate Change" / "Average Rate".
-                if is_rate and "change" not in nh and "average" not in nh:
-                    v = safe_float(val)
+                if (
+                    is_rate
+                    and "change" not in nh
+                    and "average" not in nh
+                    and "avg" not in nh
+                ):
+                    v = _snt_rate_numeric(val)
                     if v is not None:
                         rate = v
 
@@ -3279,11 +3461,13 @@ def _snt_rate_and_mlos_from_row(row):
                 is_mlos = (
                     "minlengthofstay" in nh
                     or "minimumlengthofstay" in nh
+                    or "minimumstay" in nh
+                    or "minstay" in nh
                     or nh == "mlos"
                     or "minlos" in nh
                 )
                 if is_mlos:
-                    v = safe_float(val)
+                    v = _snt_rate_numeric(val)
                     if v is not None:
                         mlos = v
 
@@ -3307,16 +3491,29 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
 
     changes = []
     warnings = []
+
+    # Standalone mode may not pass hotel_name; infer it from the workbook title.
+    effective_hotel_name = hotel_name or str(ws["A1"].value or "").strip()
+
     hotel_col = restric_col = None
-    if hotel_name:
-        hotel_col, restric_col, diag = find_strategy_hotel_rate_restriction_cols(ws, hotel_name)
+    if effective_hotel_name:
+        hotel_col, restric_col, diag = find_strategy_hotel_rate_restriction_cols(
+            ws,
+            effective_hotel_name,
+        )
         warnings.append(diag)
     else:
-        warnings.append("No hotel name supplied for Rates & Restrictions mapping.")
+        warnings.append(
+            "Could not identify the selected hotel for Rates & Restrictions mapping."
+        )
     if not hotel_col:
-        warnings.append(f"Could not locate the Rate column for selected hotel '{hotel_name or 'Unknown'}'; rates will not be changed.")
+        warnings.append(f"Could not locate the Rate column for selected hotel '{effective_hotel_name or 'Unknown'}'; rates will not be changed.")
     if not restric_col:
-        warnings.append(f"Could not locate the Restrictions column for selected hotel '{hotel_name or 'Unknown'}'; restrictions will not be changed.")
+        warnings.append(f"Could not locate the Restrictions column for selected hotel '{effective_hotel_name or 'Unknown'}'; restrictions will not be changed.")
+
+    usable_date_rows = 0
+    usable_rate_rows = 0
+    usable_restriction_rows = 0
 
     for _, row in rate_df.iterrows():
         # SNT exports can represent Date as M/D/YYYY, ISO text, an Excel
@@ -3340,7 +3537,13 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
             continue
 
         excel_row  = date_row_map[d]
+        usable_date_rows += 1
         double_val, mlos_val = _snt_rate_and_mlos_from_row(row)
+
+        if double_val is not None:
+            usable_rate_rows += 1
+        if mlos_val is not None:
+            usable_restriction_rows += 1
 
         if hotel_col and double_val is not None:
             existing = ws.cell(excel_row, hotel_col).value
@@ -3361,6 +3564,25 @@ def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
                 "label": "Restrictions (MLOS)", "new_value": mlos_val,
                 "skip_reason": skip
             })
+
+    if rate_df is not None and len(rate_df):
+        warnings.append(
+            "Rates & Restrictions parsed: "
+            f"{len(rate_df)} source rows · "
+            f"{usable_date_rows} dates matched this Strategy tab · "
+            f"{usable_rate_rows} usable rates · "
+            f"{usable_restriction_rows} usable restrictions."
+        )
+        if usable_date_rows == 0:
+            warnings.append(
+                "Rates & Restrictions: none of the source dates matched "
+                "the dates on this Strategy tab."
+            )
+        elif usable_rate_rows == 0:
+            warnings.append(
+                "Rates & Restrictions: dates matched, but no usable rate "
+                "values were found in the source."
+            )
 
     return changes, warnings
 
@@ -9379,7 +9601,11 @@ if test_mode:
         with col_a:
             csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv", "xlsx"], key="str_csv")
         with col_b:
-            rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
+            rate_file2 = st.file_uploader(
+                "Upload Rates & Restrictions",
+                type=["csv", "xlsx"],
+                key="str_rate",
+            )
     
         col_c, col_d = st.columns(2)
         with col_c:
@@ -9787,8 +10013,8 @@ with tab_weekly:
         drive_lighthouse_xlsx = None
         if "Strategy Report" in (wb_sels or []):
             drive_rate_csv = st.file_uploader(
-                "CSV — SNT Rates & Restrictions",
-                type=["csv"],
+                "SNT Rates & Restrictions",
+                type=["csv", "xlsx"],
                 key=f"drive_rate_csv_{hotel_sel}",
             )
             drive_lighthouse_xlsx = st.file_uploader(
