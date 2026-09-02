@@ -3073,6 +3073,79 @@ def find_strategy_compset_rate_col(ws, lighthouse_hotel):
     return min(candidates, key=lambda x: x[0])
 
 
+
+# Lighthouse competitor destinations that have been validated against a
+# corrected Strategy workbook.
+#
+# Key = selected Strategy property (normalized)
+# Values = (Lighthouse source-name fragment, Strategy header fragment)
+#
+# Properties not listed here continue to use the generic existing-header
+# matcher, so this Plymouth correction does not change other hotels.
+LIGHTHOUSE_VALIDATED_COMPSET_MAP = {
+    "HOTEL1620": [
+        ("BESTWESTERN", "BESTWESTERN"),
+    ],
+}
+
+
+def _find_strategy_header_col_by_fragment(ws, fragment):
+    fragment = _strategy_norm(fragment)
+    header_max_row = min(4, ws.max_row)
+
+    for c in range(1, ws.max_column + 1):
+        header = " ".join(
+            str(ws.cell(r, c).value or "").strip()
+            for r in range(1, header_max_row + 1)
+            if ws.cell(r, c).value not in (None, "")
+        ).strip()
+        if not header:
+            continue
+
+        compact = _strategy_norm(header)
+        if compact.startswith("RESTRIC"):
+            continue
+
+        if fragment and fragment in compact:
+            return c, header
+
+    return None, None
+
+
+def _validated_lighthouse_matches(ws, lighthouse_data, hotel_name):
+    """Return explicit Lighthouse->Strategy column matches when configured."""
+    prop = _strategy_norm(hotel_name)
+    rules = LIGHTHOUSE_VALIDATED_COMPSET_MAP.get(prop)
+    if not rules:
+        return None
+
+    matched = {}
+    ignored = []
+
+    for lh_hotel in lighthouse_data.get("hotels", []):
+        lh_norm = _strategy_norm(lh_hotel)
+        target_fragment = None
+
+        for source_fragment, strategy_fragment in rules:
+            if _strategy_norm(source_fragment) in lh_norm:
+                target_fragment = strategy_fragment
+                break
+
+        if not target_fragment:
+            ignored.append(lh_hotel)
+            continue
+
+        rate_col, strategy_label = _find_strategy_header_col_by_fragment(
+            ws, target_fragment
+        )
+        if not rate_col:
+            ignored.append(lh_hotel)
+            continue
+
+        matched[lh_hotel] = rate_col
+
+    return matched, ignored
+
 def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_name):
     if not lighthouse_data:
         return [], []
@@ -3085,22 +3158,38 @@ def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_
     selected_aliases = _strategy_hotel_aliases(hotel_name)
     changes = []
     warnings = []
-    matched = {}
-    ignored = []
 
-    for lh_hotel in lighthouse_data.get("hotels", []):
-        lh_norm = _strategy_norm(lh_hotel)
-        if any(alias == lh_norm or alias in lh_norm or lh_norm in alias for alias in selected_aliases):
-            continue
+    validated = _validated_lighthouse_matches(
+        ws, lighthouse_data, hotel_name
+    )
 
-        rate_col, strategy_label = find_strategy_compset_rate_col(ws, lh_hotel)
-        if not rate_col:
-            ignored.append(lh_hotel)
-            continue
-        if rate_col in matched.values():
-            ignored.append(lh_hotel)
-            continue
-        matched[lh_hotel] = rate_col
+    if validated is not None:
+        # For validated properties, use only the explicitly approved
+        # Lighthouse destinations from the corrected Strategy workbook.
+        matched, ignored = validated
+    else:
+        matched = {}
+        ignored = []
+
+        for lh_hotel in lighthouse_data.get("hotels", []):
+            lh_norm = _strategy_norm(lh_hotel)
+            if any(
+                alias == lh_norm or alias in lh_norm or lh_norm in alias
+                for alias in selected_aliases
+            ):
+                # Selected hotel's own rate belongs to SNT, never Lighthouse.
+                continue
+
+            rate_col, strategy_label = find_strategy_compset_rate_col(
+                ws, lh_hotel
+            )
+            if not rate_col:
+                ignored.append(lh_hotel)
+                continue
+            if rate_col in matched.values():
+                ignored.append(lh_hotel)
+                continue
+            matched[lh_hotel] = rate_col
 
     for entry in lighthouse_data.get("rows", []):
         d = entry.get("date")
@@ -3123,7 +3212,12 @@ def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_
             })
 
     if matched:
-        warnings.append("Lighthouse compset matched: " + ", ".join(matched.keys()))
+        prefix = (
+            "Lighthouse validated compset matched: "
+            if _validated_lighthouse_matches(ws, lighthouse_data, hotel_name) is not None
+            else "Lighthouse compset matched: "
+        )
+        warnings.append(prefix + ", ".join(matched.keys()))
     else:
         warnings.append(
             "Lighthouse compset: none of the competitor hotel names matched existing Strategy Report headers."
@@ -5416,25 +5510,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     folder_diagnostic = f"Revenue Reports folder: {rev_name}; Month folder: {month_name}"
 
     # ── Find or copy the file ─────────────────────────────────────────────────
-    # Diagnostic: list every file in month_id whose name contains "ROB" —
-    # confirmed real risk this session (Wolfeboro's duplicate-named folders)
-    # that two files with the same display name could sit in the same
-    # folder, with drive_find_file silently picking one while a human
-    # browsing to the file by name lands on the other.
+    # Fast path: skip extra duplicate-file diagnostic Drive query.
     dup_check_warnings = []
-    try:
-        dup_q = ("'%s' in parents and trashed = false and name contains 'ROB'") % month_id
-        dup_files = service.files().list(
-            q=dup_q, fields="files(id,name)", pageSize=20,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute().get("files", [])
-        if len(dup_files) > 1:
-            dup_check_warnings.append(
-                f"Multiple files matching 'ROB' found in the target month folder: "
-                + ", ".join(f"'{f['name']}' (id: {f['id']})" for f in dup_files)
-            )
-    except Exception:
-        pass
 
     existing_id, existing_name = drive_find_file(service, "ROB", month_id)
     is_fresh_copy = False
@@ -5459,6 +5536,10 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         except Exception as e:
             return None, str(e), None, None
 
+    _cache_drive_workbook_resolution(
+        hotel_id, hotel_name, "ROB", target_month, new_file_id, new_file_name
+    )
+
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
@@ -5477,8 +5558,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     ] + dup_check_warnings
 
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
-    prev_result, prev_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                                     month_date=prev_month_dt)
+    prev_result, prev_err = _resolve_drive_workbook_session_cached(
+        service, hotel_id, hotel_name, "ROB", prev_month_dt
+    )
     prev_wb = None
     prev_wb_formulas = None
     if prev_result:
@@ -5493,8 +5575,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
 
     ly_month_dt = target_month.replace(year=target_month.year - 1)
-    ly_result, ly_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                                month_date=ly_month_dt)
+    ly_result, ly_err = _resolve_drive_workbook_session_cached(
+        service, hotel_id, hotel_name, "ROB", ly_month_dt
+    )
     ly_wb = None
     if ly_result:
         warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: {ly_result[1]}")
@@ -5791,6 +5874,10 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     # Check if SR already exists in that folder
     existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
     if existing_id and "master" not in existing_name.lower():
+        _cache_drive_workbook_resolution(
+            hotel_id, hotel_name, "Strategy Report",
+            target_month, existing_id, existing_name
+        )
         return existing_name, None  # already set up
 
     # Find master
@@ -5809,9 +5896,16 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
 
     new_file_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
     try:
-        _, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+        created_id, created_name = drive_copy_file(
+            service, master_id, new_file_name, month_id
+        )
     except Exception as e:
         return None, str(e)
+
+    _cache_drive_workbook_resolution(
+        hotel_id, hotel_name, "Strategy Report",
+        target_month, created_id, created_name
+    )
     return created_name, None
 
 
@@ -6102,12 +6196,63 @@ def restructure_sr_dates(wb, target_month):
                 pass
 
 
+def _resolve_drive_workbook_session_cached(
+    svc, hotel_id, hotel_name, wb_type, month_date, force_refresh=False
+):
+    month_key = (
+        month_date.strftime("%Y-%m")
+        if isinstance(month_date, (datetime.date, datetime.datetime))
+        else str(month_date)
+    )
+    cache_key = (str(hotel_id), str(hotel_name), str(wb_type), month_key)
+    cache = None
+    try:
+        cache = st.session_state.setdefault("_drive_workbook_resolution_cache", {})
+        if not force_refresh and cache_key in cache:
+            item = cache[cache_key]
+            result = tuple(item["result"]) if item.get("result") else None
+            return result, item.get("error")
+    except Exception:
+        pass
+
+    result, err = resolve_drive_workbook(
+        svc, hotel_id, hotel_name, wb_type, month_date=month_date
+    )
+    if cache is not None:
+        cache[cache_key] = {
+            "result": list(result) if result else None,
+            "error": err,
+        }
+    return result, err
+
+
+def _cache_drive_workbook_resolution(
+    hotel_id, hotel_name, wb_type, month_date, file_id, file_name
+):
+    try:
+        cache = st.session_state.setdefault("_drive_workbook_resolution_cache", {})
+        cache_key = (
+            str(hotel_id),
+            str(hotel_name),
+            str(wb_type),
+            month_date.strftime("%Y-%m"),
+        )
+        cache[cache_key] = {
+            "result": [file_id, file_name],
+            "error": None,
+        }
+    except Exception:
+        pass
+
+
 def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_only=True):
     """Download and parse a workbook from Drive. Returns openpyxl.Workbook or None.
     data_only=True (default) returns cached cell values — use for reference workbooks.
     data_only=False preserves formulas — use for workbooks we intend to write back.
     """
-    result, err = resolve_drive_workbook(svc, hotel_id, hotel_name, wb_type, month_date=month_date)
+    result, err = _resolve_drive_workbook_session_cached(
+        svc, hotel_id, hotel_name, wb_type, month_date
+    )
     if err or not result:
         return None
     try:
@@ -6782,14 +6927,6 @@ def ancillary_render_report(
             sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
             sh.cell(left, 5).value = "" if avg_blank else r.get("average")
 
-            # Match the current-year metric formatting exactly: every populated
-            # metric cell gets the approved light gray fill, while genuinely
-            # unavailable/blank metrics are dark gray. This is especially
-            # important for SNT STLY rows (e.g. Provincetown Inn) where Journal
-            # replacement rows intentionally have no count/average values.
-            light_gray = PatternFill(fill_type="solid", fgColor="EFEFEF")
-            for metric_col in (3, 4, 5):
-                sh.cell(left, metric_col).fill = copy(light_gray)
             if count_blank:
                 unavailable_fill(sh.cell(left, 3))
             if avg_blank:
@@ -7130,9 +7267,6 @@ def ancillary_render_report(
 
     # Clone the approved charts from Report Template. copy_worksheet() does not
     # copy chart objects, so explicitly deep-copy and repoint each source range.
-    # Some older/property-specific template copies contain zero or only a subset
-    # of the chart objects; build any missing standard charts so every report
-    # arrives with the same three chart placeholders already in place.
     sh._charts = []
 
     def _ar_chart_title_text(chart):
@@ -7153,57 +7287,16 @@ def ancillary_render_report(
         if getattr(ser, "val", None) is not None and getattr(ser.val, "numRef", None) is not None:
             ser.val.numRef.f = val_formula
 
-    copied_chart_kinds = set()
     for template_chart in template._charts:
         chart = deepcopy(template_chart)
         title = _ar_chart_title_text(chart).strip().lower()
         if "engagement rate" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$31:$M$38", "'Report'!$N$31:$N$38")
-            copied_chart_kinds.add("engagement")
         elif "common guest" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$6:$M$13", "'Report'!$N$6:$N$13")
-            copied_chart_kinds.add("guest")
         elif "operational concerns" in title:
             _ar_set_chart_series_range(chart, "'Report'!$M$40:$M$44", "'Report'!$N$40:$N$44")
-            copied_chart_kinds.add("operational")
         sh._charts.append(chart)
-
-    # Fallback chart construction. These are only used when an incoming template
-    # is missing one of the approved chart objects; when the template has the
-    # chart, its existing formatting is preserved via deepcopy above.
-    from openpyxl.chart import LineChart, PieChart, BarChart, Reference
-
-    if "engagement" not in copied_chart_kinds:
-        chart = LineChart()
-        chart.title = "Engagement Rate"
-        chart.y_axis.title = "Engagement Rate"
-        chart.height = 5.0
-        chart.width = 20.0
-        chart.add_data(Reference(sh, min_col=14, min_row=31, max_row=38), titles_from_data=False)
-        chart.set_categories(Reference(sh, min_col=13, min_row=31, max_row=38))
-        chart.anchor = "L29"
-        sh.add_chart(chart)
-
-    if "guest" not in copied_chart_kinds:
-        chart = PieChart()
-        chart.title = "Common Guest Conversation Topics"
-        chart.height = 10.2
-        chart.width = 20.3
-        chart.add_data(Reference(sh, min_col=14, min_row=6, max_row=13), titles_from_data=False)
-        chart.set_categories(Reference(sh, min_col=13, min_row=6, max_row=13))
-        chart.anchor = "L3"
-        sh.add_chart(chart)
-
-    if "operational" not in copied_chart_kinds:
-        chart = BarChart()
-        chart.type = "bar"
-        chart.title = "Recurring Operational Concerns"
-        chart.height = 9.4
-        chart.width = 20.2
-        chart.add_data(Reference(sh, min_col=14, min_row=40, max_row=44), titles_from_data=False)
-        chart.set_categories(Reference(sh, min_col=13, min_row=40, max_row=44))
-        chart.anchor = "M39"
-        sh.add_chart(chart)
 
     sh.freeze_panes = None
 
@@ -8673,12 +8766,8 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
             # Step 1 — locate or create the target workbook.
             is_fresh_copy = False
             with st.spinner("Step 1 / 3 — locating or creating Strategy workbook..."):
-                existing, find_err = resolve_drive_workbook(
-                    svc,
-                    hotel_id,
-                    hotel_name,
-                    "Strategy Report",
-                    month_date=target_month,
+                existing, find_err = _resolve_drive_workbook_session_cached(
+                    svc, hotel_id, hotel_name, "Strategy Report", target_month
                 )
 
                 if existing:
@@ -8758,12 +8847,8 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
 
             # Step 3 — populate all week tabs.
             with st.spinner("Step 3 / 3 — preparing all Strategy week tabs..."):
-                result, err = resolve_drive_workbook(
-                    svc,
-                    hotel_id,
-                    hotel_name,
-                    "Strategy Report",
-                    month_date=target_month,
+                result, err = _resolve_drive_workbook_session_cached(
+                    svc, hotel_id, hotel_name, "Strategy Report", target_month
                 )
                 if err or not result:
                     st.error(f"Cannot open Strategy workbook: {err}")
@@ -9819,8 +9904,10 @@ with tab_weekly:
                         # Step 1 — ensure the file exists; skip copy if it's already there
                         is_fresh_copy = False
                         with st.spinner("Step 1 / 3 — locating or creating workbook..."):
-                            existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                                  "Strategy Report", month_date=setup_month_dt)
+                            existing, find_err = _resolve_drive_workbook_session_cached(
+                                svc, hotel_id_nm, hotel_sel,
+                                "Strategy Report", setup_month_dt
+                            )
                             if existing:
                                 st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
                             else:
@@ -9855,8 +9942,10 @@ with tab_weekly:
 
                         # Step 3 — populate all 5 weeks
                         with st.spinner("Step 3 / 3 — populating all weeks..."):
-                            result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                                 "Strategy Report", month_date=setup_month_dt)
+                            result, err = _resolve_drive_workbook_session_cached(
+                                svc, hotel_id_nm, hotel_sel,
+                                "Strategy Report", setup_month_dt
+                            )
                             if err:
                                 st.error(f"Cannot open new workbook: {err}")
                                 st.stop()
