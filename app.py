@@ -12152,3 +12152,4 @@ with tab_projection:
 # only the open section reaches the page. Must stay the last statement in the
 # file — anything added after it would render into the void.
 _offstage.empty()
+
