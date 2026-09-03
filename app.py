@@ -7241,6 +7241,13 @@ ANCILLARY_RULES = {
         ],
         'exclude': [],
     },
+    'harbor hotel provincetown': {
+        'operational': [],
+        'itemized': [
+            'Priority Morning Check-In (10:00 AM)',
+        ],
+        'exclude': [],
+    },
 
 }
 
@@ -7265,6 +7272,21 @@ ANCILLARY_YOY_ALIASES = {
         ('Pet Fee','Pet Accommodation'),('Rollaway Bed','Extra twin bed $25.00 per day'),
         ('Very Late Check Out','Very Late Checkout'),('Bottle of Prosecco','Bottle of Sparkling Wine'),
         ('Bottle or Red Wine','Bottle of Red Wine'),('All American Bucket of Beer','All American Beach Beer Bucket')],
+    'harbor hotel provincetown': [
+        # Combined Journal ECI/LCO line versus the four historical Canary timing products.
+        ('Early Check In / Late Checkout','Early Check-in'),
+        ('Early Check In / Late Checkout','Very Early Check-in'),
+        ('Early Check In / Late Checkout','Late Checkout'),
+        ('Early Check In / Late Checkout','Very Late Checkout'),
+
+        # Renamed products / room-upgrade labels.
+        ('Pet Fee','Pet Accommodation'),
+        ('Premium Bayview 2 Doubles','Premium Bay View Room with Two Double Beds'),
+        ('Courtyard 2 Queens with Patio/Balcony','Courtyard Queen with Patio/Balcony'),
+        ('Courtyard Patio Suite','Courtyard Suite with Patio or Balcony'),
+        ('Bayview 2 Doubles','Bay View with Two Double Beds'),
+        ('Bayview King','Bay View King'),
+    ],
 }
 
 
@@ -7400,7 +7422,9 @@ def ancillary_parse_addon(raw, property_key):
             r'\bearly\s+(?:check\s*-?\s*in|arrival)\b'
             r'|\blate\s+(?:check\s*-?\s*out|checkout|departure)\b'
             r'|\bvery\s+early\s+check\s*-?\s*in\b'
-            r'|\bvery\s+late\s+check\s*-?\s*out\b',
+            r'|\bvery\s+late\s+check\s*-?\s*out\b'
+            r'|\bpriority\b.*\bcheck\s*-?\s*in\b'
+            r'|\bmorning\b.*\bcheck\s*-?\s*in\b',
             name,
             re.I,
         ))
