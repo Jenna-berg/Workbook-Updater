@@ -3,6 +3,10 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.chart import PieChart, BarChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.axis import ChartLines
+from openpyxl.chart.shapes import GraphicalProperties
 import io
 import csv
 import re
@@ -8154,8 +8158,21 @@ def ancillary_render_report(
         CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
     )
 
-    # Clone the approved charts from Report Template. copy_worksheet() does not
-    # copy chart objects, so explicitly deep-copy and repoint each source range.
+    # ============================================================
+    # Messaging Overview charts
+    # ============================================================
+    # copy_worksheet() does not copy charts. Clone any approved charts that
+    # already exist on Report Template, then create the two sentiment charts
+    # when the template does not contain them.
+    #
+    # This guarantees every generated report opens with all three charts:
+    #   1) Common Guest Conversation Topics — pie
+    #   2) Engagement Rate — line
+    #   3) Recurring Operational Concerns — column/bar
+    #
+    # The pie/bar charts intentionally point at blank paste-in tables. When the
+    # monthly sentiment data is pasted into M:N later, Excel populates them
+    # automatically without rebuilding a chart.
     sh._charts = []
 
     def _ar_chart_title_text(chart):
@@ -8168,24 +8185,136 @@ def ancillary_render_report(
         if not getattr(chart, "ser", None):
             return
         ser = chart.ser[0]
+
         if getattr(ser, "cat", None) is not None:
             if getattr(ser.cat, "strRef", None) is not None:
                 ser.cat.strRef.f = cat_formula
             elif getattr(ser.cat, "numRef", None) is not None:
                 ser.cat.numRef.f = cat_formula
-        if getattr(ser, "val", None) is not None and getattr(ser.val, "numRef", None) is not None:
+
+        if (
+            getattr(ser, "val", None) is not None
+            and getattr(ser.val, "numRef", None) is not None
+        ):
             ser.val.numRef.f = val_formula
+
+    cloned_titles = set()
 
     for template_chart in template._charts:
         chart = deepcopy(template_chart)
-        title = _ar_chart_title_text(chart).strip().lower()
-        if "engagement rate" in title:
-            _ar_set_chart_series_range(chart, "'Report'!$M$31:$M$38", "'Report'!$N$31:$N$38")
-        elif "common guest" in title:
-            _ar_set_chart_series_range(chart, "'Report'!$M$6:$M$13", "'Report'!$N$6:$N$13")
-        elif "operational concerns" in title:
-            _ar_set_chart_series_range(chart, "'Report'!$M$40:$M$44", "'Report'!$N$40:$N$44")
+        title = _ar_chart_title_text(chart).strip()
+        title_l = title.lower()
+
+        if "engagement rate" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$31:$M$38",
+                "'Report'!$N$31:$N$38",
+            )
+            cloned_titles.add("engagement")
+        elif "common guest" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$6:$M$12",
+                "'Report'!$N$6:$N$12",
+            )
+            cloned_titles.add("guest")
+        elif "operational concerns" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$40:$M$45",
+                "'Report'!$N$40:$N$45",
+            )
+            cloned_titles.add("concerns")
+
         sh._charts.append(chart)
+
+    # ----- Common Guest Conversation Topics -----
+    # Format/placement matched to the completed Harbor Hotel AUG report.
+    if "guest" not in cloned_titles:
+        guest_chart = PieChart()
+        guest_chart.title = "Common Guest Conversation Topics"
+        guest_chart.height = 7.5
+        guest_chart.width = 15
+        guest_chart.varyColors = True
+        guest_chart.display_blanks = "gap"
+
+        guest_labels = Reference(
+            sh,
+            min_col=13,  # M
+            min_row=6,
+            max_row=12,
+        )
+        guest_values = Reference(
+            sh,
+            min_col=14,  # N
+            min_row=6,
+            max_row=12,
+        )
+        guest_chart.add_data(guest_values, titles_from_data=False)
+        guest_chart.set_categories(guest_labels)
+
+        if guest_chart.legend is not None:
+            guest_chart.legend.position = "r"
+
+        guest_chart.dLbls = DataLabelList()
+        guest_chart.dLbls.showLegendKey = False
+        guest_chart.dLbls.showVal = False
+        guest_chart.dLbls.showCatName = False
+        guest_chart.dLbls.showSerName = False
+        guest_chart.dLbls.showPercent = False
+        guest_chart.dLbls.showBubbleSize = False
+
+        # Completed Harbor AUG placement starts around column M / row 4.
+        sh.add_chart(guest_chart, "M4")
+
+    # ----- Recurring Operational Concerns -----
+    # Excel calls this a BarChart object with barDir="col"; visually it is the
+    # vertical column chart used in the completed Harbor report.
+    if "concerns" not in cloned_titles:
+        concerns_chart = BarChart()
+        concerns_chart.type = "col"
+        concerns_chart.style = None
+        concerns_chart.title = "Recurring Operational Concerns"
+        concerns_chart.height = 7.5
+        concerns_chart.width = 15
+        concerns_chart.grouping = "clustered"
+        concerns_chart.gapWidth = 150
+        concerns_chart.display_blanks = "gap"
+
+        concern_labels = Reference(
+            sh,
+            min_col=13,  # M
+            min_row=40,
+            max_row=45,
+        )
+        concern_values = Reference(
+            sh,
+            min_col=14,  # N
+            min_row=40,
+            max_row=45,
+        )
+        concerns_chart.add_data(
+            concern_values,
+            titles_from_data=False,
+        )
+        concerns_chart.set_categories(concern_labels)
+
+        if concerns_chart.legend is not None:
+            concerns_chart.legend.position = "r"
+
+        # Match the Harbor chart's visible horizontal gridlines.
+        try:
+            concerns_chart.y_axis.majorGridlines = ChartLines(
+                spPr=GraphicalProperties()
+            )
+            concerns_chart.y_axis.majorGridlines.spPr.ln.solidFill = "B7B7B7"
+            concerns_chart.y_axis.majorGridlines.spPr.ln.prstDash = "solid"
+        except Exception:
+            pass
+
+        # Completed Harbor AUG placement starts around column M / row 39.
+        sh.add_chart(concerns_chart, "M39")
 
     sh.freeze_panes = None
 
