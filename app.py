@@ -7201,7 +7201,7 @@ ANCILLARY_DRIVE_HOTEL_MAP = {
     "allegria hotel": "Long Beach",
     "the brass key guesthouse": "Brass Key",
     "harbor hotel provincetown": "Harbor Hotel",
-    "hotel 1620": "Plymouth",
+    "hotel 1620": "1620",
     "provincetown inn": "Provincetown Inn",
     "surfside hotel and suites": "Surfside",
     "hotel tybee": "Tybee",
@@ -12152,4 +12152,3 @@ with tab_projection:
 # only the open section reaches the page. Must stay the last statement in the
 # file — anything added after it would render into the void.
 _offstage.empty()
-
