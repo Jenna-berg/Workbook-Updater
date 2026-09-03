@@ -7159,7 +7159,7 @@ ANCILLARY_PROPERTY_PROFILES = {
         {'label':'121 Late Checkout','report':'Late Checkout'}]},
     'harbor hotel provincetown': {'display':'Harbor Hotel Provincetown','stlySource':'CANARY','journal':[
         {'label':'4006 Early Checkin/Late Departure Fee','report':'Early Check In / Late Checkout'}]},
-    'hotel 1620': {'display':'Hotel 1620','stlySource':'CANARY','journal':[]},
+    'hotel 1620': {'display':'Hotel 1620','stlySource':'SNT','journal':[]},
     'provincetown inn': {'display':'Provincetown Inn','stlySource':'SNT','stlyJournal':True,'journal':[
         {'label':'1009 Early Arrival','report':'Early Check In'},
         {'label':'1008 Late Checkout Fee','report':'Late Checkout'}]},
