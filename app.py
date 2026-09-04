@@ -5450,29 +5450,35 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracke
         tracked_year,
     ]
 
-    dest_year_col = {}
-    for r in range(hdr_row, min(wk1_ws.max_row + 1, hdr_row + 10)):
-        parsed = {}
-        for c in range(
-            month_label_col + 1,
-            min(wk1_ws.max_column + 1, month_label_col + 20)
-        ):
-            yr = _as_year(wk1_ws.cell(r, c).value)
-            if yr:
-                parsed[yr] = c
-        if parsed:
-            dest_year_col = parsed
-            break
+    # The Week 1 Previous table is always four consecutive year columns
+    # immediately to the right of the month labels. Do NOT trust the literal
+    # year headers already printed in the master — some masters still carry
+    # the prior year's header stack (e.g. 2022–2025 when building a 2026 ROB).
+    #
+    # Actively rewrite the headers to the tracked-year stack:
+    #   2026 ROB -> 2023 / 2024 / 2025 / 2026
+    #   2027 ROB -> 2024 / 2025 / 2026 / 2027
+    year_cols = list(
+        range(month_label_col + 1, month_label_col + 5)
+    )
+    dest_year_col = dict(zip(expected_years, year_cols))
 
-    # The standard Week 1 Previous table is four consecutive year columns.
-    # Its headers may themselves be formulas (=B3, =C3, etc.), so if the
-    # literal years cannot be read, use their known left-to-right order.
-    if not dest_year_col:
-        for c, year in zip(
-            range(month_label_col + 1, month_label_col + 5),
-            expected_years
-        ):
-            dest_year_col[year] = c
+    # Find the row that contains the existing year headers. It is normally the
+    # row directly below the title and immediately above Jan.
+    first_month_row = min(dest_month_row.values()) if dest_month_row else None
+    year_header_row = (
+        first_month_row - 1
+        if first_month_row and first_month_row > hdr_row
+        else hdr_row + 1
+    )
+
+    for year, col in dest_year_col.items():
+        _rob_set_value(
+            wk1_ws,
+            year_header_row,
+            col,
+            year,
+        )
 
     # ----- Select ONE last completed week from previous month's ROB -----
     prev_month = (
@@ -5989,10 +5995,23 @@ def _fill_rob_sheet(
             ):
                 continue
 
+            # Historical B:D dates are prefilled. Current-year E dates remain
+            # blank from the immediately previous month forward in a newly
+            # created ROB; weekly uploads add them later.
+            if col == 5 and month_idx >= prev_idx:
+                _rob_set_value(
+                    new_ws,
+                    header_row,
+                    col,
+                    None,
+                    number_format="mm/dd/yyyy",
+                )
+                continue
+
             write_date = date_value
             if (
                 col == 5
-                and month_idx <= prev_idx
+                and month_idx < prev_idx
                 and prev_ty_date is not None
             ):
                 write_date = prev_ty_date
@@ -6025,7 +6044,10 @@ def _fill_rob_sheet(
             continue
 
         # Immediately previous month:
-        # historical B:D from selected STLY snapshot; current E from prior ROB.
+        #   - historical B:D comes from the selected STLY snapshot
+        #   - wk one current-year E/H stays blank
+        #   - wk two and later link the previous-month section back to wk one
+        # This makes the behavior dynamic for however many week tabs the month uses.
         if month_idx == prev_idx:
             if is_wk_one:
                 _rob_copy_month_metrics_by_label(
@@ -6040,14 +6062,20 @@ def _fill_rob_sheet(
                     new_ws,
                     month_idx,
                 )
-                _rob_copy_month_metrics_by_label(
-                    prev_ws,
-                    new_ws,
-                    month_idx,
-                    {5: 5},
-                    allow_formulas=True,
-                )
+
+                # wk one starts clean for the immediately previous month.
+                dst_labels = rob_month_blocks(new_ws).get(month_idx, {})
+                for label in _ROB_BASE_METRIC_LABELS:
+                    dr = dst_labels.get(label)
+                    if dr:
+                        _rob_set_value(new_ws, dr, 5, None)
+                for label in _ROB_SECONDARY_METRIC_LABELS:
+                    dr = dst_labels.get(label)
+                    if dr:
+                        _rob_set_value(new_ws, dr, 8, None)
             else:
+                # Later weeks inherit the full previous-month block from wk one
+                # by matching metric labels, regardless of physical row layout.
                 _rob_link_month_metrics_to_wk_one(
                     new_ws,
                     wk_one_ws,
@@ -6070,20 +6098,20 @@ def _fill_rob_sheet(
             month_idx,
         )
 
-        # wk one only: carry forward already-captured current-year OTB by label.
-        if is_wk_one and carry_forward_ws is not None:
-            _rob_copy_month_metrics_by_label(
-                carry_forward_ws,
-                new_ws,
-                month_idx,
-                {5: 5},
-                allow_formulas=True,
-            )
-            _rob_copy_secondary_by_label(
-                carry_forward_ws,
-                new_ws,
-                month_idx,
-            )
+        # Current-year values for the target month and all future months must
+        # remain blank when a new ROB month is created. Weekly uploads populate
+        # these later. Historical B:D can be prefilled, but E stays empty.
+        dst_labels = rob_month_blocks(new_ws).get(month_idx, {})
+        for label in _ROB_BASE_METRIC_LABELS:
+            dr = dst_labels.get(label)
+            if dr:
+                _rob_set_value(new_ws, dr, 5, None)
+
+        # Clear right-side current-year/group cells as well.
+        for label in _ROB_SECONDARY_METRIC_LABELS:
+            dr = dst_labels.get(label)
+            if dr:
+                _rob_set_value(new_ws, dr, 8, None)
 
 
 def _wk1_previous_table_refs(ws, target_year):
