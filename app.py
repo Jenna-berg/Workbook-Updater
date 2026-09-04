@@ -5813,7 +5813,6 @@ _ROB_BASE_METRIC_LABELS = (
 _ROB_SECONDARY_METRIC_LABELS = (
     "group rms sold",
     "group rm rev",
-    "group rm adr",
 )
 
 
@@ -5898,29 +5897,64 @@ def _rob_link_month_metrics_to_wk_one(
     return copied
 
 
+def _rob_link_group_npu_to_wk_one(dst_ws, wk_one_ws, month_idx):
+    """Link Group NPU rooms/revenue in later weeks back to wk one."""
+    if dst_ws is None or wk_one_ws is None:
+        return 0
+
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    src_labels = rob_month_blocks(wk_one_ws).get(month_idx, {})
+    copied = 0
+
+    for label in _ROB_SECONDARY_METRIC_LABELS:
+        dr = dst_labels.get(label)
+        sr = src_labels.get(label)
+        if not dr or not sr:
+            continue
+
+        if _rob_set_value(
+            dst_ws,
+            dr,
+            8,
+            f"='{wk_one_ws.title}'!H{sr}",
+        ):
+            copied += 1
+
+    return copied
+
+
 def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
-    """Copy right-side group comparison metrics into H by label."""
+    """Carry STLY Groups Not Picked Up values by month + metric label.
+
+    Historical ROB source:
+      G = that source year's Group NPU rooms/revenue
+
+    Newly-created ROB:
+      H = STLY Group NPU comparison
+
+    This is an explicit G -> H copy for the raw Group NPU inputs only.
+    Group NPU ADR remains the destination workbook's existing formula.
+    """
     if src_ws is None or dst_ws is None:
         return 0
 
     src_labels = rob_month_blocks(src_ws).get(month_idx, {})
     dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
-    src_header = _rob_month_header_rows(src_ws).get(month_idx)
-    if not src_labels or not dst_labels or not src_header:
+    if not src_labels or not dst_labels:
         return 0
 
-    src_sec_col = find_secondary_col(src_ws, src_header) or 7
     copied = 0
-
     for label in _ROB_SECONDARY_METRIC_LABELS:
         sr = src_labels.get(label)
         dr = dst_labels.get(label)
         if not sr or not dr:
             continue
-        value = src_ws.cell(sr, src_sec_col).value
+
+        value = src_ws.cell(sr, 7).value  # G = source-year Group NPU
         if value is None or is_datelike(value):
             continue
-        if _rob_set_value(dst_ws, dr, 8, value):
+
+        if _rob_set_value(dst_ws, dr, 8, value):  # H = STLY Group NPU
             copied += 1
 
     return copied
@@ -6041,6 +6075,11 @@ def _fill_rob_sheet(
                     wk_one_ws,
                     month_idx,
                 )
+                _rob_link_group_npu_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
             continue
 
         # Immediately previous month:
@@ -6077,6 +6116,11 @@ def _fill_rob_sheet(
                 # Later weeks inherit the full previous-month block from wk one
                 # by matching metric labels, regardless of physical row layout.
                 _rob_link_month_metrics_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+                _rob_link_group_npu_to_wk_one(
                     new_ws,
                     wk_one_ws,
                     month_idx,
