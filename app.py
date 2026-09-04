@@ -5669,40 +5669,24 @@ def _rob_build_date_first_stly_map(
     target_month,
     source_workbooks,
 ):
-    """Map destination ROB week tabs to STLY snapshots by reporting dates.
+    """Map ROB weeks by reporting dates with a portfolio minimum of 4 weeks.
 
-    The week-tab name is NOT the match key.
-
-    Process:
-      1. Find the previous ROB's latest completed current-year reporting date.
-      2. Advance that date by 7 days for destination wk one, then by 7 days
-         for each following destination week.
-      3. Stop once that reporting date leaves the target month.
-      4. Convert each destination reporting date to the comparable prior-year
-         weekday using a 52-week / 364-day shift.
-      5. Choose the nearest valid STLY source snapshot after the previously
-         consumed historical snapshot, within a small tolerance.
-      6. Never reuse a source snapshot. If no reasonable date match exists,
-         leave that destination week untouched.
-
-    This handles cases such as:
-      - AUG2026 Northbrook wk5 used SEP2025 wk1 (09/01/2025)
-      - SEP2026 Northbrook then starts with SEP2025 wk2 (09/07/2025)
-      - 4-week vs 5-week month differences without forcing same-tab matches
-      - source snapshots that are one or two days off the exact 364-day date
-        because reports were run on slightly different weekdays/dates.
+    Rules:
+      - every new ROB month should populate at least 4 destination weeks
+      - source week selection is chronological/date-driven, never tab-driven
+      - a matching historical snapshot may come from the next STLY month file
+      - after wk4, additional weeks are populated only while the reporting
+        cadence still falls inside the target month
     """
     snapshots = _rob_collect_stly_snapshots(source_workbooks)
     if not snapshots:
         return {}, ["No dated STLY ROB week snapshots were found."]
 
-    # Historical snapshot already consumed by the previous ROB's last week.
     consumed_hist_date, consumed_hist_sheet = _rob_previous_stly_anchor_date(
         prev_wb,
         target_month,
     )
 
-    # Current-year reporting date already used by the previous ROB's last week.
     prev_completed_sheet = _rob_last_completed_week(prev_wb, target_month)
     prev_ty_date = None
     if (
@@ -5715,8 +5699,6 @@ def _rob_build_date_first_stly_map(
         )
 
     if prev_ty_date is None:
-        # Conservative fallback: start from the last day before target month,
-        # so wk one begins in the first week of the target month.
         prev_ty_date = target_month - datetime.timedelta(days=1)
 
     mapping = {}
@@ -5728,6 +5710,7 @@ def _rob_build_date_first_stly_map(
             f"{consumed_hist_date:%m/%d/%Y} "
             f"({consumed_hist_sheet})"
         )
+
     diagnostics.append(
         f"Previous current-year reporting date: "
         f"{prev_ty_date:%m/%d/%Y}"
@@ -5746,21 +5729,24 @@ def _rob_build_date_first_stly_map(
             days=7 * week_index
         )
 
-        # Only build weeks whose reporting date falls inside the new month.
-        if (
-            expected_ty_date.year != target_month.year
-            or expected_ty_date.month != target_month.month
-        ):
+        inside_target_month = (
+            expected_ty_date.year == target_month.year
+            and expected_ty_date.month == target_month.month
+        )
+
+        must_fill = week_index <= 4
+
+        if (not must_fill) and (not inside_target_month):
             diagnostics.append(
-                f"{dest_sheet}: left untouched — reporting date "
-                f"{expected_ty_date:%m/%d/%Y} is outside "
+                f"{dest_sheet}: left untouched after minimum four weeks; "
+                f"reporting date {expected_ty_date:%m/%d/%Y} is outside "
                 f"{target_month:%b %Y}"
             )
             continue
 
         comparable_stly_date = expected_ty_date - datetime.timedelta(days=364)
 
-        candidates = []
+        eligible = []
         for snap in snapshots:
             src_date = snap["date"]
 
@@ -5770,21 +5756,33 @@ def _rob_build_date_first_stly_map(
                 continue
 
             distance = abs((src_date - comparable_stly_date).days)
+            eligible.append((distance, src_date, snap))
 
-            # Real ROB snapshot dates can drift slightly, but a match farther
-            # than four days is not the same reporting week.
-            if distance <= 4:
-                candidates.append((distance, src_date, snap))
+        if not eligible:
+            diagnostics.append(
+                f"{dest_sheet}: no later STLY snapshots available; "
+                f"left untouched"
+            )
+            continue
 
-        if not candidates:
+        eligible.sort(key=lambda x: (x[0], x[1]))
+        close = [item for item in eligible if item[0] <= 4]
+
+        if close:
+            distance, src_date, snap = close[0]
+            match_note = "date match"
+        elif must_fill:
+            # Minimum-four fallback: take the next chronological snapshot even
+            # if that snapshot is filed in the following STLY month.
+            chronological = sorted(eligible, key=lambda x: x[1])
+            distance, src_date, snap = chronological[0]
+            match_note = "minimum-4 chronological carry"
+        else:
             diagnostics.append(
                 f"{dest_sheet}: no STLY snapshot close enough to "
                 f"{comparable_stly_date:%m/%d/%Y}; left untouched"
             )
             continue
-
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        _, src_date, snap = candidates[0]
 
         mapping[dest_sheet] = snap
         used_source_dates.add(src_date)
@@ -5794,11 +5792,16 @@ def _rob_build_date_first_stly_map(
             f"{dest_sheet} ({expected_ty_date:%m/%d/%Y}) <- "
             f"{snap['workbook_label']} / {snap['sheet_name']} "
             f"({src_date:%m/%d/%Y}); comparable date "
-            f"{comparable_stly_date:%m/%d/%Y}"
+            f"{comparable_stly_date:%m/%d/%Y}; {match_note}"
+        )
+
+    if len(mapping) < min(4, len(dest_sheets)):
+        diagnostics.append(
+            f"WARNING: only {len(mapping)} destination weeks mapped; "
+            f"portfolio standard is a minimum of 4."
         )
 
     return mapping, diagnostics
-
 
 
 _ROB_BASE_METRIC_LABELS = (
@@ -6399,6 +6402,42 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             f"({next_ly_month_dt.strftime('%b %Y')}) not found: {next_ly_err}"
         )
 
+    # Safety net for month-overlap cases. The mapper remains date-driven, so
+    # this only broadens the pool of available historical weekly snapshots.
+    next2_ly_month_dt = (
+        next_ly_month_dt + datetime.timedelta(days=32)
+    ).replace(day=1)
+    next2_ly_result, next2_ly_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        next2_ly_month_dt,
+    )
+    next2_ly_wb = None
+    if next2_ly_result:
+        warnings.append(
+            f"Second following STLY month "
+            f"({next2_ly_month_dt.strftime('%b %Y')}) resolved to: "
+            f"{next2_ly_result[1]}"
+        )
+        try:
+            next2_ly_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, next2_ly_result[0])),
+                data_only=True,
+            )
+        except Exception as e:
+            warnings.append(
+                f"Second following STLY month "
+                f"({next2_ly_month_dt.strftime('%b %Y')}) failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Second following STLY month "
+            f"({next2_ly_month_dt.strftime('%b %Y')}) not found: "
+            f"{next2_ly_err}"
+        )
+
     # Sheet lookups below are exact, case-sensitive matches against
     # ROB_SHEETS ("wk one", "wk two", ...) — a workbook can load successfully
     # above and still contribute nothing if its own tab names don't match
@@ -6411,6 +6450,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ("Prev month", prev_wb),
         ("Last year", ly_wb),
         ("Following STLY month", next_ly_wb),
+        ("Second following STLY month", next2_ly_wb),
     ]:
         if wb_obj is None:
             continue
@@ -6431,6 +6471,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         [
             (ly_month_dt.strftime("%b%Y").upper(), ly_wb),
             (next_ly_month_dt.strftime("%b%Y").upper(), next_ly_wb),
+            (next2_ly_month_dt.strftime("%b%Y").upper(), next2_ly_wb),
         ],
     )
     if stly_map_diag:
