@@ -5898,7 +5898,13 @@ def _rob_link_month_metrics_to_wk_one(
 
 
 def _rob_link_group_npu_to_wk_one(dst_ws, wk_one_ws, month_idx):
-    """Link Group NPU rooms/revenue in later weeks back to wk one."""
+    """Link Group NPU rooms/revenue in later weeks back to wk one.
+
+    For the immediately previous month:
+      G = current-year GNPU (blank/formula from wk1)
+      H = STLY GNPU historical comparison
+    Both should mirror wk1 dynamically.
+    """
     if dst_ws is None or wk_one_ws is None:
         return 0
 
@@ -5912,13 +5918,14 @@ def _rob_link_group_npu_to_wk_one(dst_ws, wk_one_ws, month_idx):
         if not dr or not sr:
             continue
 
-        if _rob_set_value(
-            dst_ws,
-            dr,
-            8,
-            f"='{wk_one_ws.title}'!H{sr}",
-        ):
-            copied += 1
+        for col, letter in ((7, "G"), (8, "H")):
+            if _rob_set_value(
+                dst_ws,
+                dr,
+                col,
+                f"='{wk_one_ws.title}'!{letter}{sr}",
+            ):
+                copied += 1
 
     return copied
 
@@ -6108,10 +6115,12 @@ def _fill_rob_sheet(
                     dr = dst_labels.get(label)
                     if dr:
                         _rob_set_value(new_ws, dr, 5, None)
+                # GNPU: G is current-year and must start blank; H is STLY
+                # and was just populated from the mapped historical week.
                 for label in _ROB_SECONDARY_METRIC_LABELS:
                     dr = dst_labels.get(label)
                     if dr:
-                        _rob_set_value(new_ws, dr, 8, None)
+                        _rob_set_value(new_ws, dr, 7, None)
             else:
                 # Later weeks inherit the full previous-month block from wk one
                 # by matching metric labels, regardless of physical row layout.
@@ -6151,11 +6160,13 @@ def _fill_rob_sheet(
             if dr:
                 _rob_set_value(new_ws, dr, 5, None)
 
-        # Clear right-side current-year/group cells as well.
+        # GNPU follows the same setup rule:
+        #   G = current-year GNPU -> blank until weekly data is loaded
+        #   H = STLY GNPU -> preserve the historical value copied above
         for label in _ROB_SECONDARY_METRIC_LABELS:
             dr = dst_labels.get(label)
             if dr:
-                _rob_set_value(new_ws, dr, 8, None)
+                _rob_set_value(new_ws, dr, 7, None)
 
 
 def _wk1_previous_table_refs(ws, target_year):
