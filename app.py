@@ -5725,7 +5725,7 @@ def _rob_build_date_first_stly_map(
 
 
 
-def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name, tracked_year=None):
+def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name, tracked_year=None, carry_forward_ws=None):
     """Fill one ROB sheet tab with historical data.
     Preserves formulas from master template — only overwrites cells with values.
     """
@@ -5883,29 +5883,59 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         )
 
         else:
-            # Current month and future months (Jul+): cols 2,3,4 from LY ROB
-            # For new hotels with no historical data (e.g., Foxberry), ly_ws will be None —
-            # just skip and leave those months with master template values (no error).
-            if ly_ws is None:
-                continue
-            for dr in data_offsets:
-                r = block_start + dr
-                for ly_col, new_col in ly_to_new.items():
-                    # Skip if master template has a formula in this cell
-                    if is_formula(str(new_ws.cell(r, new_col).value)):
+            # Current month and future months:
+            #   cols B:D = STLY/historical values from the date-mapped LY snapshot
+            #   col E    = carry forward the most recent current-year OTB values
+            #              already captured in the previous month's latest completed
+            #              ROB week. This preserves October values that were already
+            #              being tracked in September wk5/wk6, etc.
+            if ly_ws is not None:
+                for dr in data_offsets:
+                    r = block_start + dr
+                    for ly_col, new_col in ly_to_new.items():
+                        if is_formula(str(new_ws.cell(r, new_col).value)):
+                            continue
+                        v = ly_ws.cell(r, ly_col).value
+                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
+                            _rob_set_value(new_ws, r, new_col, v)
+
+                ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
+                for dr in [4, 5, 6]:
+                    r = block_start + dr
+                    if is_formula(str(new_ws.cell(r, 8).value)):
                         continue
-                    v = ly_ws.cell(r, ly_col).value
+                    v = ly_ws.cell(r, ly_sec_col).value
                     if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        _rob_set_value(new_ws, r, new_col, v)
-            ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
-            for dr in [4, 5, 6]:
-                r = block_start + dr
-                # Skip if master template has a formula in this cell
-                if is_formula(str(new_ws.cell(r, 8).value)):
-                    continue
-                v = ly_ws.cell(r, ly_sec_col).value
-                if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                    _rob_set_value(new_ws, r, 8, v)
+                        _rob_set_value(new_ws, r, 8, v)
+
+            # Only wk one gets the carry-forward baseline. Later week tabs are
+            # populated by their own weekly updates, so we should not make them
+            # duplicate the same OTB snapshot.
+            if is_wk_one and carry_forward_ws is not None:
+                cf_step = rob_block_step(carry_forward_ws)
+                cf_block_start = 4 + cf_step * month_idx
+
+                for dr in data_offsets:
+                    new_r = block_start + dr
+                    cf_r = cf_block_start + dr
+
+                    if is_formula(str(new_ws.cell(new_r, 5).value)):
+                        continue
+
+                    v = carry_forward_ws.cell(cf_r, 5).value
+                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
+                        _rob_set_value(new_ws, new_r, 5, v)
+
+                # Carry the secondary/group values on the right side too.
+                cf_sec_col = find_secondary_col(carry_forward_ws, cf_block_start) or 7
+                for dr in [4, 5, 6]:
+                    new_r = block_start + dr
+                    cf_r = cf_block_start + dr
+                    if is_formula(str(new_ws.cell(new_r, 8).value)):
+                        continue
+                    v = carry_forward_ws.cell(cf_r, cf_sec_col).value
+                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
+                        _rob_set_value(new_ws, new_r, 8, v)
 
 
 def _wk1_previous_table_refs(ws, target_year):
@@ -6161,6 +6191,24 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             "Date-first STLY week map — " + " | ".join(stly_map_diag)
         )
 
+    # Latest completed week in the previous ROB is the current-year OTB
+    # carry-forward baseline for the newly-created month.
+    latest_prev_sheet_name = _rob_last_completed_week(
+        prev_wb,
+        target_month,
+    )
+    carry_forward_ws = (
+        prev_wb[latest_prev_sheet_name]
+        if prev_wb
+        and latest_prev_sheet_name
+        and latest_prev_sheet_name in prev_wb.sheetnames
+        else None
+    )
+    if latest_prev_sheet_name:
+        warnings.append(
+            f"Current-year carry-forward source: {latest_prev_sheet_name}"
+        )
+
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
@@ -6170,7 +6218,16 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         stly_snap = stly_week_map.get(sheet_name)
         ly_ws = stly_snap["worksheet"] if stly_snap else None
         is_wk_one = (sheet_name == wk_one_name)
-        _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name, tracked_year=target_month.year)
+        _fill_rob_sheet(
+            new_ws,
+            prev_ws,
+            ly_ws,
+            target_month,
+            is_wk_one,
+            wk_one_name,
+            tracked_year=target_month.year,
+            carry_forward_ws=carry_forward_ws,
+        )
 
     # Normalize all ROB date headers to MM/DD/YYYY display.
     for _s in ROB_SHEETS:
@@ -6662,6 +6719,7 @@ def setup_next_year_rob_month(
             sheet_name == wk_one_name,
             wk_one_name,
             tracked_year=tracked_year,
+            carry_forward_ws=None,
         )
 
     # Normalize ROB date displays.
