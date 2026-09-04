@@ -5663,66 +5663,135 @@ def _rob_build_date_first_stly_map(
     target_month,
     source_workbooks,
 ):
-    """Map destination week tabs to STLY snapshots by chronology, not tab name.
+    """Map destination ROB week tabs to STLY snapshots by reporting dates.
 
-    Rule:
-      - identify the STLY snapshot already used by the prior month's final week
-      - start with the first historical snapshot AFTER that date
-      - continue forward one historical snapshot per destination week tab
-      - allow snapshots to come from the following prior-year month workbook
+    The week-tab name is NOT the match key.
 
-    Returns (mapping, diagnostics)
-      mapping = {destination_sheet: snapshot_dict}
+    Process:
+      1. Find the previous ROB's latest completed current-year reporting date.
+      2. Advance that date by 7 days for destination wk one, then by 7 days
+         for each following destination week.
+      3. Stop once that reporting date leaves the target month.
+      4. Convert each destination reporting date to the comparable prior-year
+         weekday using a 52-week / 364-day shift.
+      5. Choose the nearest valid STLY source snapshot after the previously
+         consumed historical snapshot, within a small tolerance.
+      6. Never reuse a source snapshot. If no reasonable date match exists,
+         leave that destination week untouched.
+
+    This handles cases such as:
+      - AUG2026 Northbrook wk5 used SEP2025 wk1 (09/01/2025)
+      - SEP2026 Northbrook then starts with SEP2025 wk2 (09/07/2025)
+      - 4-week vs 5-week month differences without forcing same-tab matches
+      - source snapshots that are one or two days off the exact 364-day date
+        because reports were run on slightly different weekdays/dates.
     """
     snapshots = _rob_collect_stly_snapshots(source_workbooks)
     if not snapshots:
         return {}, ["No dated STLY ROB week snapshots were found."]
 
-    anchor_date, anchor_sheet = _rob_previous_stly_anchor_date(
+    # Historical snapshot already consumed by the previous ROB's last week.
+    consumed_hist_date, consumed_hist_sheet = _rob_previous_stly_anchor_date(
         prev_wb,
         target_month,
     )
 
-    if anchor_date is not None:
-        available = [
-            s for s in snapshots
-            if s["date"] > anchor_date
-        ]
-    else:
-        # Fallback for a first-ever setup with no previous ROB: start from the
-        # first dated snapshot in the comparable prior-year month.
-        available = list(snapshots)
+    # Current-year reporting date already used by the previous ROB's last week.
+    prev_completed_sheet = _rob_last_completed_week(prev_wb, target_month)
+    prev_ty_date = None
+    if (
+        prev_wb is not None
+        and prev_completed_sheet
+        and prev_completed_sheet in prev_wb.sheetnames
+    ):
+        prev_ty_date = _rob_valid_date(
+            prev_wb[prev_completed_sheet].cell(4, 5).value
+        )
+
+    if prev_ty_date is None:
+        # Conservative fallback: start from the last day before target month,
+        # so wk one begins in the first week of the target month.
+        prev_ty_date = target_month - datetime.timedelta(days=1)
 
     mapping = {}
     diagnostics = []
+
+    if consumed_hist_date is not None:
+        diagnostics.append(
+            f"Previously consumed STLY snapshot: "
+            f"{consumed_hist_date:%m/%d/%Y} "
+            f"({consumed_hist_sheet})"
+        )
+    diagnostics.append(
+        f"Previous current-year reporting date: "
+        f"{prev_ty_date:%m/%d/%Y}"
+    )
+
+    used_source_dates = set()
+    last_source_date = consumed_hist_date
 
     dest_sheets = [
         s for s in ROB_SHEETS
         if s in new_wb.sheetnames
     ]
 
-    for dest_sheet, snap in zip(dest_sheets, available):
+    for week_index, dest_sheet in enumerate(dest_sheets, start=1):
+        expected_ty_date = prev_ty_date + datetime.timedelta(
+            days=7 * week_index
+        )
+
+        # Only build weeks whose reporting date falls inside the new month.
+        if (
+            expected_ty_date.year != target_month.year
+            or expected_ty_date.month != target_month.month
+        ):
+            diagnostics.append(
+                f"{dest_sheet}: left untouched — reporting date "
+                f"{expected_ty_date:%m/%d/%Y} is outside "
+                f"{target_month:%b %Y}"
+            )
+            continue
+
+        comparable_stly_date = expected_ty_date - datetime.timedelta(days=364)
+
+        candidates = []
+        for snap in snapshots:
+            src_date = snap["date"]
+
+            if src_date in used_source_dates:
+                continue
+            if last_source_date is not None and src_date <= last_source_date:
+                continue
+
+            distance = abs((src_date - comparable_stly_date).days)
+
+            # Real ROB snapshot dates can drift slightly, but a match farther
+            # than four days is not the same reporting week.
+            if distance <= 4:
+                candidates.append((distance, src_date, snap))
+
+        if not candidates:
+            diagnostics.append(
+                f"{dest_sheet}: no STLY snapshot close enough to "
+                f"{comparable_stly_date:%m/%d/%Y}; left untouched"
+            )
+            continue
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        _, src_date, snap = candidates[0]
+
         mapping[dest_sheet] = snap
-        diagnostics.append(
-            f"{dest_sheet} <- {snap['workbook_label']} / "
-            f"{snap['sheet_name']} ({snap['date']:%m/%d/%Y})"
-        )
+        used_source_dates.add(src_date)
+        last_source_date = src_date
 
-    if anchor_date is not None:
-        diagnostics.insert(
-            0,
-            f"STLY date anchor from previous ROB {anchor_sheet}: "
-            f"{anchor_date:%m/%d/%Y}",
-        )
-
-    if len(available) < len(dest_sheets):
         diagnostics.append(
-            f"Only {len(available)} dated STLY snapshots were available for "
-            f"{len(dest_sheets)} destination week tabs."
+            f"{dest_sheet} ({expected_ty_date:%m/%d/%Y}) <- "
+            f"{snap['workbook_label']} / {snap['sheet_name']} "
+            f"({src_date:%m/%d/%Y}); comparable date "
+            f"{comparable_stly_date:%m/%d/%Y}"
         )
 
     return mapping, diagnostics
-
 
 
 def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name, tracked_year=None, carry_forward_ws=None):
