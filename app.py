@@ -5326,6 +5326,43 @@ def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
     return None
 
 
+def _rob_cell_is_writable(ws, row, col):
+    """True when a ROB setup cell can safely receive a value.
+
+    Northbrook's ROB master contains vertically merged cells inside monthly
+    blocks (for example H5:H7). openpyxl represents every merged cell except
+    the top-left anchor as MergedCell, whose .value is read-only.
+
+    Setup should preserve those merged sections, so non-anchor merged cells are
+    skipped instead of being assigned.
+    """
+    cell = ws.cell(row, col)
+    if cell.__class__.__name__ == "MergedCell":
+        return False
+
+    # Defensive check for regular Cell objects that belong to a merge range.
+    for rng in ws.merged_cells.ranges:
+        if (
+            rng.min_row <= row <= rng.max_row
+            and rng.min_col <= col <= rng.max_col
+        ):
+            return row == rng.min_row and col == rng.min_col
+
+    return True
+
+
+def _rob_set_value(ws, row, col, value, number_format=None):
+    """Merged-cell-safe ROB setup write. Returns True when written."""
+    if not _rob_cell_is_writable(ws, row, col):
+        return False
+    cell = ws.cell(row, col)
+    cell.value = value
+    if number_format is not None:
+        cell.number_format = number_format
+    return True
+
+
+
 def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracked_year=None):
     """Fill Week 1 Previous Sheet from one prior-month completed week.
 
@@ -5507,7 +5544,7 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracke
             value = src_ws.cell(rev_row, src_col).value
 
             if value is not None:
-                wk1_ws.cell(dest_row, dest_col).value = value
+                _rob_set_value(wk1_ws, dest_row, dest_col, value)
 
     return None
 
@@ -5586,8 +5623,13 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
             write_date = date_val
             if col == 5 and month_idx <= prev_idx and prev_week_current_year_date is not None:
                 write_date = prev_week_current_year_date
-            cell.value = write_date
-            cell.number_format = "mm/dd/yyyy"
+            _rob_set_value(
+                new_ws,
+                block_start,
+                col,
+                write_date,
+                number_format="mm/dd/yyyy",
+            )
 
         # ── Data rows (offsets 1–7) ───────────────────────────────────────────
         if month_idx < prev_idx:
@@ -5607,7 +5649,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                             continue
                         v = prev_ws.cell(r, c).value
                         if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            new_ws.cell(r, c).value = v
+                            _rob_set_value(new_ws, r, c, v)
             else:
                 for dr in data_offsets:
                     r = block_start + dr
@@ -5616,7 +5658,12 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         if is_formula(str(new_ws.cell(r, c).value)):
                             continue
                         col_ltr = get_column_letter(c)
-                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+                        _rob_set_value(
+                            new_ws,
+                            r,
+                            c,
+                            f"='{wk_one_sheet_name}'!{col_ltr}{r}",
+                        )
 
         elif month_idx == prev_idx:
             # Prev month (Jun when target=Jul):
@@ -5634,7 +5681,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                                 continue
                             v = ly_ws.cell(r, ly_col).value
                             if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                                new_ws.cell(r, new_col).value = v
+                                _rob_set_value(new_ws, r, new_col, v)
                     ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
                     for dr in [4, 5, 6]:
                         r = block_start + dr
@@ -5643,7 +5690,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                             continue
                         v = ly_ws.cell(r, ly_sec_col).value
                         if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            new_ws.cell(r, 8).value = v
+                            _rob_set_value(new_ws, r, 8, v)
             else:
                 for dr in data_offsets:
                     r = block_start + dr
@@ -5652,7 +5699,12 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         if is_formula(str(new_ws.cell(r, c).value)):
                             continue
                         col_ltr = get_column_letter(c)
-                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+                        _rob_set_value(
+                            new_ws,
+                            r,
+                            c,
+                            f"='{wk_one_sheet_name}'!{col_ltr}{r}",
+                        )
 
         else:
             # Current month and future months (Jul+): cols 2,3,4 from LY ROB
@@ -5668,7 +5720,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         continue
                     v = ly_ws.cell(r, ly_col).value
                     if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        new_ws.cell(r, new_col).value = v
+                        _rob_set_value(new_ws, r, new_col, v)
             ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
             for dr in [4, 5, 6]:
                 r = block_start + dr
@@ -5677,7 +5729,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                     continue
                 v = ly_ws.cell(r, ly_sec_col).value
                 if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                    new_ws.cell(r, 8).value = v
+                    _rob_set_value(new_ws, r, 8, v)
 
 
 def _wk1_previous_table_refs(ws, target_year):
@@ -5740,7 +5792,7 @@ def apply_rob_pickup_wow_formulas(wb, target_year):
                 L=get_column_letter(c)
                 if wi==0:
                     ref=refs.get((mi,year_by_col[c]))
-                    if ref: ws.cell(pr,c).value=f'={L}{rr}-{ref}'
+                    if ref: _rob_set_value(ws, pr, c, f'={L}{rr}-{ref}')
                 else:
                     prev=weeks[wi-1]
                     ws.cell(pr,c).value=f"={L}{rr}-'{prev}'!{L}{rr}"
@@ -6379,7 +6431,8 @@ def setup_next_year_rob_month(
         for mi in range(12):
             row = 4 + step * mi
             for col in range(2, 6):
-                ws.cell(row, col).number_format = "mm/dd/yyyy"
+                if _rob_cell_is_writable(ws, row, col):
+                    ws.cell(row, col).number_format = "mm/dd/yyyy"
 
     if prev_wb and wk_one_name in new_wb.sheetnames:
         err = _fill_rob_prev_table(
