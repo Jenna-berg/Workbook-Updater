@@ -5794,217 +5794,296 @@ def _rob_build_date_first_stly_map(
     return mapping, diagnostics
 
 
-def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name, tracked_year=None, carry_forward_ws=None):
-    """Fill one ROB sheet tab with historical data.
-    Preserves formulas from master template — only overwrites cells with values.
-    """
-    from openpyxl.utils import get_column_letter
 
+_ROB_BASE_METRIC_LABELS = (
+    "revenue",
+    "room nights",
+    "group rms sold",
+    "group rm rev",
+    "perm rms sold",
+    "perm rm rev",
+)
+
+_ROB_SECONDARY_METRIC_LABELS = (
+    "group rms sold",
+    "group rm rev",
+    "group rm adr",
+)
+
+
+def _rob_month_header_rows(ws):
+    """Return {month_index: actual month-header row} from column A."""
+    out = {}
+    for r in range(1, min(ws.max_row, 300) + 1):
+        v = ws.cell(r, 1).value
+        if not isinstance(v, str):
+            continue
+        s = v.strip()
+        key = s[:3].lower()
+        if len(s) <= 12 and key in _MONTH_LABELS:
+            out.setdefault(_MONTH_LABELS[key], r)
+    return out
+
+
+def _rob_copy_month_metrics_by_label(
+    src_ws,
+    dst_ws,
+    month_idx,
+    col_map,
+    labels=_ROB_BASE_METRIC_LABELS,
+    allow_formulas=True,
+):
+    """Copy ROB values by month + metric label, never by physical row."""
+    if src_ws is None or dst_ws is None:
+        return 0
+
+    src_labels = rob_month_blocks(src_ws).get(month_idx, {})
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    if not src_labels or not dst_labels:
+        return 0
+
+    copied = 0
+    for label in labels:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+
+        for src_col, dst_col in col_map.items():
+            value = src_ws.cell(sr, src_col).value
+            if value is None or is_datelike(value):
+                continue
+            if is_formula(str(value)) and not allow_formulas:
+                continue
+            if _rob_set_value(dst_ws, dr, dst_col, value):
+                copied += 1
+
+    return copied
+
+
+def _rob_link_month_metrics_to_wk_one(
+    dst_ws,
+    wk_one_ws,
+    month_idx,
+    labels=_ROB_BASE_METRIC_LABELS,
+):
+    """Link later week tabs to the matching metric row in wk one."""
+    if dst_ws is None or wk_one_ws is None:
+        return 0
+
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    src_labels = rob_month_blocks(wk_one_ws).get(month_idx, {})
+    copied = 0
+
+    for label in labels:
+        dr = dst_labels.get(label)
+        sr = src_labels.get(label)
+        if not dr or not sr:
+            continue
+        for col in (2, 3, 4, 5):
+            L = get_column_letter(col)
+            if _rob_set_value(
+                dst_ws,
+                dr,
+                col,
+                f"='{wk_one_ws.title}'!{L}{sr}",
+            ):
+                copied += 1
+    return copied
+
+
+def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
+    """Copy right-side group comparison metrics into H by label."""
+    if src_ws is None or dst_ws is None:
+        return 0
+
+    src_labels = rob_month_blocks(src_ws).get(month_idx, {})
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    src_header = _rob_month_header_rows(src_ws).get(month_idx)
+    if not src_labels or not dst_labels or not src_header:
+        return 0
+
+    src_sec_col = find_secondary_col(src_ws, src_header) or 7
+    copied = 0
+
+    for label in _ROB_SECONDARY_METRIC_LABELS:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+        value = src_ws.cell(sr, src_sec_col).value
+        if value is None or is_datelike(value):
+            continue
+        if _rob_set_value(dst_ws, dr, 8, value):
+            copied += 1
+
+    return copied
+
+
+
+def _fill_rob_sheet(
+    new_ws,
+    prev_ws,
+    ly_ws,
+    target_month,
+    is_wk_one,
+    wk_one_sheet_name,
+    tracked_year=None,
+    carry_forward_ws=None,
+):
+    """Build a ROB week by date-selected source + month/metric labels."""
     tracked_year = tracked_year or target_month.year
-    target_idx  = target_month.month - 1   # reporting month
-    # When tracking a future year (e.g. 2027 ROB during Oct 2026), every Jan-Dec
-    # block is still future business. Do not treat Jan-Aug as closed/past.
+    target_idx = target_month.month - 1
     prev_idx = -1 if tracked_year > target_month.year else target_idx - 1
-    # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
-    ly_to_new    = {3: 2, 4: 3, 5: 4}
-    # Rows per month block, read off each sheet rather than assumed (8 for most
-    # hotels, 11 where there's a Permanent-rooms section). Last year's workbook
-    # is measured separately so a template change between years can't shift the
-    # rows we read from.
-    step         = rob_block_step(new_ws)
-    ly_step      = rob_block_step(ly_ws) if ly_ws is not None else step
-    data_offsets = list(range(1, step))    # offset 0 (date header) handled separately
+    ly_to_new = {3: 2, 4: 3, 5: 4}
 
-    # ── As-of dates for this week tab ──────────────────────────────────────
-    # Taken from row 4 of THIS sheet's counterpart in last year's ROB, so
-    # AUG2026 'wk two' gets its 2023/2024/2025 reporting dates from AUG2025
-    # 'wk two'. Each week was reported roughly seven days apart, so these must
-    # never be shared between tabs.
-    #
-    # Row 4 specifically: it holds the literal dates, while every month block
-    # below it chains upward (=B4, =B52, ...). Reading a lower block instead
-    # picks up the chain formula itself on most sheets — and on some it picks
-    # up whatever else is parked in that cell (one real file has a revenue
-    # figure sitting in the Aug block's date position on 'wk two'). Requiring
-    # a real date type keeps that kind of stray number out of the header.
-    #
-    # Col 5 (current year) is a placeholder; the weekly update stamps the real
-    # as-of date when it runs.
+    new_headers = _rob_month_header_rows(new_ws)
+
+    # STLY reporting-date headers from the specifically selected historical week.
     as_of_dates = {}
-    if ly_ws:
+    if ly_ws is not None:
         for ly_col, new_col in ly_to_new.items():
-            v = ly_ws.cell(4, ly_col).value
-            # A never-used week tab carries Excel's zero date (1899-12-30),
-            # which is a real datetime and would otherwise be copied across as
-            # though it were a reporting date.
-            if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
-                as_of_dates[new_col] = v
-    prev_week_current_year_date = None
+            value = ly_ws.cell(4, ly_col).value
+            if (
+                isinstance(value, (datetime.datetime, datetime.date))
+                and value.year >= 2000
+            ):
+                as_of_dates[new_col] = value
+
+    prev_ty_date = None
     if prev_ws is not None:
-        v = prev_ws.cell(4, 5).value
-        if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
-            prev_week_current_year_date = v
-    as_of_dates[5] = datetime.datetime(target_month.year, target_month.month, target_month.day)
+        value = prev_ws.cell(4, 5).value
+        if (
+            isinstance(value, (datetime.datetime, datetime.date))
+            and value.year >= 2000
+        ):
+            prev_ty_date = value
+
+    as_of_dates[5] = datetime.datetime(
+        target_month.year,
+        target_month.month,
+        target_month.day,
+    )
+
+    wk_one_ws = (
+        new_ws.parent[wk_one_sheet_name]
+        if wk_one_sheet_name in new_ws.parent.sheetnames
+        else None
+    )
 
     for month_idx in range(12):
-        block_start = 4 + step * month_idx
+        header_row = new_headers.get(month_idx)
+        if not header_row:
+            continue
 
-        # ── Date header row (offset 0) ─────────────────────────────────────
-        # Weeks 2+ used to get ='wk one'!<col><row> here, which forced every
-        # week tab to display wk one's reporting dates.
-        #
-        # Row 4 always gets the real date. Month blocks below it keep a
-        # same-sheet chain (=B4, =SUM(B12)) because that correctly carries
-        # THIS tab's date down the sheet — but a cross-sheet reference is
-        # overwritten, since pointing at another week's tab reintroduces the
-        # very problem being fixed (one real template chains its lower blocks
-        # to ='wk one'!B11).
-        for col, date_val in as_of_dates.items():
-            cell = new_ws.cell(block_start, col)
-            cur = str(cell.value) if cell.value is not None else ""
-            same_sheet_chain = is_formula(cur) and "!" not in cur
-            if block_start != 4 and same_sheet_chain:
+        # Date rows: use the actual month-header row for THIS tab.
+        for col, date_value in as_of_dates.items():
+            current = new_ws.cell(header_row, col).value
+            current_text = str(current) if current is not None else ""
+
+            # Preserve normal same-sheet date chains below row 4.
+            if (
+                header_row != 4
+                and is_formula(current_text)
+                and "!" not in current_text
+            ):
                 continue
-            write_date = date_val
-            if col == 5 and month_idx <= prev_idx and prev_week_current_year_date is not None:
-                write_date = prev_week_current_year_date
+
+            write_date = date_value
+            if (
+                col == 5
+                and month_idx <= prev_idx
+                and prev_ty_date is not None
+            ):
+                write_date = prev_ty_date
+
             _rob_set_value(
                 new_ws,
-                block_start,
+                header_row,
                 col,
                 write_date,
                 number_format="mm/dd/yyyy",
             )
 
-        # ── Data rows (offsets 1–7) ───────────────────────────────────────────
+        # Closed months: wk one gets the completed prior ROB;
+        # subsequent weeks link to wk one by matching metric label.
         if month_idx < prev_idx:
-            # Past months (Jan–May when target=Jul): copy all 4 cols from prev ROB
-            # For new hotels with no historical data (e.g., first year), prev_ws will be None —
-            # just skip and leave those months with master template values (no error).
-            if not _is_rob_month_blank(new_ws, block_start):
-                continue
             if is_wk_one:
-                if prev_ws is None:
-                    continue
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        v = prev_ws.cell(r, c).value
-                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            _rob_set_value(new_ws, r, c, v)
+                _rob_copy_month_metrics_by_label(
+                    prev_ws,
+                    new_ws,
+                    month_idx,
+                    {2: 2, 3: 3, 4: 4, 5: 5},
+                    allow_formulas=True,
+                )
             else:
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        col_ltr = get_column_letter(c)
-                        _rob_set_value(
-                            new_ws,
-                            r,
-                            c,
-                            f"='{wk_one_sheet_name}'!{col_ltr}{r}",
-                        )
+                _rob_link_month_metrics_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+            continue
 
-        elif month_idx == prev_idx:
-            # Prev month (Jun when target=Jul):
-            # Cols 2,3,4 = historical years from LY ROB (same source as Jul+)
-            # Col 5     = actual current-year data from prev ROB (built up weekly)
-            if not _is_rob_month_blank(new_ws, block_start):
-                continue
+        # Immediately previous month:
+        # historical B:D from selected STLY snapshot; current E from prior ROB.
+        if month_idx == prev_idx:
             if is_wk_one:
-                if ly_ws:
-                    for dr in data_offsets:
-                        r = block_start + dr
-                        for ly_col, new_col in ly_to_new.items():
-                            # Skip if master template has a formula in this cell
-                            if is_formula(str(new_ws.cell(r, new_col).value)):
-                                continue
-                            v = ly_ws.cell(r, ly_col).value
-                            if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                                _rob_set_value(new_ws, r, new_col, v)
-                    ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
-                    for dr in [4, 5, 6]:
-                        r = block_start + dr
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, 8).value)):
-                            continue
-                        v = ly_ws.cell(r, ly_sec_col).value
-                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            _rob_set_value(new_ws, r, 8, v)
+                _rob_copy_month_metrics_by_label(
+                    ly_ws,
+                    new_ws,
+                    month_idx,
+                    ly_to_new,
+                    allow_formulas=True,
+                )
+                _rob_copy_secondary_by_label(
+                    ly_ws,
+                    new_ws,
+                    month_idx,
+                )
+                _rob_copy_month_metrics_by_label(
+                    prev_ws,
+                    new_ws,
+                    month_idx,
+                    {5: 5},
+                    allow_formulas=True,
+                )
             else:
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        col_ltr = get_column_letter(c)
-                        _rob_set_value(
-                            new_ws,
-                            r,
-                            c,
-                            f"='{wk_one_sheet_name}'!{col_ltr}{r}",
-                        )
+                _rob_link_month_metrics_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+            continue
 
-        else:
-            # Current month and future months:
-            #   cols B:D = STLY/historical values from the date-mapped LY snapshot
-            #   col E    = carry forward the most recent current-year OTB values
-            #              already captured in the previous month's latest completed
-            #              ROB week. This preserves October values that were already
-            #              being tracked in September wk5/wk6, etc.
-            if ly_ws is not None:
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for ly_col, new_col in ly_to_new.items():
-                        if is_formula(str(new_ws.cell(r, new_col).value)):
-                            continue
-                        v = ly_ws.cell(r, ly_col).value
-                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            _rob_set_value(new_ws, r, new_col, v)
+        # Current/future months:
+        # B:D from this destination week's selected historical ROB snapshot.
+        _rob_copy_month_metrics_by_label(
+            ly_ws,
+            new_ws,
+            month_idx,
+            ly_to_new,
+            allow_formulas=True,
+        )
+        _rob_copy_secondary_by_label(
+            ly_ws,
+            new_ws,
+            month_idx,
+        )
 
-                ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
-                for dr in [4, 5, 6]:
-                    r = block_start + dr
-                    if is_formula(str(new_ws.cell(r, 8).value)):
-                        continue
-                    v = ly_ws.cell(r, ly_sec_col).value
-                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        _rob_set_value(new_ws, r, 8, v)
-
-            # Only wk one gets the carry-forward baseline. Later week tabs are
-            # populated by their own weekly updates, so we should not make them
-            # duplicate the same OTB snapshot.
-            if is_wk_one and carry_forward_ws is not None:
-                cf_step = rob_block_step(carry_forward_ws)
-                cf_block_start = 4 + cf_step * month_idx
-
-                for dr in data_offsets:
-                    new_r = block_start + dr
-                    cf_r = cf_block_start + dr
-
-                    if is_formula(str(new_ws.cell(new_r, 5).value)):
-                        continue
-
-                    v = carry_forward_ws.cell(cf_r, 5).value
-                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        _rob_set_value(new_ws, new_r, 5, v)
-
-                # Carry the secondary/group values on the right side too.
-                cf_sec_col = find_secondary_col(carry_forward_ws, cf_block_start) or 7
-                for dr in [4, 5, 6]:
-                    new_r = block_start + dr
-                    cf_r = cf_block_start + dr
-                    if is_formula(str(new_ws.cell(new_r, 8).value)):
-                        continue
-                    v = carry_forward_ws.cell(cf_r, cf_sec_col).value
-                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        _rob_set_value(new_ws, new_r, 8, v)
+        # wk one only: carry forward already-captured current-year OTB by label.
+        if is_wk_one and carry_forward_ws is not None:
+            _rob_copy_month_metrics_by_label(
+                carry_forward_ws,
+                new_ws,
+                month_idx,
+                {5: 5},
+                allow_formulas=True,
+            )
+            _rob_copy_secondary_by_label(
+                carry_forward_ws,
+                new_ws,
+                month_idx,
+            )
 
 
 def _wk1_previous_table_refs(ws, target_year):
@@ -6043,10 +6122,14 @@ def _wk1_previous_table_refs(ws, target_year):
     return {(mi,y):ws.cell(r,c).coordinate for mi,r in mrows.items() for y,c in ycols.items()}
 
 
-def apply_rob_pickup_wow_formulas(wb, target_year):
+def apply_rob_pickup_wow_formulas(wb, target_year, allowed_sheets=None):
     """All months, all year columns: current-week Revenue minus prior-week Revenue."""
     from openpyxl.utils import get_column_letter
-    weeks=[s for s in ROB_SHEETS if s in wb.sheetnames]
+    weeks=[
+        s for s in ROB_SHEETS
+        if s in wb.sheetnames
+        and (allowed_sheets is None or s in allowed_sheets)
+    ]
     if not weeks: return ['Pickup WoW formulas: no ROB week tabs found.']
     wk1=wb[weeks[0]]; refs=_wk1_previous_table_refs(wk1,target_year)
     year_by_col={}
@@ -6070,7 +6153,19 @@ def apply_rob_pickup_wow_formulas(wb, target_year):
                     if ref: _rob_set_value(ws, pr, c, f'={L}{rr}-{ref}')
                 else:
                     prev=weeks[wi-1]
-                    ws.cell(pr,c).value=f"={L}{rr}-'{prev}'!{L}{rr}"
+                    prev_ws = wb[prev]
+                    prev_rr = (
+                        rob_month_blocks(prev_ws)
+                        .get(mi, {})
+                        .get("revenue")
+                    )
+                    if prev_rr:
+                        _rob_set_value(
+                            ws,
+                            pr,
+                            c,
+                            f"={L}{rr}-'{prev}'!{L}{prev_rr}",
+                        )
     return [] if refs else ['Pickup WoW formulas: WK1 previous table could not be mapped; WK1 formulas left unchanged.']
 
 
@@ -6285,7 +6380,13 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         new_ws  = new_wb[sheet_name]
         prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
         stly_snap = stly_week_map.get(sheet_name)
-        ly_ws = stly_snap["worksheet"] if stly_snap else None
+        if not stly_snap:
+            warnings.append(
+                f"{sheet_name}: no date-mapped STLY snapshot; tab left untouched"
+            )
+            continue
+
+        ly_ws = stly_snap["worksheet"]
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(
             new_ws,
@@ -6344,7 +6445,13 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         if err:
             warnings.append(f"Prev table: {err}")
 
-    warnings.extend(apply_rob_pickup_wow_formulas(new_wb, target_month.year))
+    warnings.extend(
+        apply_rob_pickup_wow_formulas(
+            new_wb,
+            target_month.year,
+            allowed_sheets=set(stly_week_map.keys()),
+        )
+    )
 
     strip_tables(new_wb)
     out = io.BytesIO()
@@ -6793,12 +6900,10 @@ def setup_next_year_rob_month(
 
     # Normalize ROB date displays.
     for s in ROB_SHEETS:
-        if s not in new_wb.sheetnames:
+        if s not in new_wb.sheetnames or s not in stly_week_map:
             continue
         ws = new_wb[s]
-        step = rob_block_step(ws)
-        for mi in range(12):
-            row = 4 + step * mi
+        for row in _rob_month_header_rows(ws).values():
             for col in range(2, 6):
                 if _rob_cell_is_writable(ws, row, col):
                     ws.cell(row, col).number_format = "mm/dd/yyyy"
@@ -6815,7 +6920,7 @@ def setup_next_year_rob_month(
             warnings.append(f"Prev table: {err}")
 
     warnings.extend(
-        apply_rob_pickup_wow_formulas(new_wb, tracked_year)
+        apply_rob_pickup_wow_formulas(new_wb, tracked_year, allowed_sheets=None)
     )
 
     strip_tables(new_wb)
