@@ -5549,6 +5549,182 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracke
     return None
 
 
+
+def _rob_valid_date(value):
+    """Return a real ROB as-of date or None."""
+    if isinstance(value, datetime.datetime):
+        value = value.date()
+    if isinstance(value, datetime.date) and value.year >= 2000:
+        return value
+    return None
+
+
+def _rob_last_completed_week(prev_wb, target_month):
+    """Return the previous ROB's last actually-used week sheet.
+
+    Completion is based on the previous month block's current-year Revenue /
+    Rooms Sold cells, matching the existing Week 1 Previous logic.
+    """
+    if prev_wb is None:
+        return None
+
+    prev_month = (
+        target_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+    prev_month_idx = prev_month.month - 1
+
+    for candidate in reversed(ROB_SHEETS):
+        if candidate not in prev_wb.sheetnames:
+            continue
+        ws = prev_wb[candidate]
+        labels = rob_month_blocks(ws).get(prev_month_idx, {})
+        rev_row = labels.get("revenue")
+        rms_row = (
+            labels.get("room nights")
+            or labels.get("rms sold")
+            or labels.get("rooms sold")
+        )
+        if not rev_row:
+            continue
+
+        rev_val = ws.cell(rev_row, 5).value
+        rms_val = ws.cell(rms_row, 5).value if rms_row else None
+        if rev_val is not None or rms_val is not None:
+            return candidate
+
+    return None
+
+
+def _rob_previous_stly_anchor_date(prev_wb, target_month):
+    """Historical as-of date already consumed by the prior month's last week.
+
+    For a 2026 ROB, column D is the 2025 snapshot date. If AUG2026 wk five
+    already used 09/03/2025, SEP2026 must start with the next STLY snapshot,
+    not restart at SEP2025 wk one.
+    """
+    sheet_name = _rob_last_completed_week(prev_wb, target_month)
+    if not sheet_name:
+        return None, None
+
+    ws = prev_wb[sheet_name]
+    # Current ROB year columns B:E = TY-3, TY-2, TY-1, TY.
+    anchor = _rob_valid_date(ws.cell(4, 4).value)
+    return anchor, sheet_name
+
+
+def _rob_collect_stly_snapshots(source_workbooks):
+    """Build one chronological pool of STLY weekly snapshots.
+
+    source_workbooks: iterable of (label, workbook), typically the comparable
+    prior-year month plus the following prior-year month. Using a pool allows
+    4-week and 5-week months to cross month-file boundaries naturally.
+    """
+    snapshots = []
+    seen = set()
+
+    for wb_label, wb in source_workbooks:
+        if wb is None:
+            continue
+        for sheet_name in ROB_SHEETS:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+
+            # In the prior-year ROB, column E is that workbook's current year.
+            source_date = _rob_valid_date(ws.cell(4, 5).value)
+            if source_date is None:
+                continue
+
+            key = (source_date, wb_label, sheet_name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            snapshots.append({
+                "date": source_date,
+                "sheet_name": sheet_name,
+                "worksheet": ws,
+                "workbook_label": wb_label,
+            })
+
+    snapshots.sort(
+        key=lambda x: (
+            x["date"],
+            ROB_SHEETS.index(x["sheet_name"])
+            if x["sheet_name"] in ROB_SHEETS else 999,
+        )
+    )
+    return snapshots
+
+
+def _rob_build_date_first_stly_map(
+    new_wb,
+    prev_wb,
+    target_month,
+    source_workbooks,
+):
+    """Map destination week tabs to STLY snapshots by chronology, not tab name.
+
+    Rule:
+      - identify the STLY snapshot already used by the prior month's final week
+      - start with the first historical snapshot AFTER that date
+      - continue forward one historical snapshot per destination week tab
+      - allow snapshots to come from the following prior-year month workbook
+
+    Returns (mapping, diagnostics)
+      mapping = {destination_sheet: snapshot_dict}
+    """
+    snapshots = _rob_collect_stly_snapshots(source_workbooks)
+    if not snapshots:
+        return {}, ["No dated STLY ROB week snapshots were found."]
+
+    anchor_date, anchor_sheet = _rob_previous_stly_anchor_date(
+        prev_wb,
+        target_month,
+    )
+
+    if anchor_date is not None:
+        available = [
+            s for s in snapshots
+            if s["date"] > anchor_date
+        ]
+    else:
+        # Fallback for a first-ever setup with no previous ROB: start from the
+        # first dated snapshot in the comparable prior-year month.
+        available = list(snapshots)
+
+    mapping = {}
+    diagnostics = []
+
+    dest_sheets = [
+        s for s in ROB_SHEETS
+        if s in new_wb.sheetnames
+    ]
+
+    for dest_sheet, snap in zip(dest_sheets, available):
+        mapping[dest_sheet] = snap
+        diagnostics.append(
+            f"{dest_sheet} <- {snap['workbook_label']} / "
+            f"{snap['sheet_name']} ({snap['date']:%m/%d/%Y})"
+        )
+
+    if anchor_date is not None:
+        diagnostics.insert(
+            0,
+            f"STLY date anchor from previous ROB {anchor_sheet}: "
+            f"{anchor_date:%m/%d/%Y}",
+        )
+
+    if len(available) < len(dest_sheets):
+        diagnostics.append(
+            f"Only {len(available)} dated STLY snapshots were available for "
+            f"{len(dest_sheets)} destination week tabs."
+        )
+
+    return mapping, diagnostics
+
+
+
 def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name, tracked_year=None):
     """Fill one ROB sheet tab with historical data.
     Preserves formulas from master template — only overwrites cells with values.
@@ -5892,15 +6068,59 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     )
     ly_wb = None
     if ly_result:
-        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: {ly_result[1]}")
+        warnings.append(
+            f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: "
+            f"{ly_result[1]}"
+        )
         try:
             ly_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, ly_result[0])), data_only=True)
+                io.BytesIO(drive_download(service, ly_result[0])),
+                data_only=True,
+            )
         except Exception as e:
-            warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
+            warnings.append(
+                f"Last year ({ly_month_dt.strftime('%b %Y')}) workbook "
+                f"found but failed to load: {e}"
+            )
     else:
-        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) not found — future months' historical "
-                         f"columns will be blank: {ly_err}")
+        warnings.append(
+            f"Last year ({ly_month_dt.strftime('%b %Y')}) not found: {ly_err}"
+        )
+
+    # Also load the following prior-year month. This is required when the
+    # destination month has more reporting weeks than the comparable STLY
+    # month. Example: SEP2026 can legitimately continue into OCT2025 snapshots.
+    next_ly_month_dt = (
+        ly_month_dt + datetime.timedelta(days=32)
+    ).replace(day=1)
+    next_ly_result, next_ly_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        next_ly_month_dt,
+    )
+    next_ly_wb = None
+    if next_ly_result:
+        warnings.append(
+            f"Following STLY month ({next_ly_month_dt.strftime('%b %Y')}) "
+            f"resolved to: {next_ly_result[1]}"
+        )
+        try:
+            next_ly_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, next_ly_result[0])),
+                data_only=True,
+            )
+        except Exception as e:
+            warnings.append(
+                f"Following STLY month "
+                f"({next_ly_month_dt.strftime('%b %Y')}) failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Following STLY month "
+            f"({next_ly_month_dt.strftime('%b %Y')}) not found: {next_ly_err}"
+        )
 
     # Sheet lookups below are exact, case-sensitive matches against
     # ROB_SHEETS ("wk one", "wk two", ...) — a workbook can load successfully
@@ -5910,7 +6130,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # named "wk one" (so wk one fills fine) while missing/mismatching "wk
     # two" through "wk six" — confirmed real case where wk one populated but
     # wk two silently didn't. Check every ROB_SHEETS name, not just the first.
-    for label, wb_obj in [("Prev month", prev_wb), ("Last year", ly_wb)]:
+    for label, wb_obj in [
+        ("Prev month", prev_wb),
+        ("Last year", ly_wb),
+        ("Following STLY month", next_ly_wb),
+    ]:
         if wb_obj is None:
             continue
         missing = [s for s in ROB_SHEETS if s not in wb_obj.sheetnames]
@@ -5921,13 +6145,30 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             )
 
     # ── Fill each sheet ───────────────────────────────────────────────────────
+    # STLY source weeks are selected by actual chronological snapshot dates,
+    # not by matching destination/source tab names.
+    stly_week_map, stly_map_diag = _rob_build_date_first_stly_map(
+        new_wb,
+        prev_wb,
+        target_month,
+        [
+            (ly_month_dt.strftime("%b%Y").upper(), ly_wb),
+            (next_ly_month_dt.strftime("%b%Y").upper(), next_ly_wb),
+        ],
+    )
+    if stly_map_diag:
+        warnings.append(
+            "Date-first STLY week map — " + " | ".join(stly_map_diag)
+        )
+
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
             continue
         new_ws  = new_wb[sheet_name]
         prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
-        ly_ws   = ly_wb[sheet_name]   if ly_wb   and sheet_name in ly_wb.sheetnames   else None
+        stly_snap = stly_week_map.get(sheet_name)
+        ly_ws = stly_snap["worksheet"] if stly_snap else None
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name, tracked_year=target_month.year)
 
@@ -5950,7 +6191,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # real case where wk one's fill succeeded but wk two's silently didn't.
     # Also check Jan/Feb/Mar/Dec to verify backward/future months are filled.
     target_idx = target_month.month - 1
-    target_block_start = 4 + 8 * target_idx
+    _diag_step = rob_block_step(new_wb[ROB_SHEETS[0]]) if ROB_SHEETS[0] in new_wb.sheetnames else 8
+    target_block_start = 4 + _diag_step * target_idx
     readback = {
         s: new_wb[s].cell(target_block_start + 1, 2).value
         for s in ROB_SHEETS if s in new_wb.sheetnames
@@ -5960,7 +6202,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ws = new_wb[wk_one_sheet]
         month_check = {}
         for m, mlabel in [(1, "Jan"), (2, "Feb"), (3, "Mar"), (12, "Dec")]:
-            block = 4 + 8 * (m - 1)
+            block = 4 + rob_block_step(ws) * (m - 1)
             month_check[mlabel] = ws.cell(block + 1, 2).value
         warnings.append(
             f"Months check (wk one only) — Jan/Feb/Mar/Dec Revenue (col B): {month_check!r}"
