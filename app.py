@@ -3493,6 +3493,43 @@ def _snt_rate_and_mlos_from_row(row):
     return rate, mlos
 
 
+def _find_restrictions_col(ws):
+    """Find the Strategy Restrictions destination column from rows 1-4.
+
+    This avoids assuming a fixed column and supports Ashworth, where the
+    Casino Ballroom section can shift Restrictions to a different position.
+    """
+    if ws is None:
+        return None
+
+    for r in range(1, min(ws.max_row, 4) + 1):
+        for c in range(1, min(ws.max_column, 60) + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            label = re.sub(r"\s+", " ", str(value).strip()).lower()
+            if label in {
+                "restrictions",
+                "restriction",
+                "restrictions / mlos",
+                "restriction / mlos",
+                "mlos / restrictions",
+                "mlos/restrictions",
+            }:
+                return c
+
+    for r in range(1, min(ws.max_row, 4) + 1):
+        for c in range(1, min(ws.max_column, 60) + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            label = re.sub(r"\s+", " ", str(value).strip()).lower()
+            if "restrict" in label:
+                return c
+
+    return None
+
+
 def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
     today = datetime.date.today()
     # include previous month — final numbers arrive on the 1st of the following month
