@@ -12709,7 +12709,8 @@ with tab_ancillary:
                     key="pw_stly_lco",
                 )
 
-            with st.expander("Weekly Canary messaging KPI update (optional)"):
+            st.markdown("**Weekly Canary messaging KPI update (optional)**")
+            with st.container(border=True):
                 pm1, pm2 = st.columns(2)
                 with pm1:
                     pw_msg_total = st.number_input(
