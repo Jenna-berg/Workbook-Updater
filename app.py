@@ -7,6 +7,7 @@ from openpyxl.chart import PieChart, BarChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.axis import ChartLines
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.formula.translate import Translator
 import io
 import csv
 import re
@@ -9057,6 +9058,439 @@ def ancillary_build_monthly_report(template_bytes, property_name, report_month, 
     output=ancillary_render_report(template_bytes,property_name,key,report_month,main,addon['operational'],addon['itemized'],upgrades,stly,variance,staff,messaging,engagement)
     return output, {'mainRows':main,'stly':stly,'variance':variance,'operational':addon['operational'],'itemized':addon['itemized'],'upgrades':upgrades,'staff':staff}
 
+
+# ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
+PLYMOUTH_WEEKLY_COLS = {
+    1: (2, 3),   # B/C
+    2: (4, 5),   # D/E
+    3: (6, 7),   # F/G
+    4: (8, 9),   # H/I
+    5: (10, 11), # J/K
+}
+
+
+def _plymouth_find_row(ws, label, start=1, end=None):
+    """Find an exact normalized label in column A."""
+    end = end or ws.max_row
+    target = _ar_norm(label)
+    for r in range(start, min(end, ws.max_row) + 1):
+        if _ar_norm(ws.cell(r, 1).value) == target:
+            return r
+    return None
+
+
+def _plymouth_find_next_row(ws, label, start=1, end=None):
+    """Same as _plymouth_find_row but convenient for repeated section labels."""
+    return _plymouth_find_row(ws, label, start=start, end=end)
+
+
+def _plymouth_block_rows(ws, first_row, stop_row):
+    """Return row map for a named data block, excluding TOTALS."""
+    out = {}
+    if not first_row or not stop_row:
+        return out
+    for r in range(first_row, stop_row):
+        label = str(ws.cell(r, 1).value or "").strip()
+        if not label or _ar_norm(label) == "totals":
+            continue
+        out[_ar_norm(label)] = r
+    return out
+
+
+def _plymouth_section_layout(ws, report_year):
+    """Locate the weekly Plymouth sections from labels, not fixed row numbers."""
+    stly_row = _plymouth_find_row(ws, "STLY")
+    variance_row = _plymouth_find_row(ws, "VARIANCE")
+    if not stly_row or not variance_row:
+        raise ValueError(
+            "The selected Plymouth month tab is not in the July–September "
+            "weekly tracking format (STLY/VARIANCE sections were not found)."
+        )
+
+    current_total = _plymouth_find_row(ws, "TOTALS", start=4, end=stly_row - 1)
+    stly_total = _plymouth_find_row(
+        ws, "TOTALS", start=stly_row + 1, end=variance_row - 1
+    )
+    variance_total = _plymouth_find_row(
+        ws, "TOTALS", start=variance_row + 1, end=ws.max_row
+    )
+
+    if not current_total or not stly_total or not variance_total:
+        raise ValueError("Could not locate Plymouth weekly TOTALS rows.")
+
+    # Current itemized section: first year row after variance.
+    current_item_year = None
+    stly_item_year = None
+    for r in range(variance_total + 1, min(ws.max_row, variance_total + 80) + 1):
+        v = ws.cell(r, 1).value
+        try:
+            year = int(float(v))
+        except Exception:
+            continue
+        if year == report_year and current_item_year is None:
+            current_item_year = r
+        elif year == report_year - 1 and current_item_year is not None:
+            stly_item_year = r
+            break
+
+    if not current_item_year or not stly_item_year:
+        raise ValueError(
+            "Could not locate current-year and STLY ECI/LCO itemized sections."
+        )
+
+    current_item_total = stly_item_year - 1
+    while current_item_total > current_item_year:
+        if str(ws.cell(current_item_total, 1).value or "").strip():
+            break
+        current_item_total -= 1
+
+    return {
+        "current_header": 2,
+        "current_first": 4,
+        "current_total": current_total,
+        "stly_header": stly_row,
+        "stly_first": stly_row + 2,
+        "stly_total": stly_total,
+        "variance_header": variance_row,
+        "variance_first": variance_row + 2,
+        "variance_total": variance_total,
+        "current_item_header": current_item_year,
+        "current_item_first": current_item_year + 2,
+        "current_item_end": stly_item_year - 1,
+        "stly_item_header": stly_item_year,
+        "stly_item_first": stly_item_year + 2,
+        "stly_item_end": min(ws.max_row + 1, stly_item_year + 20),
+    }
+
+
+def _plymouth_write_named_rows(ws, row_map, rows, count_col, revenue_col, value_key="revenue"):
+    """Write count/revenue for rows already present in the Plymouth tracker."""
+    written = 0
+    missing = []
+    by_norm = {_ar_norm(x.get("name")): x for x in rows}
+
+    # Clear the selected pair in the existing block first so a prior test/run
+    # cannot leave stale values for items that are now zero/absent.
+    for r in row_map.values():
+        ws.cell(r, count_col).value = None
+        ws.cell(r, revenue_col).value = None
+
+    for key, obj in by_norm.items():
+        r = row_map.get(key)
+        if not r:
+            missing.append(obj.get("name"))
+            continue
+
+        count = obj.get("count")
+        revenue = obj.get(value_key)
+        if revenue is None:
+            revenue = obj.get("approved")
+        if count is not None:
+            ws.cell(r, count_col).value = _ar_num(count) or 0
+        if revenue is not None:
+            ws.cell(r, revenue_col).value = _ar_num(revenue) or 0
+        written += 1
+
+    return written, missing
+
+
+def _plymouth_extend_variance_formulas(ws, layout, week_slot):
+    """Extend the existing variance formulas to the selected week pair.
+
+    This deliberately translates the prior pair's formulas instead of rebuilding
+    the variance logic from item names. Plymouth has hand-resolved current/STLY
+    aliases in this section, and Translator preserves absolute STLY references.
+    """
+    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[week_slot]
+    if week_slot == 1:
+        return
+
+    prev_count_col, prev_revenue_col = PLYMOUTH_WEEKLY_COLS[week_slot - 1]
+    delta = count_col - prev_count_col
+
+    for r in range(layout["variance_first"], layout["variance_total"]):
+        for src_col, dst_col in (
+            (prev_count_col, count_col),
+            (prev_revenue_col, revenue_col),
+        ):
+            src = ws.cell(r, src_col)
+            dst = ws.cell(r, dst_col)
+            if isinstance(src.value, str) and src.value.startswith("="):
+                try:
+                    dst.value = Translator(
+                        src.value,
+                        origin=src.coordinate,
+                    ).translate_formula(dst.coordinate)
+                except Exception:
+                    dst.value = src.value
+
+    # TOTALS row formulas are normally prebuilt, but fill them if blank.
+    total_row = layout["variance_total"]
+    for col in (count_col, revenue_col):
+        cell = ws.cell(total_row, col)
+        if cell.value in (None, ""):
+            L = get_column_letter(col)
+            cell.value = (
+                f"=SUM({L}{layout['variance_first']}:{L}{total_row - 1})"
+            )
+
+
+def _plymouth_write_messaging(ws, messaging, week_date=None, engagement_rate=None, week_slot=None):
+    """Update Plymouth's right-side messaging KPI block without touching charts."""
+    label_hits = {}
+    for r in range(1, min(ws.max_row, 80) + 1):
+        for c in range(18, min(ws.max_column, 25) + 1):
+            label = _ar_norm(ws.cell(r, c).value)
+            if label in {
+                "total messages",
+                "of messages guest sent",
+                "of messages hotel sent",
+                "of your guests that sent a message",
+                "response rate",
+                "average minutes to respond",
+                "median minutes to respond",
+            }:
+                label_hits[label] = (r, c)
+
+    key_map = {
+        "total messages": "msgTotal",
+        "of messages guest sent": "msgGuest",
+        "of messages hotel sent": "msgHotel",
+        "of your guests that sent a message": "msgGuestPct",
+        "response rate": "responseRate",
+        "average minutes to respond": "avgResponse",
+        "median minutes to respond": "medianResponse",
+    }
+
+    for label, key in key_map.items():
+        hit = label_hits.get(label)
+        if not hit:
+            continue
+        r, label_col = hit
+        current_col = label_col + 1
+        if key in messaging and messaging.get(key) is not None:
+            ws.cell(r, current_col).value = messaging.get(key)
+
+    # One engagement point per weekly run.
+    if week_date is not None and engagement_rate is not None and week_slot:
+        date_row = None
+        date_col = None
+        for r in range(1, min(ws.max_row, 80) + 1):
+            for c in range(18, min(ws.max_column, 25) + 1):
+                if _ar_norm(ws.cell(r, c).value) == "date":
+                    nxt = _ar_norm(ws.cell(r, c + 1).value)
+                    if nxt == "rate":
+                        date_row, date_col = r, c
+                        break
+            if date_row:
+                break
+        if date_row:
+            target_row = date_row + week_slot
+            ws.cell(target_row, date_col).value = datetime.datetime.combine(
+                week_date, datetime.time()
+            )
+            ws.cell(target_row, date_col + 1).value = engagement_rate
+            ws.cell(target_row, date_col + 1).number_format = "0.0%"
+
+
+def plymouth_build_weekly_update(
+    workbook_bytes,
+    report_month,
+    week_slot,
+    week_date,
+    addon_file,
+    upsell_file,
+    stly_addon_file,
+    stly_upsell_file,
+    journal_values=None,
+    stly_journal_values=None,
+    messaging=None,
+    engagement_rate=None,
+    month_end=False,
+):
+    """Update one Plymouth weekly MTD snapshot inside the existing month tab."""
+    journal_values = journal_values or []
+    stly_journal_values = stly_journal_values or []
+    messaging = messaging or {}
+
+    wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes), data_only=False)
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(
+            f"Plymouth weekly tab **{sheet_name}** was not found in the "
+            "existing tracking workbook. Create the new month tab from the "
+            "weekly template first, then run the weekly updater."
+        )
+
+    ws = wb[sheet_name]
+    layout = _plymouth_section_layout(ws, report_month.year)
+    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[int(week_slot)]
+
+    # Parse current-year MTD source.
+    profile, key = ancillary_profile("Hotel 1620")
+    addon = ancillary_parse_addon(_ar_file_rows(addon_file), key)
+    upgrades = ancillary_parse_upsell(_ar_file_rows(upsell_file))
+
+    journal_agg = {}
+    for i, j in enumerate(profile.get("journal", [])):
+        value = journal_values[i] if i < len(journal_values) else None
+        if value is None:
+            continue
+        journal_agg[j["report"]] = (
+            journal_agg.get(j["report"], 0) + (_ar_num(value) or 0)
+        )
+
+    journal_rows = [
+        {"name": name, "count": None, "revenue": value, "average": None}
+        for name, value in journal_agg.items()
+    ]
+
+    main = [
+        r for r in addon["main"]
+        if not _ar_is_journal_equivalent(r["name"])
+    ]
+    main = journal_rows + main + upgrades["byRoomType"]
+
+    # Parse STLY MTD source.
+    stly = ancillary_parse_snt_history(
+        _ar_file_rows(stly_addon_file),
+        _ar_file_rows(stly_upsell_file),
+        key,
+    )
+    if profile.get("stlyJournal"):
+        rows = []
+        for i, j in enumerate(profile.get("journal", [])[:2]):
+            value = (
+                stly_journal_values[i]
+                if i < len(stly_journal_values)
+                else None
+            )
+            rows.append({"name": j["report"], "revenue": value})
+        stly = ancillary_apply_stly_journal(stly, rows)
+
+    # Existing block row maps.
+    current_map = _plymouth_block_rows(
+        ws, layout["current_first"], layout["current_total"]
+    )
+    stly_map = _plymouth_block_rows(
+        ws, layout["stly_first"], layout["stly_total"]
+    )
+    cur_item_map = _plymouth_block_rows(
+        ws, layout["current_item_first"], layout["current_item_end"]
+    )
+    stly_item_map = _plymouth_block_rows(
+        ws, layout["stly_item_first"], layout["stly_item_end"]
+    )
+
+    current_written, current_missing = _plymouth_write_named_rows(
+        ws, current_map, main, count_col, revenue_col, value_key="revenue"
+    )
+    stly_written, stly_missing = _plymouth_write_named_rows(
+        ws, stly_map, stly.get("rows", []), count_col, revenue_col,
+        value_key="approved",
+    )
+    item_written, item_missing = _plymouth_write_named_rows(
+        ws, cur_item_map, addon.get("itemized", []), count_col, revenue_col,
+        value_key="revenue",
+    )
+    stly_item_written, stly_item_missing = _plymouth_write_named_rows(
+        ws, stly_item_map, stly.get("itemizedRows", []), count_col, revenue_col,
+        value_key="revenue",
+    )
+
+    # Week header labels across all Plymouth weekly sections.
+    if month_end:
+        current_label = "MONTH END"
+    else:
+        date_suffix = f" - {week_date.month}/{week_date.day}" if week_date else ""
+        current_label = f"WK {week_slot}{date_suffix}"
+
+    stly_label = (
+        "MONTH END"
+        if month_end and week_slot == 5
+        else current_label
+    )
+
+    for header_key, label in (
+        ("current_header", current_label),
+        ("stly_header", stly_label),
+        ("variance_header", current_label),
+        ("current_item_header", current_label),
+        ("stly_item_header", stly_label),
+    ):
+        ws.cell(layout[header_key], count_col).value = label
+
+    _plymouth_extend_variance_formulas(ws, layout, int(week_slot))
+    _plymouth_write_messaging(
+        ws,
+        messaging,
+        week_date=week_date,
+        engagement_rate=engagement_rate,
+        week_slot=int(week_slot),
+    )
+
+    out = io.BytesIO()
+    wb.save(out)
+
+    summary = {
+        "sheet": sheet_name,
+        "weekSlot": int(week_slot),
+        "weekLabel": current_label,
+        "currentWritten": current_written,
+        "stlyWritten": stly_written,
+        "itemizedWritten": item_written,
+        "stlyItemizedWritten": stly_item_written,
+        "missingCurrent": current_missing,
+        "missingSTLY": stly_missing,
+        "missingItemized": item_missing,
+        "missingSTLYItemized": stly_item_missing,
+        "currentRows": main,
+        "stly": stly,
+    }
+    return out.getvalue(), summary
+
+
+def _plymouth_resolve_drive_target(service, report_month):
+    """Resolve Hotel 1620/Plymouth's existing ancillary tracking workbook."""
+    discovered = dict(get_hotels_from_drive())
+    hotel_id = (
+        discovered.get("Hotel 1620")
+        or discovered.get("Plymouth")
+        or discovered.get("1620")
+    )
+    if not hotel_id:
+        for label, folder_id in discovered.items():
+            n = _ar_norm(label)
+            if "1620" in n or "plymouth" in n:
+                hotel_id = folder_id
+                break
+
+    if hotel_id:
+        target, err = ancillary_find_drive_report(
+            service,
+            hotel_id,
+            "1620",
+            report_month,
+        )
+        if target and not err:
+            return target, None
+
+    # Fallback to the older dedicated Plymouth ancillary folder resolver.
+    file_id, name_or_err = find_ancillary_revenue_file(service)
+    if file_id:
+        return {
+            "file_id": file_id,
+            "file_name": name_or_err,
+            "folder_name": ANCILLARY_REVENUE_FOLDER_NAME,
+        }, None
+
+    return None, (
+        name_or_err
+        if isinstance(name_or_err, str)
+        else "Plymouth ancillary tracking workbook was not found in Drive."
+    )
+
+
 # ── Ancillary Revenue (Plymouth/Hotel 1620 only, for now) ────────────────────
 # Different shape from ROB/SR/Forecast: one workbook with a tab per month
 # (not a file per hotel per month), and within a month's tab, up to 5 "weeks"
@@ -12172,6 +12606,295 @@ with tab_ancillary:
     ar_properties = list(dict.fromkeys(ar_properties))
     ar_property = st.selectbox("Property", ar_properties, key="ar_monthly_property")
     ar_profile, ar_key = ancillary_profile(ar_property)
+
+    # Hotel 1620 is tracked as cumulative MTD weekly snapshots inside one
+    # month tab. Keep this separate from the standard monthly report builder.
+    if ar_key == "hotel 1620":
+        st.info(
+            "Hotel 1620 / Plymouth uses the weekly tracking format. "
+            "Use this section for weekly updates; the standard monthly builder "
+            "below remains available for month-end recreation/testing."
+        )
+
+        with st.expander("Hotel 1620 — Weekly Ancillary Update", expanded=True):
+            pw_month_date = st.date_input(
+                "Plymouth report month",
+                value=datetime.date.today().replace(day=1),
+                key="pw_month",
+            )
+            pw_month_dt = datetime.datetime(
+                pw_month_date.year, pw_month_date.month, 1
+            )
+
+            wcol1, wcol2, wcol3 = st.columns(3)
+            with wcol1:
+                pw_week = st.selectbox(
+                    "Week slot",
+                    [1, 2, 3, 4, 5],
+                    key="pw_week_slot",
+                    help=(
+                        "Each upload is month-to-date. Week 1 writes B/C, "
+                        "Week 2 D/E, Week 3 F/G, Week 4 H/I, Week 5 J/K."
+                    ),
+                )
+            with wcol2:
+                pw_week_date = st.date_input(
+                    "As-of date",
+                    value=datetime.date.today(),
+                    key="pw_week_date",
+                )
+            with wcol3:
+                pw_month_end = st.checkbox(
+                    "Month End",
+                    value=False,
+                    key="pw_month_end",
+                )
+
+            st.caption(
+                "Upload SNT reports covering the **1st of the month through "
+                "this as-of date**. The updater writes the cumulative MTD "
+                "snapshot into the selected week pair."
+            )
+
+            st.markdown("**Current-year MTD source**")
+            pw_addon = st.file_uploader(
+                "Plymouth SNT Add On Production",
+                type=["csv", "xlsx"],
+                key="pw_addon",
+            )
+            pw_upsell = st.file_uploader(
+                "Plymouth SNT Upsell By Day/User",
+                type=["csv", "xlsx"],
+                key="pw_upsell",
+            )
+
+            st.markdown(f"**STLY MTD source — {pw_month_dt.year - 1}**")
+            pw_stly_addon = st.file_uploader(
+                f"Plymouth {pw_month_dt.year - 1} SNT Add On Production",
+                type=["csv", "xlsx"],
+                key="pw_stly_addon",
+            )
+            pw_stly_upsell = st.file_uploader(
+                f"Plymouth {pw_month_dt.year - 1} SNT Upsell By Day/User",
+                type=["csv", "xlsx"],
+                key="pw_stly_upsell",
+            )
+
+            st.markdown("**Journal totals — MTD as of this week**")
+            pjc1, pjc2 = st.columns(2)
+            with pjc1:
+                pw_eci = st.number_input(
+                    "Early Check In — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_eci",
+                )
+                pw_stly_eci = st.number_input(
+                    "STLY Early Check In — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_stly_eci",
+                )
+            with pjc2:
+                pw_lco = st.number_input(
+                    "Late Checkout — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_lco",
+                )
+                pw_stly_lco = st.number_input(
+                    "STLY Late Checkout — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_stly_lco",
+                )
+
+            with st.expander("Weekly Canary messaging KPI update (optional)"):
+                pm1, pm2 = st.columns(2)
+                with pm1:
+                    pw_msg_total = st.number_input(
+                        "Plymouth Total Messages", value=0.0, key="pw_msg_total"
+                    )
+                    pw_msg_guest = st.number_input(
+                        "Plymouth Guest Messages", value=0.0, key="pw_msg_guest"
+                    )
+                    pw_msg_hotel = st.number_input(
+                        "Plymouth Hotel Messages", value=0.0, key="pw_msg_hotel"
+                    )
+                    pw_msg_pct = st.number_input(
+                        "Plymouth % Guests Messaged",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_msg_pct",
+                    )
+                with pm2:
+                    pw_resp = st.number_input(
+                        "Plymouth Response Rate %",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_resp",
+                    )
+                    pw_avg = st.number_input(
+                        "Plymouth Avg Minutes to Respond",
+                        value=0.0,
+                        key="pw_avg",
+                    )
+                    pw_med = st.number_input(
+                        "Plymouth Median Minutes to Respond",
+                        value=0.0,
+                        key="pw_med",
+                    )
+                    pw_engagement = st.number_input(
+                        "Engagement Rate % for this week",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_engagement",
+                    )
+
+            pw_ready = all([
+                pw_addon is not None,
+                pw_upsell is not None,
+                pw_stly_addon is not None,
+                pw_stly_upsell is not None,
+            ])
+
+            if st.button(
+                "Build Plymouth Weekly Update",
+                type="primary",
+                key="pw_build",
+                disabled=not pw_ready,
+            ):
+                try:
+                    svc = get_drive_service()
+                    with st.spinner(
+                        "Loading Plymouth tracker from Drive and updating the selected week..."
+                    ):
+                        target, target_err = _plymouth_resolve_drive_target(
+                            svc, pw_month_dt
+                        )
+                        if target_err or not target:
+                            raise ValueError(
+                                target_err or "Plymouth tracking workbook not found."
+                            )
+
+                        original_bytes = drive_download(
+                            svc, target["file_id"]
+                        )
+
+                        pw_messaging = {
+                            "msgTotal": pw_msg_total,
+                            "msgGuest": pw_msg_guest,
+                            "msgHotel": pw_msg_hotel,
+                            "msgGuestPct": pw_msg_pct / 100.0,
+                            "responseRate": pw_resp / 100.0,
+                            "avgResponse": pw_avg,
+                            "medianResponse": pw_med,
+                        }
+
+                        updated_bytes, pw_summary = plymouth_build_weekly_update(
+                            workbook_bytes=original_bytes,
+                            report_month=pw_month_dt,
+                            week_slot=pw_week,
+                            week_date=pw_week_date,
+                            addon_file=pw_addon,
+                            upsell_file=pw_upsell,
+                            stly_addon_file=pw_stly_addon,
+                            stly_upsell_file=pw_stly_upsell,
+                            journal_values=[pw_eci, pw_lco],
+                            stly_journal_values=[pw_stly_eci, pw_stly_lco],
+                            messaging=pw_messaging,
+                            engagement_rate=pw_engagement / 100.0,
+                            month_end=pw_month_end,
+                        )
+
+                        st.session_state["pw_output"] = updated_bytes
+                        st.session_state["pw_summary"] = pw_summary
+                        st.session_state["pw_target"] = target
+                        st.session_state["pw_original"] = original_bytes
+
+                    st.success(
+                        f"Built {pw_summary['sheet']} — "
+                        f"{pw_summary['weekLabel']}."
+                    )
+                except Exception as e:
+                    st.error(f"Plymouth weekly build error: {e}")
+
+            if st.session_state.get("pw_output"):
+                ps = st.session_state.get("pw_summary", {})
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                pc1.metric("Current rows", ps.get("currentWritten", 0))
+                pc2.metric("STLY rows", ps.get("stlyWritten", 0))
+                pc3.metric("Current itemized", ps.get("itemizedWritten", 0))
+                pc4.metric("STLY itemized", ps.get("stlyItemizedWritten", 0))
+
+                missing = (
+                    ps.get("missingCurrent", [])
+                    + ps.get("missingSTLY", [])
+                    + ps.get("missingItemized", [])
+                    + ps.get("missingSTLYItemized", [])
+                )
+                if missing:
+                    with st.expander(
+                        "Items in the uploaded reports not found on this month tab"
+                    ):
+                        st.write(sorted(set(x for x in missing if x)))
+                        st.caption(
+                            "These are not silently inserted because inserting "
+                            "rows can disturb Plymouth's side tables/charts. "
+                            "Add the new row to the month template once, then "
+                            "rerun the same week."
+                        )
+
+                pdl, psv = st.columns(2)
+                with pdl:
+                    st.download_button(
+                        "Download Plymouth Weekly Workbook",
+                        data=st.session_state["pw_output"],
+                        file_name=(
+                            f"{pw_month_dt.year} Plymouth Ancillary "
+                            f"{pw_month_dt.strftime('%b').upper()} "
+                            f"WK{pw_week}.xlsx"
+                        ),
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        key="pw_download",
+                        use_container_width=True,
+                    )
+
+                with psv:
+                    if st.button(
+                        "Save Plymouth Weekly Update to Drive",
+                        key="pw_save_drive",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            svc = get_drive_service()
+                            target = st.session_state["pw_target"]
+                            original = st.session_state["pw_original"]
+
+                            st.session_state["ar_drive_undo"] = {
+                                "file_id": target["file_id"],
+                                "file_name": target["file_name"],
+                                "bytes": original,
+                            }
+
+                            drive_upload(
+                                svc,
+                                target["file_id"],
+                                st.session_state["pw_output"],
+                                target["file_name"],
+                            )
+                            st.success(
+                                f"Saved {ps.get('sheet')} "
+                                f"{ps.get('weekLabel')} into "
+                                f"**{target['file_name']}**."
+                            )
+                        except Exception as e:
+                            st.error(
+                                f"Could not save Plymouth weekly update: {e}"
+                            )
+
+        st.divider()
 
     ar_month_date = st.date_input(
         "Report month",
