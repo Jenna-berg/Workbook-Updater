@@ -9293,6 +9293,584 @@ def _plymouth_write_messaging(ws, messaging, week_date=None, engagement_rate=Non
             ws.cell(target_row, date_col + 1).number_format = "0.0%"
 
 
+
+def _plymouth_copy_left_row_style(ws, src_row, dst_row):
+    """Copy A:L styling/formulas pattern for a newly-added Plymouth data row."""
+    for c in range(1, 13):
+        src = ws.cell(src_row, c)
+        dst = ws.cell(dst_row, c)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.number_format = src.number_format
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+
+
+def _plymouth_shift_left_down(ws, start_row, delta):
+    """Shift only A:L downward, preserving the independent N:V side tables."""
+    if delta <= 0:
+        return
+
+    max_row = ws.max_row
+
+    # Merged ranges in A:L do not follow move_range automatically.
+    shifted_merges = []
+    for rng in list(ws.merged_cells.ranges):
+        if rng.max_col <= 12 and rng.min_row >= start_row:
+            shifted_merges.append(
+                (
+                    rng.min_row + delta,
+                    rng.min_col,
+                    rng.max_row + delta,
+                    rng.max_col,
+                )
+            )
+            ws.unmerge_cells(str(rng))
+
+    heights = {
+        r: ws.row_dimensions[r].height
+        for r in range(start_row, max_row + 1)
+        if ws.row_dimensions[r].height is not None
+    }
+
+    ws.move_range(
+        f"A{start_row}:L{max_row}",
+        rows=delta,
+        cols=0,
+        translate=True,
+    )
+
+    for old_row, height in heights.items():
+        ws.row_dimensions[old_row + delta].height = height
+
+    for min_row, min_col, max_row2, max_col in shifted_merges:
+        ws.merge_cells(
+            start_row=min_row,
+            start_column=min_col,
+            end_row=max_row2,
+            end_column=max_col,
+        )
+
+
+def _plymouth_append_missing_names(
+    ws,
+    report_year,
+    block,
+    names,
+):
+    """Append newly-seen names without disturbing prior-week rows.
+
+    This creates a month-long union of item names. Existing rows keep their
+    position so prior weekly columns remain attached to the correct item.
+    """
+    layout = _plymouth_section_layout(ws, report_year)
+
+    keys = {
+        "current": ("current_first", "current_total"),
+        "stly": ("stly_first", "stly_total"),
+        "variance": ("variance_first", "variance_total"),
+    }
+    first_key, total_key = keys[block]
+    first_row = layout[first_key]
+    total_row = layout[total_key]
+
+    existing = []
+    existing_norm = set()
+    for r in range(first_row, total_row):
+        name = str(ws.cell(r, 1).value or "").strip()
+        if not name:
+            continue
+        existing.append(name)
+        existing_norm.add(_ar_norm(name))
+
+    missing = []
+    for name in names:
+        clean = str(name or "").strip()
+        if not clean:
+            continue
+        key = _ar_norm(clean)
+        if key not in existing_norm:
+            missing.append(clean)
+            existing_norm.add(key)
+
+    if not missing:
+        return _plymouth_section_layout(ws, report_year), []
+
+    # Insert blank A:L rows immediately before this block's TOTALS row.
+    _plymouth_shift_left_down(ws, total_row, len(missing))
+
+    # After the shift, the old TOTALS row moved down and the newly-created
+    # rows occupy total_row .. total_row + len(missing) - 1.
+    style_source = max(first_row, total_row - 1)
+    for offset, name in enumerate(missing):
+        r = total_row + offset
+        _plymouth_copy_left_row_style(ws, style_source, r)
+        for c in range(1, 13):
+            ws.cell(r, c).value = None
+        ws.cell(r, 1).value = name
+        ws.cell(r, 12).value = (
+            f"=IFERROR((C{r}+E{r}+G{r}+I{r}+K{r})/"
+            f"(B{r}+D{r}+F{r}+H{r}+J{r}),0)"
+        )
+
+    return _plymouth_section_layout(ws, report_year), missing
+
+
+def _plymouth_prepare_dynamic_main_rows(ws, report_year, main_rows, stly_rows):
+    """Ensure current/STLY/variance left-side sections can accept new item names."""
+    # Current-year month-long union.
+    layout, added_current = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "current",
+        [r.get("name") for r in main_rows],
+    )
+
+    # STLY month-long union.
+    layout, added_stly = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "stly",
+        [r.get("name") for r in stly_rows],
+    )
+
+    # Variance needs a row for every item appearing in either side.
+    variance_names = []
+    seen = set()
+    for row in list(main_rows) + list(stly_rows):
+        name = str(row.get("name") or "").strip()
+        key = _ar_norm(name)
+        if name and key not in seen:
+            variance_names.append(name)
+            seen.add(key)
+
+    layout, added_variance = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "variance",
+        variance_names,
+    )
+
+    return layout, {
+        "current": added_current,
+        "stly": added_stly,
+        "variance": added_variance,
+    }
+
+
+def _plymouth_variance_formula_for_row(
+    ws,
+    layout,
+    variance_row,
+    item_name,
+    count_col,
+    revenue_col,
+):
+    """Create selected-week variance formulas for a dynamic item row."""
+    current_map = _plymouth_block_rows(
+        ws,
+        layout["current_first"],
+        layout["current_total"],
+    )
+    stly_map = _plymouth_block_rows(
+        ws,
+        layout["stly_first"],
+        layout["stly_total"],
+    )
+
+    key = _ar_norm(item_name)
+    current_row = current_map.get(key)
+    stly_row = stly_map.get(key)
+
+    count_letter = get_column_letter(count_col)
+    revenue_letter = get_column_letter(revenue_col)
+
+    if current_row and stly_row:
+        count_formula = (
+            f"={count_letter}{current_row}-{count_letter}{stly_row}"
+        )
+        revenue_formula = (
+            f"={revenue_letter}{current_row}-{revenue_letter}{stly_row}"
+        )
+    elif current_row:
+        count_formula = f"={count_letter}{current_row}"
+        revenue_formula = f"={revenue_letter}{current_row}"
+    elif stly_row:
+        count_formula = f"=-{count_letter}{stly_row}"
+        revenue_formula = f"=-{revenue_letter}{stly_row}"
+    else:
+        count_formula = "=0"
+        revenue_formula = "=0"
+
+    ws.cell(variance_row, count_col).value = count_formula
+    ws.cell(variance_row, revenue_col).value = revenue_formula
+
+
+def _plymouth_update_dynamic_variance(ws, layout, week_slot):
+    """Write variance formulas for every current dynamic variance item."""
+    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[int(week_slot)]
+
+    for r in range(layout["variance_first"], layout["variance_total"]):
+        name = str(ws.cell(r, 1).value or "").strip()
+        if not name:
+            ws.cell(r, count_col).value = None
+            ws.cell(r, revenue_col).value = None
+            continue
+        _plymouth_variance_formula_for_row(
+            ws,
+            layout,
+            r,
+            name,
+            count_col,
+            revenue_col,
+        )
+
+    total_row = layout["variance_total"]
+    count_letter = get_column_letter(count_col)
+    revenue_letter = get_column_letter(revenue_col)
+    ws.cell(total_row, count_col).value = (
+        f"=SUM({count_letter}{layout['variance_first']}:"
+        f"{count_letter}{total_row - 1})"
+    )
+    ws.cell(total_row, revenue_col).value = (
+        f"=SUM({revenue_letter}{layout['variance_first']}:"
+        f"{revenue_letter}{total_row - 1})"
+    )
+
+
+def _plymouth_excel_date(value):
+    """Parse Google Form posting dates, including Excel serial numbers."""
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return (
+                datetime.datetime(1899, 12, 30)
+                + datetime.timedelta(days=float(value))
+            ).date()
+        except Exception:
+            return None
+
+    parsed = _ar_date(value)
+    return parsed.date() if parsed else None
+
+
+def _plymouth_clean_agent_name(name):
+    return re.sub(r"\s+", " ", str(name or "").strip())
+
+
+def _plymouth_agent_key(name):
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        _plymouth_clean_agent_name(name).lower(),
+    )
+
+
+def _plymouth_parse_commission_form(raw, start_date, end_date):
+    """Aggregate Google Form add-on revenue by agent for the selected MTD window."""
+    if not raw:
+        return []
+
+    header_idx = None
+    h = None
+    for i, row in enumerate(raw[:15]):
+        hm = _ar_header_map(row)
+        if (
+            _ar_col(hm, ["agent name"]) >= 0
+            and _ar_col(
+                hm,
+                [
+                    "add on revenue posting date",
+                    "add-on revenue posting date",
+                ],
+            ) >= 0
+            and _ar_col(
+                hm,
+                [
+                    "add on revenue amount posted",
+                    "add-on revenue amount posted",
+                ],
+            ) >= 0
+        ):
+            header_idx = i
+            h = hm
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Employee Commission Recognition Form is missing Agent Name, "
+            "Add On Revenue Posting Date, or Add On Revenue Amount Posted."
+        )
+
+    name_col = _ar_col(h, ["agent name"])
+    date_col = _ar_col(
+        h,
+        ["add on revenue posting date", "add-on revenue posting date"],
+    )
+    amount_col = _ar_col(
+        h,
+        ["add on revenue amount posted", "add-on revenue amount posted"],
+    )
+
+    agg = {}
+    for row in raw[header_idx + 1:]:
+        def rv(c):
+            return row[c] if c >= 0 and c < len(row) else None
+
+        posted = _plymouth_excel_date(rv(date_col))
+        if not posted or posted < start_date or posted > end_date:
+            continue
+
+        name = _plymouth_clean_agent_name(rv(name_col))
+        if not name:
+            continue
+
+        amount = _ar_num(rv(amount_col)) or 0
+        key = _plymouth_agent_key(name)
+        entry = agg.setdefault(
+            key,
+            {
+                "name": name,
+                "addOnRevenue": 0,
+            },
+        )
+        # Prefer the longest/fullest display form found in the source.
+        if len(name) > len(entry["name"]):
+            entry["name"] = name
+        entry["addOnRevenue"] += amount
+
+    return list(agg.values())
+
+
+def _plymouth_canonical_agent_rows(upgrade_staff, commission_rows):
+    """Merge capitalization/spacing/short-name variants across both sources."""
+    all_names = []
+    for row in upgrade_staff:
+        name = _plymouth_clean_agent_name(row.get("name"))
+        if name:
+            all_names.append(name)
+    for row in commission_rows:
+        name = _plymouth_clean_agent_name(row.get("name"))
+        if name:
+            all_names.append(name)
+
+    # Build exact and unique-first-name references from the source data itself,
+    # not from the existing worksheet table.
+    exact_display = {}
+    first_to_full = {}
+    first_candidates = {}
+
+    for name in all_names:
+        key = _plymouth_agent_key(name)
+        if key not in exact_display or len(name) > len(exact_display[key]):
+            exact_display[key] = name
+
+        tokens = name.split()
+        if tokens:
+            first = tokens[0].lower()
+            if len(tokens) > 1:
+                first_candidates.setdefault(first, set()).add(name)
+
+    for first, candidates in first_candidates.items():
+        if len(candidates) == 1:
+            first_to_full[first] = next(iter(candidates))
+
+    def canonical(name):
+        clean = _plymouth_clean_agent_name(name)
+        key = _plymouth_agent_key(clean)
+        if key in exact_display:
+            return exact_display[key]
+
+        tokens = clean.split()
+        if len(tokens) == 1:
+            full = first_to_full.get(tokens[0].lower())
+            if full:
+                return full
+        return clean
+
+    merged = {}
+    for row in upgrade_staff:
+        name = canonical(row.get("name"))
+        key = _plymouth_agent_key(name)
+        entry = merged.setdefault(
+            key,
+            {
+                "name": name,
+                "upgradeCount": 0,
+                "upgradeRevenue": 0,
+                "addOnRevenue": 0,
+            },
+        )
+        entry["upgradeCount"] += _ar_num(row.get("count")) or 0
+        entry["upgradeRevenue"] += _ar_num(row.get("revenue")) or 0
+
+    for row in commission_rows:
+        name = canonical(row.get("name"))
+        key = _plymouth_agent_key(name)
+        entry = merged.setdefault(
+            key,
+            {
+                "name": name,
+                "upgradeCount": 0,
+                "upgradeRevenue": 0,
+                "addOnRevenue": 0,
+            },
+        )
+        entry["addOnRevenue"] += _ar_num(row.get("addOnRevenue")) or 0
+
+    rows = []
+    for row in merged.values():
+        row["totalRevenue"] = (
+            (_ar_num(row.get("upgradeRevenue")) or 0)
+            + (_ar_num(row.get("addOnRevenue")) or 0)
+        )
+        if (
+            row["upgradeCount"]
+            or row["upgradeRevenue"]
+            or row["addOnRevenue"]
+        ):
+            rows.append(row)
+
+    rows.sort(
+        key=lambda x: (
+            -x["totalRevenue"],
+            -x["upgradeRevenue"],
+            x["name"].lower(),
+        )
+    )
+    return rows
+
+
+def _plymouth_agent_table_style_rows(ws):
+    """Find normal and blue-highlight style examples in the current month tab."""
+    normal_row = None
+    highlight_row = None
+
+    for r in range(16, min(ws.max_row, 60) + 1):
+        name = str(ws.cell(r, 14).value or "").strip()
+        if not name:
+            continue
+
+        fill = ws.cell(r, 14).fill
+        rgb = (
+            fill.fgColor.rgb
+            if fill and fill.fgColor.type == "rgb"
+            else None
+        )
+        if rgb and str(rgb).upper().endswith("3C78D8"):
+            highlight_row = r
+        elif normal_row is None:
+            normal_row = r
+
+    return normal_row or 18, highlight_row or 17
+
+
+def _plymouth_copy_agent_row_style(ws, src_row, dst_row):
+    for c in range(14, 19):
+        src = ws.cell(src_row, c)
+        dst = ws.cell(dst_row, c)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.number_format = src.number_format
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+
+
+def _plymouth_rebuild_agent_table(
+    ws,
+    upgrade_staff,
+    commission_raw,
+    report_month,
+    week_date,
+):
+    """Rebuild N:R from source data, sorted by total revenue descending."""
+    start_date = report_month.date().replace(day=1)
+    end_date = week_date
+
+    commission_rows = _plymouth_parse_commission_form(
+        commission_raw,
+        start_date,
+        end_date,
+    )
+    agent_rows = _plymouth_canonical_agent_rows(
+        upgrade_staff,
+        commission_rows,
+    )
+
+    normal_style_row, highlight_style_row = _plymouth_agent_table_style_rows(ws)
+
+    # Preserve style blueprints before clearing the previous table.
+    normal_styles = [
+        copy(ws.cell(normal_style_row, c)._style)
+        for c in range(14, 19)
+    ]
+    highlight_styles = [
+        copy(ws.cell(highlight_style_row, c)._style)
+        for c in range(14, 19)
+    ]
+    normal_formats = [
+        ws.cell(normal_style_row, c).number_format
+        for c in range(14, 19)
+    ]
+    highlight_formats = [
+        ws.cell(highlight_style_row, c).number_format
+        for c in range(14, 19)
+    ]
+
+    # Table occupies N:R only; T:V messaging remains untouched.
+    clear_end = max(60, 15 + len(agent_rows) + 5)
+    for r in range(16, clear_end + 1):
+        for c in range(14, 19):
+            ws.cell(r, c).value = None
+            ws.cell(r, c)._style = copy(normal_styles[c - 14])
+            ws.cell(r, c).number_format = normal_formats[c - 14]
+
+    for idx, row in enumerate(agent_rows, start=16):
+        for c in range(14, 19):
+            ws.cell(idx, c)._style = copy(normal_styles[c - 14])
+            ws.cell(idx, c).number_format = normal_formats[c - 14]
+
+        ws.cell(idx, 14).value = row["name"]
+        ws.cell(idx, 15).value = row["upgradeCount"]
+        ws.cell(idx, 16).value = row["upgradeRevenue"]
+        ws.cell(idx, 17).value = row["addOnRevenue"]
+        ws.cell(idx, 18).value = f"=SUM(P{idx}:Q{idx})"
+
+    # Blue highlight = highest-revenue human staff member. WEB/Unknown remain
+    # visible in the sorted table but are not eligible for champion highlight.
+    top_human_index = None
+    for idx, row in enumerate(agent_rows, start=16):
+        if _ar_norm(row["name"]) not in {"web", "unknown"}:
+            top_human_index = idx
+            break
+
+    if top_human_index is not None:
+        for c in range(14, 19):
+            ws.cell(top_human_index, c)._style = copy(
+                highlight_styles[c - 14]
+            )
+            ws.cell(top_human_index, c).number_format = (
+                highlight_formats[c - 14]
+            )
+
+    return agent_rows, (
+        agent_rows[top_human_index - 16]["name"]
+        if top_human_index is not None
+        else None
+    )
+
+
+
 def plymouth_build_weekly_update(
     workbook_bytes,
     report_month,
@@ -9302,6 +9880,7 @@ def plymouth_build_weekly_update(
     upsell_file,
     stly_addon_file,
     stly_upsell_file,
+    commission_file,
     journal_values=None,
     stly_journal_values=None,
     messaging=None,
@@ -9368,7 +9947,16 @@ def plymouth_build_weekly_update(
             rows.append({"name": j["report"], "revenue": value})
         stly = ancillary_apply_stly_journal(stly, rows)
 
-    # Existing block row maps.
+    # Main/STLY/variance names are dynamic. Preserve prior-week rows and append
+    # any newly-seen add-on or room-upgrade names so prior week columns remain
+    # attached to the correct item.
+    layout, added_dynamic = _plymouth_prepare_dynamic_main_rows(
+        ws,
+        report_month.year,
+        main,
+        stly.get("rows", []),
+    )
+
     current_map = _plymouth_block_rows(
         ws, layout["current_first"], layout["current_total"]
     )
@@ -9420,7 +10008,20 @@ def plymouth_build_weekly_update(
     ):
         ws.cell(layout[header_key], count_col).value = label
 
-    _plymouth_extend_variance_formulas(ws, layout, int(week_slot))
+    _plymouth_update_dynamic_variance(
+        ws,
+        layout,
+        int(week_slot),
+    )
+
+    agent_rows, top_agent = _plymouth_rebuild_agent_table(
+        ws,
+        upgrades.get("byStaff", []),
+        _ar_file_rows(commission_file),
+        report_month,
+        week_date,
+    )
+
     _plymouth_write_messaging(
         ws,
         messaging,
@@ -9446,6 +10047,9 @@ def plymouth_build_weekly_update(
         "missingSTLYItemized": stly_item_missing,
         "currentRows": main,
         "stly": stly,
+        "addedDynamicRows": added_dynamic,
+        "agentRows": agent_rows,
+        "topAgent": top_agent,
     }
     return out.getvalue(), summary
 
@@ -12679,6 +13283,18 @@ with tab_ancillary:
                 key="pw_stly_upsell",
             )
 
+            st.markdown("**Revenue by Agent source**")
+            pw_commission = st.file_uploader(
+                "1620 Employee Commission Recognition Form Responses",
+                type=["xlsx", "csv"],
+                key="pw_commission",
+                help=(
+                    "Upload the current Google Form response export. "
+                    "The tool filters Add On Revenue Posting Date from the "
+                    "1st of the selected month through the as-of date."
+                ),
+            )
+
             st.markdown("**Journal totals — MTD as of this week**")
             pjc1, pjc2 = st.columns(2)
             with pjc1:
@@ -12753,6 +13369,7 @@ with tab_ancillary:
                 pw_upsell is not None,
                 pw_stly_addon is not None,
                 pw_stly_upsell is not None,
+                pw_commission is not None,
             ])
 
             if st.button(
@@ -12797,6 +13414,7 @@ with tab_ancillary:
                             upsell_file=pw_upsell,
                             stly_addon_file=pw_stly_addon,
                             stly_upsell_file=pw_stly_upsell,
+                            commission_file=pw_commission,
                             journal_values=[pw_eci, pw_lco],
                             stly_journal_values=[pw_stly_eci, pw_stly_lco],
                             messaging=pw_messaging,
@@ -12830,6 +13448,24 @@ with tab_ancillary:
                     + ps.get("missingItemized", [])
                     + ps.get("missingSTLYItemized", [])
                 )
+                dynamic_added = ps.get("addedDynamicRows", {})
+                added_names = (
+                    dynamic_added.get("current", [])
+                    + dynamic_added.get("stly", [])
+                    + dynamic_added.get("variance", [])
+                )
+                if added_names:
+                    st.success(
+                        "Added new month tracking rows automatically: "
+                        + ", ".join(sorted(set(added_names)))
+                    )
+
+                if ps.get("topAgent"):
+                    st.info(
+                        f"Top staff upseller for this MTD snapshot: "
+                        f"**{ps['topAgent']}**"
+                    )
+
                 if missing:
                     st.markdown(
                         "**Items in the uploaded reports not found on this month tab**"
@@ -12843,7 +13479,7 @@ with tab_ancillary:
                             "rerun the same week."
                         )
 
-                pdl, psv = st.columns(2)
+                pdl, psv, pundo = st.columns(3)
                 with pdl:
                     st.download_button(
                         "Download Plymouth Weekly Workbook",
@@ -12873,7 +13509,7 @@ with tab_ancillary:
                             target = st.session_state["pw_target"]
                             original = st.session_state["pw_original"]
 
-                            st.session_state["ar_drive_undo"] = {
+                            st.session_state["pw_drive_undo"] = {
                                 "file_id": target["file_id"],
                                 "file_name": target["file_name"],
                                 "bytes": original,
@@ -12893,6 +13529,35 @@ with tab_ancillary:
                         except Exception as e:
                             st.error(
                                 f"Could not save Plymouth weekly update: {e}"
+                            )
+
+                with pundo:
+                    if st.button(
+                        "↩ Undo Last 1620 Upload",
+                        key="pw_undo_drive",
+                        type="secondary",
+                        use_container_width=True,
+                        disabled=not bool(
+                            st.session_state.get("pw_drive_undo")
+                        ),
+                    ):
+                        try:
+                            undo = st.session_state["pw_drive_undo"]
+                            drive_upload(
+                                get_drive_service(),
+                                undo["file_id"],
+                                undo["bytes"],
+                                undo["file_name"],
+                            )
+                            st.session_state.pop("pw_drive_undo", None)
+                            st.session_state.pop("pw_output", None)
+                            st.success(
+                                "Restored the Plymouth workbook to the version "
+                                "from immediately before the last 1620 upload."
+                            )
+                        except Exception as e:
+                            st.error(
+                                f"Could not undo the last Plymouth upload: {e}"
                             )
 
         st.divider()
