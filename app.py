@@ -12831,9 +12831,10 @@ with tab_ancillary:
                     + ps.get("missingSTLYItemized", [])
                 )
                 if missing:
-                    with st.expander(
-                        "Items in the uploaded reports not found on this month tab"
-                    ):
+                    st.markdown(
+                        "**Items in the uploaded reports not found on this month tab**"
+                    )
+                    with st.container(border=True):
                         st.write(sorted(set(x for x in missing if x)))
                         st.caption(
                             "These are not silently inserted because inserting "
