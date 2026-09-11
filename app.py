@@ -9420,9 +9420,185 @@ def _plymouth_append_missing_names(
     return _plymouth_section_layout(ws, report_year), missing
 
 
-def _plymouth_prepare_dynamic_main_rows(ws, report_year, main_rows, stly_rows):
-    """Ensure current/STLY/variance left-side sections can accept new item names."""
-    # Current-year month-long union.
+
+PLYMOUTH_VARIANCE_ALIASES = {
+    # STLY SNT naming vs current SNT naming
+    _ar_norm("Standard One King Bed"): _ar_norm("Standard Room - One King Bed"),
+}
+
+
+def _plymouth_variance_key(name):
+    key = _ar_norm(name)
+    return PLYMOUTH_VARIANCE_ALIASES.get(key, key)
+
+
+def _plymouth_capture_total_sum_starts(ws, layout, week_slot):
+    """Capture the intended SUM start row before dynamic row insertions.
+
+    Plymouth's count totals do not always start on the same row as revenue
+    totals (for example, journal-only rows have revenue but no count). Keep the
+    existing workbook's start-row logic, then extend only the ending row.
+    """
+    captured = {}
+    for block_name, total_key in (
+        ("current", "current_total"),
+        ("stly", "stly_total"),
+    ):
+        total_row = layout[total_key]
+        block = {}
+        for slot in range(1, int(week_slot) + 1):
+            for col in PLYMOUTH_WEEKLY_COLS[slot]:
+                value = ws.cell(total_row, col).value
+                start_row = None
+                if isinstance(value, str):
+                    m = re.search(
+                        r"SUM\(\s*[A-Z]+(\d+)\s*:\s*[A-Z]+\d+\s*\)",
+                        value,
+                        flags=re.I,
+                    )
+                    if m:
+                        start_row = int(m.group(1))
+                block[col] = start_row
+        captured[block_name] = block
+    return captured
+
+
+def _plymouth_rebuild_block_totals(ws, layout, week_slot, captured):
+    """Rebuild current/STLY TOTALS after rows were appended."""
+    for block_name, first_key, total_key in (
+        ("current", "current_first", "current_total"),
+        ("stly", "stly_first", "stly_total"),
+    ):
+        total_row = layout[total_key]
+        default_start = layout[first_key]
+        starts = captured.get(block_name, {})
+
+        for slot in range(1, int(week_slot) + 1):
+            count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
+            for col in (count_col, revenue_col):
+                start_row = starts.get(col) or default_start
+                letter = get_column_letter(col)
+                ws.cell(total_row, col).value = (
+                    f"=SUM({letter}{start_row}:{letter}{total_row - 1})"
+                )
+
+
+def _plymouth_initialize_added_prior_weeks(
+    ws,
+    layout,
+    added_rows,
+    week_slot,
+):
+    """Newly-seen items get 0/0 in earlier completed weekly snapshots."""
+    if int(week_slot) <= 1:
+        return
+
+    for block_name, first_key, total_key in (
+        ("current", "current_first", "current_total"),
+        ("stly", "stly_first", "stly_total"),
+    ):
+        added_names = {
+            _ar_norm(x)
+            for x in added_rows.get(block_name, [])
+            if x
+        }
+        if not added_names:
+            continue
+
+        row_map = _plymouth_block_rows(
+            ws,
+            layout[first_key],
+            layout[total_key],
+        )
+        for name_key in added_names:
+            r = row_map.get(name_key)
+            if not r:
+                continue
+            for prior_slot in range(1, int(week_slot)):
+                count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[prior_slot]
+                if ws.cell(r, count_col).value in (None, ""):
+                    ws.cell(r, count_col).value = 0
+                if ws.cell(r, revenue_col).value in (None, ""):
+                    ws.cell(r, revenue_col).value = 0
+
+
+
+def _plymouth_remove_alias_only_variance_rows(ws, report_year):
+    """Remove duplicate variance rows created by older builds for STLY aliases."""
+    layout = _plymouth_section_layout(ws, report_year)
+    variance_first = layout["variance_first"]
+    variance_total = layout["variance_total"]
+
+    # Build set of preferred current-year variance display keys.
+    current_rows = _plymouth_block_rows(
+        ws,
+        layout["current_first"],
+        layout["current_total"],
+    )
+    current_keys = {
+        _plymouth_variance_key(name): name
+        for name in current_rows.keys()
+    }
+
+    rows_to_remove = []
+    seen = set()
+    for r in range(variance_first, variance_total):
+        name = str(ws.cell(r, 1).value or "").strip()
+        if not name:
+            continue
+        key = _plymouth_variance_key(name)
+
+        preferred = current_keys.get(key)
+        if preferred and _ar_norm(name) != _ar_norm(preferred):
+            rows_to_remove.append(r)
+            continue
+
+        if key in seen:
+            rows_to_remove.append(r)
+            continue
+        seen.add(key)
+
+    for r in reversed(rows_to_remove):
+        # Only shift A:L upward; N:V is a separate dashboard/table area.
+        max_row = ws.max_row
+        # Remove merges that start in/after this row in A:L, then shift/rebuild
+        affected_merges = []
+        for rng in list(ws.merged_cells.ranges):
+            if rng.max_col <= 12 and rng.min_row >= r:
+                affected_merges.append(
+                    (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
+                )
+                ws.unmerge_cells(str(rng))
+
+        ws.move_range(
+            f"A{r + 1}:L{max_row}",
+            rows=-1,
+            cols=0,
+            translate=True,
+        )
+        for c in range(1, 13):
+            ws.cell(max_row, c).value = None
+
+        for min_row, min_col, max_row2, max_col in affected_merges:
+            if min_row == r:
+                continue
+            ws.merge_cells(
+                start_row=min_row - 1,
+                start_column=min_col,
+                end_row=max_row2 - 1,
+                end_column=max_col,
+            )
+
+    return _plymouth_section_layout(ws, report_year), rows_to_remove
+
+
+def _plymouth_prepare_dynamic_main_rows(
+    ws,
+    report_year,
+    main_rows,
+    stly_rows,
+):
+    """Ensure current/STLY/variance sections can accept new item names."""
     layout, added_current = _plymouth_append_missing_names(
         ws,
         report_year,
@@ -9430,7 +9606,6 @@ def _plymouth_prepare_dynamic_main_rows(ws, report_year, main_rows, stly_rows):
         [r.get("name") for r in main_rows],
     )
 
-    # STLY month-long union.
     layout, added_stly = _plymouth_append_missing_names(
         ws,
         report_year,
@@ -9438,15 +9613,30 @@ def _plymouth_prepare_dynamic_main_rows(ws, report_year, main_rows, stly_rows):
         [r.get("name") for r in stly_rows],
     )
 
-    # Variance needs a row for every item appearing in either side.
+    # Variance uses canonicalized names so known current/STLY naming variants
+    # share one row instead of generating a duplicate negative-only row.
     variance_names = []
     seen = set()
+
+    current_display_by_key = {}
+    for row in main_rows:
+        name = str(row.get("name") or "").strip()
+        if name:
+            current_display_by_key[_plymouth_variance_key(name)] = name
+
     for row in list(main_rows) + list(stly_rows):
         name = str(row.get("name") or "").strip()
-        key = _ar_norm(name)
-        if name and key not in seen:
-            variance_names.append(name)
-            seen.add(key)
+        if not name:
+            continue
+
+        key = _plymouth_variance_key(name)
+        if key in seen:
+            continue
+
+        # Prefer the current-year display name when the STLY name is an alias.
+        display = current_display_by_key.get(key, name)
+        variance_names.append(display)
+        seen.add(key)
 
     layout, added_variance = _plymouth_append_missing_names(
         ws,
@@ -9470,19 +9660,27 @@ def _plymouth_variance_formula_for_row(
     count_col,
     revenue_col,
 ):
-    """Create selected-week variance formulas for a dynamic item row."""
-    current_map = _plymouth_block_rows(
+    """Create one week's variance formulas using canonical current/STLY names."""
+    current_raw = _plymouth_block_rows(
         ws,
         layout["current_first"],
         layout["current_total"],
     )
-    stly_map = _plymouth_block_rows(
+    stly_raw = _plymouth_block_rows(
         ws,
         layout["stly_first"],
         layout["stly_total"],
     )
 
-    key = _ar_norm(item_name)
+    current_map = {}
+    for key, row in current_raw.items():
+        current_map.setdefault(_plymouth_variance_key(key), row)
+
+    stly_map = {}
+    for key, row in stly_raw.items():
+        stly_map.setdefault(_plymouth_variance_key(key), row)
+
+    key = _plymouth_variance_key(item_name)
     current_row = current_map.get(key)
     stly_row = stly_map.get(key)
 
@@ -9511,35 +9709,37 @@ def _plymouth_variance_formula_for_row(
 
 
 def _plymouth_update_dynamic_variance(ws, layout, week_slot):
-    """Write variance formulas for every current dynamic variance item."""
-    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[int(week_slot)]
+    """Rebuild variance formulas for every completed weekly snapshot."""
+    for slot in range(1, int(week_slot) + 1):
+        count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
 
-    for r in range(layout["variance_first"], layout["variance_total"]):
-        name = str(ws.cell(r, 1).value or "").strip()
-        if not name:
-            ws.cell(r, count_col).value = None
-            ws.cell(r, revenue_col).value = None
-            continue
-        _plymouth_variance_formula_for_row(
-            ws,
-            layout,
-            r,
-            name,
-            count_col,
-            revenue_col,
+        for r in range(layout["variance_first"], layout["variance_total"]):
+            name = str(ws.cell(r, 1).value or "").strip()
+            if not name:
+                ws.cell(r, count_col).value = None
+                ws.cell(r, revenue_col).value = None
+                continue
+
+            _plymouth_variance_formula_for_row(
+                ws,
+                layout,
+                r,
+                name,
+                count_col,
+                revenue_col,
+            )
+
+        total_row = layout["variance_total"]
+        count_letter = get_column_letter(count_col)
+        revenue_letter = get_column_letter(revenue_col)
+        ws.cell(total_row, count_col).value = (
+            f"=SUM({count_letter}{layout['variance_first']}:"
+            f"{count_letter}{total_row - 1})"
         )
-
-    total_row = layout["variance_total"]
-    count_letter = get_column_letter(count_col)
-    revenue_letter = get_column_letter(revenue_col)
-    ws.cell(total_row, count_col).value = (
-        f"=SUM({count_letter}{layout['variance_first']}:"
-        f"{count_letter}{total_row - 1})"
-    )
-    ws.cell(total_row, revenue_col).value = (
-        f"=SUM({revenue_letter}{layout['variance_first']}:"
-        f"{revenue_letter}{total_row - 1})"
-    )
+        ws.cell(total_row, revenue_col).value = (
+            f"=SUM({revenue_letter}{layout['variance_first']}:"
+            f"{revenue_letter}{total_row - 1})"
+        )
 
 
 def _plymouth_excel_date(value):
@@ -9947,6 +10147,20 @@ def plymouth_build_weekly_update(
             rows.append({"name": j["report"], "revenue": value})
         stly = ancillary_apply_stly_journal(stly, rows)
 
+    # Clean up duplicate alias-only variance rows that may exist from an older
+    # Plymouth weekly build before capturing ranges/adding any new rows.
+    layout, removed_alias_variance_rows = _plymouth_remove_alias_only_variance_rows(
+        ws,
+        report_month.year,
+    )
+
+    # Capture the original TOTALS range starts before any A:L rows move.
+    total_sum_starts = _plymouth_capture_total_sum_starts(
+        ws,
+        layout,
+        int(week_slot),
+    )
+
     # Main/STLY/variance names are dynamic. Preserve prior-week rows and append
     # any newly-seen add-on or room-upgrade names so prior week columns remain
     # attached to the correct item.
@@ -9984,6 +10198,24 @@ def plymouth_build_weekly_update(
     stly_item_written, stly_item_missing = _plymouth_write_named_rows(
         ws, stly_item_map, stly.get("itemizedRows", []), count_col, revenue_col,
         value_key="revenue",
+    )
+
+    # Any item that first appears this week should show 0 / $0 in earlier
+    # completed week columns, matching the corrected Plymouth tracker.
+    _plymouth_initialize_added_prior_weeks(
+        ws,
+        layout,
+        added_dynamic,
+        int(week_slot),
+    )
+
+    # Structural row additions can shift/translate TOTALS formulas. Rebuild
+    # them using the original start-row logic and the new block end rows.
+    _plymouth_rebuild_block_totals(
+        ws,
+        layout,
+        int(week_slot),
+        total_sum_starts,
     )
 
     # Week header labels across all Plymouth weekly sections.
@@ -10048,6 +10280,7 @@ def plymouth_build_weekly_update(
         "currentRows": main,
         "stly": stly,
         "addedDynamicRows": added_dynamic,
+        "removedAliasVarianceRows": removed_alias_variance_rows,
         "agentRows": agent_rows,
         "topAgent": top_agent,
     }
