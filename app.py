@@ -11524,6 +11524,19 @@ def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
                     st.success("ROB workbook(s) restored to their original state.")
 
 
+HILTON_PERMANENT_ROOM_PROPERTIES = {
+    "northbrook",
+    "kansas city",
+    "memphis",
+    "nashua",
+}
+
+
+def _hilton_has_permanent_rooms(hotel_name):
+    name = str(hotel_name or "").strip().lower()
+    return any(key in name for key in HILTON_PERMANENT_ROOM_PROPERTIES)
+
+
 def render_hilton_update(hotels):
     """Hilton portfolio run.
 
@@ -11666,29 +11679,34 @@ def render_hilton_update(hotels):
                             label_visibility="collapsed",
                         )
 
-                    # Permanent
-                    p0, p1, p2 = st.columns([1.45, 1, 1])
-                    with p0:
-                        st.markdown("**Permanent**")
-                    with p1:
-                        perm_rooms = st.number_input(
-                            f"{name} Permanent Room Nights through T-2",
-                            min_value=0.0,
-                            value=0.0,
-                            step=1.0,
-                            key=f"hil_perm_rooms_{fid}",
-                            label_visibility="collapsed",
-                        )
-                    with p2:
-                        perm_revenue = st.number_input(
-                            f"{name} Permanent Revenue through T-2",
-                            min_value=0.0,
-                            value=0.0,
-                            step=100.0,
-                            format="%.2f",
-                            key=f"hil_perm_revenue_{fid}",
-                            label_visibility="collapsed",
-                        )
+                    has_perm = _hilton_has_permanent_rooms(name)
+                    perm_rooms = 0.0
+                    perm_revenue = 0.0
+
+                    if has_perm:
+                        # Permanent
+                        p0, p1, p2 = st.columns([1.45, 1, 1])
+                        with p0:
+                            st.markdown("**Permanent**")
+                        with p1:
+                            perm_rooms = st.number_input(
+                                f"{name} Permanent Room Nights through T-2",
+                                min_value=0.0,
+                                value=0.0,
+                                step=1.0,
+                                key=f"hil_perm_rooms_{fid}",
+                                label_visibility="collapsed",
+                            )
+                        with p2:
+                            perm_revenue = st.number_input(
+                                f"{name} Permanent Revenue through T-2",
+                                min_value=0.0,
+                                value=0.0,
+                                step=100.0,
+                                format="%.2f",
+                                key=f"hil_perm_revenue_{fid}",
+                                label_visibility="collapsed",
+                            )
 
                     hilton_manual_mtd[name] = {
                         "rooms": total_rooms,
@@ -11697,6 +11715,7 @@ def render_hilton_update(hotels):
                         "group_revenue": group_revenue,
                         "perm_rooms": perm_rooms,
                         "perm_revenue": perm_revenue,
+                        "has_perm": has_perm,
                     }
 
     if not selected:
