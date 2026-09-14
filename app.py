@@ -1285,7 +1285,15 @@ def hilton_current_month_total(srp_days, forecast_actuals, as_of):
     }
 
 
-def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month_total=None, tracked_year=None):
+def build_hilton_rob_plan(
+    srp_months,
+    wash_months,
+    ws,
+    as_of=None,
+    current_month_total=None,
+    tracked_year=None,
+    wash_days=None,
+):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
     srp_months  — parse_srp_activity()[inncode]["months"]
@@ -1356,6 +1364,72 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month
 
         g = wash.get("GRP") or {}
         p = wash.get("PRM") or {}
+
+        if current_month_reconciled and wash_days is not None:
+            # Current-month Group/Permanent use the same cutoff as Total:
+            # manual actuals through T-2 + live Wash data from T-1 to EOM.
+            month_end = (
+                (as_of.replace(day=28) + datetime.timedelta(days=4))
+                .replace(day=1)
+                - datetime.timedelta(days=1)
+            )
+            live_start = as_of - datetime.timedelta(days=1)
+
+            live_group = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
+            live_perm = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
+
+            d = live_start
+            while d <= month_end:
+                day_bucket = wash_days.get(d) or {}
+                for src, dest in (
+                    (day_bucket.get("GRP") or {}, live_group),
+                    (day_bucket.get("PRM") or {}, live_perm),
+                ):
+                    for metric in (
+                        "pu_rooms",
+                        "pu_rev",
+                        "av_rooms",
+                        "av_rev",
+                    ):
+                        dest[metric] += _ar_num(src.get(metric)) or 0
+                d += datetime.timedelta(days=1)
+
+            g = {
+                "pu_rooms": (
+                    (_ar_num(current_month_total.get("actual_group_rooms")) or 0)
+                    + live_group["pu_rooms"]
+                ),
+                "pu_rev": (
+                    (_ar_num(current_month_total.get("actual_group_revenue")) or 0)
+                    + live_group["pu_rev"]
+                ),
+                # Not-picked-up is a live future block measure, so only the
+                # T-1-to-EOM remainder belongs in the current ROB.
+                "av_rooms": live_group["av_rooms"],
+                "av_rev": live_group["av_rev"],
+            }
+            p = {
+                "pu_rooms": (
+                    (_ar_num(current_month_total.get("actual_perm_rooms")) or 0)
+                    + live_perm["pu_rooms"]
+                ),
+                "pu_rev": (
+                    (_ar_num(current_month_total.get("actual_perm_revenue")) or 0)
+                    + live_perm["pu_rev"]
+                ),
+                "av_rooms": live_perm["av_rooms"],
+                "av_rev": live_perm["av_rev"],
+            }
 
         # Zero is a real ROB value, not "missing data". A month with no rooms
         # on the books must still write 0 to Rooms and Revenue so the workbook
@@ -11526,43 +11600,104 @@ def render_hilton_update(hotels):
 
         hilton_manual_mtd = {}
         if selected and "ROB" in wb_sels:
-            st.markdown("**Current-month actuals through T-2 — enter manually for ROB**")
+            st.markdown("### Hilton ROB Actuals")
             st.caption(
-                "Enter the Room Nights and Revenue actual totals through two days ago "
-                "(T-2). The ROB will then add all live SRP OTB from yesterday "
-                "(T-1) through month end."
+                "Enter actual totals through **T-2**. The ROB adds live OTB from "
+                "**T-1 through month-end**. These inputs affect the ROB only."
             )
-            mtd_cols = st.columns(2)
-            for i, (name, fid) in enumerate(selected):
-                with mtd_cols[i % 2]:
+
+            for name, fid in selected:
+                with st.container(border=True):
                     st.markdown(f"**{name}**")
-                    m1, m2 = st.columns(2)
-                    with m1:
-                        mtd_rooms = st.number_input(
-                            "Actual Room Nights through T-2",
+
+                    h0, h1, h2 = st.columns([1.45, 1, 1])
+                    with h0:
+                        st.caption("Line")
+                    with h1:
+                        st.caption("Room Nights")
+                    with h2:
+                        st.caption("Revenue")
+
+                    # Total Rooms
+                    r0, r1, r2 = st.columns([1.45, 1, 1])
+                    with r0:
+                        st.markdown("**Total Rooms**")
+                    with r1:
+                        total_rooms = st.number_input(
+                            f"{name} Total Room Nights through T-2",
                             min_value=0.0,
                             value=0.0,
                             step=1.0,
-                            key=f"hil_mtd_rooms_{fid}",
+                            key=f"hil_total_rooms_{fid}",
+                            label_visibility="collapsed",
                         )
-                    with m2:
-                        mtd_revenue = st.number_input(
-                            "Actual Revenue through T-2",
+                    with r2:
+                        total_revenue = st.number_input(
+                            f"{name} Total Revenue through T-2",
                             min_value=0.0,
                             value=0.0,
                             step=100.0,
                             format="%.2f",
-                            key=f"hil_mtd_revenue_{fid}",
+                            key=f"hil_total_revenue_{fid}",
+                            label_visibility="collapsed",
                         )
-                    hilton_manual_mtd[name] = {
-                        "rooms": mtd_rooms,
-                        "revenue": mtd_revenue,
-                    }
 
-                    st.caption(
-                        "Enter actual totals through two days before the SRP run date. "
-                        "The ROB adds SRP OTB beginning with the day before the run date."
-                    )
+                    # Group
+                    g0, g1, g2 = st.columns([1.45, 1, 1])
+                    with g0:
+                        st.markdown("**Group**")
+                    with g1:
+                        group_rooms = st.number_input(
+                            f"{name} Group Room Nights through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"hil_group_rooms_{fid}",
+                            label_visibility="collapsed",
+                        )
+                    with g2:
+                        group_revenue = st.number_input(
+                            f"{name} Group Revenue through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            key=f"hil_group_revenue_{fid}",
+                            label_visibility="collapsed",
+                        )
+
+                    # Permanent
+                    p0, p1, p2 = st.columns([1.45, 1, 1])
+                    with p0:
+                        st.markdown("**Permanent**")
+                    with p1:
+                        perm_rooms = st.number_input(
+                            f"{name} Permanent Room Nights through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"hil_perm_rooms_{fid}",
+                            label_visibility="collapsed",
+                        )
+                    with p2:
+                        perm_revenue = st.number_input(
+                            f"{name} Permanent Revenue through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            key=f"hil_perm_revenue_{fid}",
+                            label_visibility="collapsed",
+                        )
+
+                    hilton_manual_mtd[name] = {
+                        "rooms": total_rooms,
+                        "revenue": total_revenue,
+                        "group_rooms": group_rooms,
+                        "group_revenue": group_revenue,
+                        "perm_rooms": perm_rooms,
+                        "perm_revenue": perm_revenue,
+                    }
 
     if not selected:
         st.info("Select at least one property.")
@@ -11694,6 +11829,10 @@ def render_hilton_update(hotels):
                     manual = hilton_manual_mtd.get(name) or {}
                     manual_rooms = _ar_num(manual.get("rooms")) or 0
                     manual_revenue = _ar_num(manual.get("revenue")) or 0
+                    manual_group_rooms = _ar_num(manual.get("group_rooms")) or 0
+                    manual_group_revenue = _ar_num(manual.get("group_revenue")) or 0
+                    manual_perm_rooms = _ar_num(manual.get("perm_rooms")) or 0
+                    manual_perm_revenue = _ar_num(manual.get("perm_revenue")) or 0
 
                     if manual_rooms == 0 and manual_revenue == 0:
                         problems.append(
@@ -11727,6 +11866,10 @@ def render_hilton_update(hotels):
                         "revenue": manual_revenue + srp_revenue,
                         "actual_rooms": manual_rooms,
                         "actual_revenue": manual_revenue,
+                        "actual_group_rooms": manual_group_rooms,
+                        "actual_group_revenue": manual_group_revenue,
+                        "actual_perm_rooms": manual_perm_rooms,
+                        "actual_perm_revenue": manual_perm_revenue,
                         "srp_rooms": srp_rooms,
                         "srp_revenue": srp_revenue,
                         "srp_revenue_raw": srp_revenue_raw,
@@ -11753,6 +11896,7 @@ def render_hilton_update(hotels):
                         if wb_type == NEXT_YEAR_ROB_TYPE
                         else hilton_as_of.year
                     ),
+                    wash_days=wash.get("days"),
                 )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
@@ -11766,6 +11910,14 @@ def render_hilton_update(hotels):
                         f"{current_month_total['srp_rooms']:,.0f} rooms; "
                         f"${current_month_total['actual_revenue']:,.2f} + "
                         f"${current_month_total['srp_revenue']:,.0f})"
+                    )
+                    note += (
+                        f"  ·  Group T-2 actuals "
+                        f"{current_month_total.get('actual_group_rooms', 0):,.0f} rms / "
+                        f"${current_month_total.get('actual_group_revenue', 0):,.2f}"
+                        f"  ·  Permanent T-2 actuals "
+                        f"{current_month_total.get('actual_perm_rooms', 0):,.0f} rms / "
+                        f"${current_month_total.get('actual_perm_revenue', 0):,.2f}"
                     )
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
