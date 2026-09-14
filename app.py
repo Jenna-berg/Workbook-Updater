@@ -411,7 +411,7 @@ def _wash_bucket():
             lambda: {"pu_rooms": 0.0, "pu_rev": 0.0, "av_rooms": 0.0, "av_rev": 0.0}))
 
 
-def parse_group_wash(file_like):
+def parse_group_wash(file_like, hotel_name=None):
     """Individual Group Wash export → {"months": ..., "days": ...}
 
     'months' is {(year, month): {seg: {...}}} and 'days' the same keyed by
@@ -419,7 +419,7 @@ def parse_group_wash(file_like):
     builds both: the ROB reads months, the Forecast reads days, and they must
     describe the same blocks.
 
-    seg is 'GRP' (Market Segment != PERM) or 'PRM' (== PERM); each holds
+    seg is 'GRP' or 'PRM'; Northbrook also treats Market Segment MEPS as PRM; each holds
     pu_rooms / pu_rev / av_rooms / av_rev.
 
     'Pick Up' is what has actually been reserved out of the block and belongs
@@ -441,7 +441,21 @@ def parse_group_wash(file_like):
         pu = safe_float(rec.get("Pick Up")) or 0.0
         av = safe_float(rec.get("Available Block")) or 0.0
         rate = safe_float(rec.get("Rate")) or 0.0
-        seg = "PRM" if str(rec.get("Market Segment", "")).strip().upper() == WASH_PERM_SEGMENT else "GRP"
+        market_segment = str(
+            rec.get("Market Segment", "")
+        ).strip().upper()
+
+        is_northbrook = "northbrook" in str(
+            hotel_name or ""
+        ).strip().lower()
+
+        # Northbrook's permanent-room business is coded as MEPS in the
+        # Group Wash export. Other Hilton hotels keep the standard PERM rule.
+        is_perm = (
+            market_segment == WASH_PERM_SEGMENT
+            or (is_northbrook and market_segment == "MEPS")
+        )
+        seg = "PRM" if is_perm else "GRP"
         day = occ.date() if isinstance(occ, datetime.datetime) else occ
         for view, key in ((months, (occ.year, occ.month)), (days, day)):
             b = view[key][seg]
@@ -11794,7 +11808,7 @@ def render_hilton_update(hotels):
                     f"{service_account_email() or 'the service account'} as Editor.")
                 continue
             try:
-                wash = parse_group_wash(wash_files[name])
+                wash = parse_group_wash(wash_files[name], hotel_name=name)
             except Exception as e:
                 problems.append(f"{name}: could not read the Group Wash report — {e}")
                 continue
