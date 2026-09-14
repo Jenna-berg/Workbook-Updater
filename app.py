@@ -1222,11 +1222,24 @@ def extract_hilton_mtd_actuals_from_forecast(raw_bytes, as_of):
 
 
 def hilton_current_month_total(srp_days, forecast_actuals, as_of):
-    """Combine Forecast actuals + SRP exactly as the Hilton daily ROB workflow.
+    """Combine Forecast actuals + live SRP tail for the Hilton current-month ROB.
 
-    Current month =
+    Correct Hilton ROB workflow:
       Forecast actuals: month start through as_of - 2
-      SRP OTB/live stay values: as_of - 1 through month end
+      SRP live OTB:     as_of - 1 through month end
+
+    The Hilton Forecast daily mapping already produces the correct occupancy /
+    ADR from the SRP activity data. The ROB should use the same live tail, but
+    the corrected Hilton ROBs round that SRP *monthly revenue component* to the
+    nearest whole dollar before combining it with the Forecast actual revenue.
+
+    Example from the corrected Ann Arbor SEP2026 ROB:
+      SRP Sep 13–30:      2,391 rooms / $471,434.829... -> $471,435
+      Forecast Sep 1–12:  1,566 rooms / $402,148.78
+      ROB current month:  3,957 rooms / $873,583.78
+
+    Keeping the two components separately also lets build_hilton_rob_plan write
+    an auditable Excel formula instead of an opaque hard-coded total.
     """
     if not as_of:
         return None
@@ -1240,21 +1253,32 @@ def hilton_current_month_total(srp_days, forecast_actuals, as_of):
     srp_start = as_of - datetime.timedelta(days=1)
 
     srp_rooms = 0.0
-    srp_revenue = 0.0
+    srp_revenue_raw = 0.0
+
     d = srp_start
     while d <= month_end:
         rooms, rev = _srp_seg(srp_days.get(d), "TOT")
         srp_rooms += rooms
-        srp_revenue += rev
+        srp_revenue_raw += rev
         d += datetime.timedelta(days=1)
 
+    # Hilton ROB convention: current-month live SRP revenue is rounded to the
+    # nearest whole dollar before adding the already-actualized Forecast MTD.
+    # All source values are positive room revenue, so floor(x + .5) is a stable
+    # half-up whole-dollar rounding rule.
+    srp_revenue = int(math.floor(srp_revenue_raw + 0.5))
+
+    actual_rooms = forecast_actuals["rooms"]
+    actual_revenue = forecast_actuals["revenue"]
+
     return {
-        "rooms": forecast_actuals["rooms"] + srp_rooms,
-        "revenue": forecast_actuals["revenue"] + srp_revenue,
-        "actual_rooms": forecast_actuals["rooms"],
-        "actual_revenue": forecast_actuals["revenue"],
+        "rooms": actual_rooms + srp_rooms,
+        "revenue": actual_revenue + srp_revenue,
+        "actual_rooms": actual_rooms,
+        "actual_revenue": actual_revenue,
         "srp_rooms": srp_rooms,
         "srp_revenue": srp_revenue,
+        "srp_revenue_raw": srp_revenue_raw,
         "actual_through": forecast_actuals["through"],
         "srp_from": srp_start,
         "forecast_sheet": forecast_actuals["sheet"],
@@ -1320,11 +1344,13 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month
         # stays have fallen outside its Departure Date filter. For the current
         # month, use the established Hilton workflow:
         #   actuals through day-before-yesterday + SRP yesterday through EOM.
-        if (
+        current_month_reconciled = (
             tracked_year == as_of.year
             and month == as_of.month
             and current_month_total is not None
-        ):
+        )
+
+        if current_month_reconciled:
             tot_rooms = current_month_total["rooms"]
             tot_rev = current_month_total["revenue"]
 
@@ -1353,8 +1379,29 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None, current_month
                 f"same dates and the same property.")
 
         L = labels.get
-        put(L("revenue"),        5, "Revenue",        round(tot_rev, 2), month)
-        put(L("room nights"),    5, "Room Nights",    int(round(tot_rooms)), month)
+
+        if current_month_reconciled:
+            # Match the corrected Hilton ROB layout: show the live SRP tail and
+            # Forecast actual MTD as the two visible formula components.
+            srp_rooms_formula = int(round(current_month_total["srp_rooms"]))
+            actual_rooms_formula = int(round(current_month_total["actual_rooms"]))
+            srp_revenue_formula = int(current_month_total["srp_revenue"])
+            actual_revenue_formula = round(
+                current_month_total["actual_revenue"], 2
+            )
+
+            revenue_write = (
+                f"={srp_revenue_formula} + {actual_revenue_formula:.2f}"
+            )
+            rooms_write = (
+                f"={srp_rooms_formula} + {actual_rooms_formula}"
+            )
+        else:
+            revenue_write = round(tot_rev, 2)
+            rooms_write = int(round(tot_rooms))
+
+        put(L("revenue"),        5, "Revenue",        revenue_write, month)
+        put(L("room nights"),    5, "Room Nights",    rooms_write, month)
         put(L("group rms sold"), 5, "Group Rms sold", int(round(g.get("pu_rooms", 0.0))), month)
         put(L("group rm rev"),   5, "Group Rm Rev",   round(g.get("pu_rev", 0.0), 2), month)
         put(L("group rms sold"), 7, "Group not p/u rms", int(round(g.get("av_rooms", 0.0))), month)
@@ -11477,6 +11524,46 @@ def render_hilton_update(hotels):
                     wash_files[name] = st.file_uploader(
                         name, type=["xlsx"], key=f"hil_wash_{fid}")
 
+        hilton_manual_mtd = {}
+        if selected and "ROB" in wb_sels:
+            st.markdown("**Current-month actuals through T-2 — enter manually for ROB**")
+            st.caption(
+                "Enter the Room Nights and Revenue actual totals through two days ago "
+                "(T-2). The ROB will then add all live SRP OTB from yesterday "
+                "(T-1) through month end."
+            )
+            mtd_cols = st.columns(2)
+            for i, (name, fid) in enumerate(selected):
+                with mtd_cols[i % 2]:
+                    st.markdown(f"**{name}**")
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        mtd_rooms = st.number_input(
+                            "Actual Room Nights through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"hil_mtd_rooms_{fid}",
+                        )
+                    with m2:
+                        mtd_revenue = st.number_input(
+                            "Actual Revenue through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            key=f"hil_mtd_revenue_{fid}",
+                        )
+                    hilton_manual_mtd[name] = {
+                        "rooms": mtd_rooms,
+                        "revenue": mtd_revenue,
+                    }
+
+                    st.caption(
+                        "Enter actual totals through two days before the SRP run date. "
+                        "The ROB adds SRP OTB beginning with the day before the run date."
+                    )
+
     if not selected:
         st.info("Select at least one property.")
         return
@@ -11515,9 +11602,10 @@ def render_hilton_update(hotels):
             for line in srp_filters["lines"]:
                 st.markdown(f"- {line}")
             st.caption("Booked Date should match the report run date. For the "
-                       "current month, the ROB combines completed Forecast actuals "
-                       "with the live SRP portion instead of expecting SRP to contain "
-                       "the full month's completed stays.")
+                       "current month, the ROB combines manually entered actual Room Nights / "
+                       "Revenue through T-2 with live SRP OTB from T-1 through month "
+                       "end. The Forecast remains separate: T-1 stays blank for manual "
+                       "daily actual entry, while T and future dates use SRP OTB.")
 
     # Resolved up front, not inside the run. A hotel the export doesn't cover
     # can't be updated, and finding that out only after pressing the button is
@@ -11598,39 +11686,57 @@ def render_hilton_update(hotels):
                 sheet = first_uncolored_sheet(wb, avail)
                 current_month_total = None
 
-                # Current-month Hilton ROB needs completed daily actuals from
-                # the current Forecast workbook plus the live SRP tail.
-                fcst_result, fcst_err = resolve_drive_workbook(
-                    svc, fid, name, "Forecast", month_date=hilton_as_of.replace(day=1)
-                )
-                if fcst_result and not fcst_err:
-                    fcst_id, fcst_name = fcst_result
-                    try:
-                        fcst_raw = drive_download(svc, fcst_id)
-                        actuals = extract_hilton_mtd_actuals_from_forecast(
-                            fcst_raw, hilton_as_of
-                        )
-                        current_month_total = hilton_current_month_total(
-                            prop["days"], actuals, hilton_as_of
-                        )
-                        if current_month_total is None:
-                            problems.append(
-                                f"{name} — ROB: could not find completed Forecast "
-                                f"actuals through {hilton_as_of - datetime.timedelta(days=2):%b %d}; "
-                                f"current-month Revenue / Room Nights were left to "
-                                f"the plain SRP total."
-                            )
-                    except Exception as e:
+                # Current-month Hilton ROB uses the user's manually reconciled
+                # actual Room Nights / Revenue through T-2, then adds the live
+                # SRP tail beginning T-1 (yesterday).
+                # Forecast workbook mapping remains separate and unchanged.
+                if wb_type != NEXT_YEAR_ROB_TYPE:
+                    manual = hilton_manual_mtd.get(name) or {}
+                    manual_rooms = _ar_num(manual.get("rooms")) or 0
+                    manual_revenue = _ar_num(manual.get("revenue")) or 0
+
+                    if manual_rooms == 0 and manual_revenue == 0:
                         problems.append(
-                            f"{name} — ROB: could not read current Forecast actuals "
-                            f"for the current-month total — {e}"
+                            f"{name} — ROB: T-2 actual Room Nights and Revenue are both "
+                            f"0. Enter the reconciled MTD actuals before applying "
+                            f"if that is not intentional."
                         )
-                else:
-                    problems.append(
-                        f"{name} — ROB: current Forecast workbook was not found, so "
-                        f"the current-month Revenue / Room Nights could not be "
-                        f"reconciled with completed actuals."
+
+                    month_end = (
+                        (hilton_as_of.replace(day=28) + datetime.timedelta(days=4))
+                        .replace(day=1)
+                        - datetime.timedelta(days=1)
                     )
+                    srp_start = hilton_as_of - datetime.timedelta(days=1)
+
+                    srp_rooms = 0.0
+                    srp_revenue_raw = 0.0
+                    d = srp_start
+                    while d <= month_end:
+                        rooms, rev = _srp_seg(prop["days"].get(d), "TOT")
+                        srp_rooms += rooms
+                        srp_revenue_raw += rev
+                        d += datetime.timedelta(days=1)
+
+                    srp_revenue = int(
+                        math.floor(srp_revenue_raw + 0.5)
+                    )
+
+                    current_month_total = {
+                        "rooms": manual_rooms + srp_rooms,
+                        "revenue": manual_revenue + srp_revenue,
+                        "actual_rooms": manual_rooms,
+                        "actual_revenue": manual_revenue,
+                        "srp_rooms": srp_rooms,
+                        "srp_revenue": srp_revenue,
+                        "srp_revenue_raw": srp_revenue_raw,
+                        "actual_through": (
+                            hilton_as_of - datetime.timedelta(days=2)
+                        ),
+                        "srp_from": srp_start,
+                        "forecast_sheet": None,
+                        "source": "manual_mtd",
+                    }
 
                 changes, rob_warns = build_hilton_rob_plan(
                     prop["months"],
@@ -11653,9 +11759,13 @@ def render_hilton_update(hotels):
                 note = f"  ·  InnCode {inn}"
                 if current_month_total is not None:
                     note += (
-                        f"  ·  current month = Forecast actuals through "
+                        f"  ·  current month = Manual actuals through T-2 "
                         f"{current_month_total['actual_through']:%b %d} + SRP "
-                        f"{current_month_total['srp_from']:%b %d}–month end"
+                        f"{current_month_total['srp_from']:%b %d}–month end "
+                        f"({current_month_total['actual_rooms']:,.0f} + "
+                        f"{current_month_total['srp_rooms']:,.0f} rooms; "
+                        f"${current_month_total['actual_revenue']:,.2f} + "
+                        f"${current_month_total['srp_revenue']:,.0f})"
                     )
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
