@@ -7450,77 +7450,416 @@ def find_forecast_master(service, hotel_id: str):
     return None, "No FORECAST master file found in Drive."
 
 
-def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+
+def _previous_month(d):
+    first = d.replace(day=1)
+    return (first - datetime.timedelta(days=1)).replace(day=1)
+
+
+def _is_ashworth_hotel(hotel_name):
+    n = str(hotel_name or "").strip().lower()
+    return "ashworth" in n or "hampton" in n
+
+
+def _numeric_formula_value(value):
+    """Best-effort numeric evaluation for simple hand-entered ROB formulas."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s.startswith("="):
+        return safe_float(s)
+
+    expr = s[1:].strip()
+    # Only allow simple arithmetic made of numbers, spaces, decimal points,
+    # parentheses and + - * /. No cell refs/functions.
+    if not re.fullmatch(r"[0-9\.\+\-\*/\(\)\s]+", expr):
+        return None
+    try:
+        return float(eval(expr, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
+def _rob_budget_values_for_month(service, hotel_id, hotel_name, target_month):
+    """Return target month total budget values from ROB I/J.
+
+    Mapping:
+      FCST-WK1 C29 <- ROB I Room Nights
+      FCST-WK1 D29 <- ROB I Revenue
+      FCST-WK1 C30 <- ROB J Room Nights
+      FCST-WK1 D30 <- ROB J Revenue
+
+    Only total Revenue / Room Nights are read — Group rows are intentionally
+    excluded.
     """
-    Copy Forecast master → rename for target_month → place in month folder → set B4 date.
-    Returns (new_file_name, error_str).
+    # The current ROB normally already carries future-month budgets, so for a
+    # next-month Forecast setup prefer the prior month's ROB workbook.
+    source_months = [_previous_month(target_month), target_month]
+    seen = set()
+    last_err = None
+
+    for source_month in source_months:
+        key = (source_month.year, source_month.month)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        result, err = resolve_drive_workbook(
+            service,
+            hotel_id,
+            hotel_name,
+            "ROB",
+            month_date=source_month,
+        )
+        if err or not result:
+            last_err = err
+            continue
+
+        file_id, file_name = result
+        try:
+            raw = drive_download(service, file_id)
+
+            # Data-only first so formula-backed budget cells return cached
+            # numeric values when the workbook has been calculated in Excel.
+            wb_values = openpyxl.load_workbook(
+                io.BytesIO(raw),
+                data_only=True,
+            )
+            wb_formulas = openpyxl.load_workbook(
+                io.BytesIO(raw),
+                data_only=False,
+            )
+
+            sheet = next(
+                (s for s in ROB_SHEETS if s in wb_values.sheetnames),
+                wb_values.sheetnames[0],
+            )
+            ws_values = wb_values[sheet]
+            ws_formulas = wb_formulas[sheet]
+
+            blocks = rob_month_blocks(ws_formulas)
+            labels = blocks.get(target_month.month - 1)
+            if not labels:
+                last_err = (
+                    f"{file_name}: could not find the "
+                    f"{target_month:%B} ROB block."
+                )
+                continue
+
+            revenue_row = labels.get("revenue")
+            rooms_row = labels.get("room nights")
+            if not revenue_row or not rooms_row:
+                last_err = (
+                    f"{file_name}: target month is missing Revenue or "
+                    f"Room Nights rows."
+                )
+                continue
+
+            def get_num(row, col):
+                v = ws_values.cell(row, col).value
+                num = safe_float(v)
+                if num is not None:
+                    return num
+
+                # If cached formula result is unavailable, support simple
+                # hand-entered arithmetic formulas such as =37660+836325.37.
+                return _numeric_formula_value(
+                    ws_formulas.cell(row, col).value
+                )
+
+            vals = {
+                "c29": get_num(rooms_row, 9),
+                "d29": get_num(revenue_row, 9),
+                "c30": get_num(rooms_row, 10),
+                "d30": get_num(revenue_row, 10),
+                "source_file": file_name,
+                "source_sheet": sheet,
+            }
+
+            missing = [
+                cell.upper()
+                for cell in ("c29", "d29", "c30", "d30")
+                if vals[cell] is None
+            ]
+            if missing:
+                last_err = (
+                    f"{file_name}: could not read ROB budget value(s) for "
+                    f"{target_month:%B}: {', '.join(missing)}."
+                )
+                continue
+
+            return vals, None
+        except Exception as e:
+            last_err = f"{file_name}: could not read ROB budget — {e}"
+
+    return None, last_err or (
+        f"Could not find a ROB workbook containing the "
+        f"{target_month:%B %Y} budget."
+    )
+
+
+def _write_forecast_budget_block(
+    wb,
+    service,
+    hotel_id,
+    hotel_name,
+    target_month,
+):
+    """Populate FCST-WK1 C29:D30 from the corresponding ROB total budget."""
+    values, err = _rob_budget_values_for_month(
+        service,
+        hotel_id,
+        hotel_name,
+        target_month,
+    )
+    if err or not values:
+        return err
+
+    sheet = (
+        "FCST-WK1"
+        if "FCST-WK1" in wb.sheetnames
+        else next(
+            (s for s in FORECAST_SHEETS if s in wb.sheetnames),
+            None,
+        )
+    )
+    if not sheet:
+        return "Could not find FCST-WK1 in the Forecast workbook."
+
+    ws = wb[sheet]
+    ws["C29"] = int(round(values["c29"]))
+    ws["D29"] = round(values["d29"], 2)
+    ws["C30"] = int(round(values["c30"]))
+    ws["D30"] = round(values["d30"], 2)
+    return None
+
+
+def _ashworth_forecast_template_fallback(
+    service,
+    hotel_id,
+    hotel_name,
+    target_month,
+):
+    """Ashworth can use the prior month's Forecast when no master exists."""
+    if not _is_ashworth_hotel(hotel_name):
+        return None, None
+
+    prior_month = _previous_month(target_month)
+    result, err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        "Forecast",
+        month_date=prior_month,
+    )
+    if err or not result:
+        return None, (
+            f"No Forecast master was found, and the prior-month "
+            f"Forecast ({prior_month:%b %Y}) could not be found either."
+        )
+    return result, None
+
+
+
+def setup_new_forecast_month(
+    service,
+    hotel_id: str,
+    hotel_name: str,
+    target_month: datetime.date,
+):
     """
-    year_kw  = str(target_month.year)
+    Set up next month's Forecast.
+
+    Normal properties:
+      Forecast master -> target month Forecast.
+
+    Ashworth fallback:
+      If no Forecast master exists, copy the immediately prior month's
+      Forecast workbook instead.
+
+    Also populates FCST-WK1 C29:D30 with the target month's TOTAL ROB budget:
+      C29 = ROB I Room Nights
+      D29 = ROB I Revenue
+      C30 = ROB J Room Nights
+      D30 = ROB J Revenue
+    """
+    year_kw = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
+    rev_id, _ = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
-    month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, _ = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        target_month,
+        hotel_name,
+    )
     if not month_id:
-        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
+        return None, (
+            f"Could not find the {month_kw} folder for {hotel_name} — "
+            f"it should already exist."
+        )
 
-    # Check if Forecast already exists
-    existing_id, existing_name = drive_find_file(service, "FORECAST", month_id)
+    # If the target Forecast already exists, still update its start date/budget
+    # instead of returning immediately. That makes the setup button useful for
+    # repairing a previously-created workbook too.
+    existing_id, existing_name = drive_find_file(
+        service,
+        "FORECAST",
+        month_id,
+    )
+    target_file_id = None
+    target_file_name = None
+    newly_created = False
+
     if existing_id and "master" not in existing_name.lower():
-        return existing_name, None
+        target_file_id = existing_id
+        target_file_name = existing_name
+    else:
+        master_id, master_name = find_forecast_master(
+            service,
+            hotel_id,
+        )
 
-    master_id, master_name = find_forecast_master(service, hotel_id)
-    if not master_id:
-        return None, master_name
+        # Ashworth has no Forecast master in its Drive tree. Use the prior
+        # month's live Forecast as the template rather than failing setup.
+        if not master_id:
+            fallback, fallback_err = _ashworth_forecast_template_fallback(
+                service,
+                hotel_id,
+                hotel_name,
+                target_month,
+            )
+            if fallback:
+                master_id, master_name = fallback
+            else:
+                return None, fallback_err or master_name
 
-    # Infer hotel suffix from master name
-    hotel_suffix = hotel_name.upper()
-    name_upper = master_name.upper()
-    ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
-    for kw in ("FORECAST",):
-        if kw in name_upper:
-            after = master_name[name_upper.find(kw) + len(kw):].strip()
-            after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+        hotel_suffix = hotel_name.upper()
+        name_upper = master_name.upper()
+        ext = (
+            ".xlsm"
+            if master_name.lower().endswith(".xlsm")
+            else ".xlsx"
+        )
+        if "FORECAST" in name_upper:
+            after = master_name[
+                name_upper.find("FORECAST") + len("FORECAST"):
+            ].strip()
+            after = re.sub(
+                r"(?i)\.(xlsx|xlsm)$",
+                "",
+                after,
+            ).strip()
             if after:
                 hotel_suffix = after
-            break
 
-    new_file_name = f"{month_kw} FORECAST {hotel_suffix}{ext}"
-    try:
-        new_file_id, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
-    except Exception as e:
-        return None, str(e)
+        target_file_name = (
+            f"{month_kw} FORECAST {hotel_suffix}{ext}"
+        )
+        try:
+            target_file_id, target_file_name = drive_copy_file(
+                service,
+                master_id,
+                target_file_name,
+                month_id,
+            )
+            newly_created = True
+        except Exception as e:
+            return None, str(e)
 
-    # Set B4 = first day of target_month in FCST-WK1
     try:
-        wb_bytes  = drive_download(service, new_file_id)
-        wb        = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        wb_bytes = drive_download(service, target_file_id)
+        keep_vba = str(target_file_name).lower().endswith(".xlsm")
+        wb = openpyxl.load_workbook(
+            io.BytesIO(wb_bytes),
+            data_only=False,
+            keep_vba=keep_vba,
+        )
+
         clear_tab_colors(wb, FORECAST_SHEETS)
-        sheet     = FORECAST_SHEETS[0] if FORECAST_SHEETS[0] in wb.sheetnames else wb.sheetnames[1] if len(wb.sheetnames) > 1 else wb.sheetnames[0]
-        ws        = wb[sheet]
-        # Find "Day of Week" cell → one right + one down = start date cell
-        date_cell_row = date_cell_col = None
+
+        sheet = (
+            FORECAST_SHEETS[0]
+            if FORECAST_SHEETS[0] in wb.sheetnames
+            else (
+                wb.sheetnames[1]
+                if len(wb.sheetnames) > 1
+                else wb.sheetnames[0]
+            )
+        )
+        ws = wb[sheet]
+
+        # Find Day of Week -> one right + one down = first date.
+        date_cell_row = None
+        date_cell_col = None
         for r in range(1, 15):
             for c in range(1, 10):
-                if "day of week" in str(ws.cell(r, c).value or "").lower():
+                if (
+                    "day of week"
+                    in str(ws.cell(r, c).value or "").lower()
+                ):
                     date_cell_row = r + 1
                     date_cell_col = c + 1
                     break
             if date_cell_row:
                 break
+
         if date_cell_row and date_cell_col:
-            ws.cell(date_cell_row, date_cell_col).value = datetime.datetime(
-                target_month.year, target_month.month, 1)
+            ws.cell(
+                date_cell_row,
+                date_cell_col,
+            ).value = datetime.datetime(
+                target_month.year,
+                target_month.month,
+                1,
+            )
+
+        budget_err = _write_forecast_budget_block(
+            wb,
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
+        )
+
         strip_tables(wb)
         out = io.BytesIO()
         wb.save(out)
-        drive_upload(service, new_file_id, out.getvalue(), created_name)
-    except Exception as e:
-        return created_name, f"Copied OK but could not set start date: {e}"
+        drive_upload(
+            service,
+            target_file_id,
+            out.getvalue(),
+            target_file_name,
+        )
 
-    return created_name, None
+        if budget_err:
+            return (
+                target_file_name,
+                f"Forecast {'created' if newly_created else 'found'} and "
+                f"dated correctly, but budget could not be filled: "
+                f"{budget_err}"
+            )
+    except Exception as e:
+        return (
+            target_file_name,
+            f"{'Copied' if newly_created else 'Found'} Forecast, but could "
+            f"not finish setup: {e}",
+        )
+
+    return target_file_name, None
 
 
 def find_sr_master(service, hotel_id: str, target_year=None):
