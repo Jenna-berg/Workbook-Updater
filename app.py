@@ -3132,11 +3132,14 @@ def _strategy_hotel_aliases(hotel_name):
 
 
 def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
-    """Find selected hotel's SNT Rate and Restrictions columns.
+    """Find the selected hotel's *current-year* SNT Rate + Restrictions columns.
 
-    Real SNT Strategy layout uses rows 1-4 as headers. Some labels are split
-    vertically, e.g. X3='Restric' and X4='tions'. The selected hotel's own
-    rate is the column headed by that hotel's name.
+    Some Strategy templates repeat the hotel's name across a bank of columns
+    for current-year and prior-year/reference pricing. Crowne Pointe is a real
+    example: AA:AJ all say CROWNE POINTE, but AA is 2026 while AB:AJ are 2025.
+    Therefore the hotel-name match alone is not enough; when multiple matches
+    exist, anchor the destination to the Strategy tab's current-year date
+    column and prefer the candidate whose header contains that same year.
     """
     aliases = _strategy_hotel_aliases(hotel_name)
     header_max_row = min(4, ws.max_row)
@@ -3155,6 +3158,38 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
             a == n or a in n or n in a
             for a in aliases
         )
+
+    # Determine the Strategy tab's current year from its actual daily date
+    # column, not from the first numeric year header we happen to encounter.
+    strategy_year = None
+    try:
+        date_col = detect_date_column(ws, wb=ws.parent)
+        years = []
+        for r in range(5, min(ws.max_row, 400) + 1):
+            v = ws.cell(r, date_col).value
+            if isinstance(v, datetime.datetime):
+                years.append(v.year)
+            elif isinstance(v, datetime.date):
+                years.append(v.year)
+        if years:
+            strategy_year = collections.Counter(years).most_common(1)[0][0]
+    except Exception:
+        strategy_year = None
+
+    # Fallback: look for a plausible current-year label in rows 1:4.
+    if strategy_year is None:
+        header_years = []
+        for c in range(1, ws.max_column + 1):
+            for r in range(1, header_max_row + 1):
+                v = ws.cell(r, c).value
+                try:
+                    y = int(float(v))
+                except Exception:
+                    continue
+                if 2000 <= y <= 2100:
+                    header_years.append(y)
+        if header_years:
+            strategy_year = max(header_years)
 
     # Ashworth/Hampton has a Casino Ballroom block before its far-right
     # rate-shopping section. Its own SNT rate belongs in the exact ASH column.
@@ -3198,12 +3233,40 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
             for c in range(rng.min_col, rng.max_col + 1):
                 hotel_candidates.append((c, str(value or "").strip()))
 
+    # Deduplicate by column while preserving the richest header text.
+    deduped = {}
+    for c, header in hotel_candidates:
+        existing = deduped.get(c, "")
+        if len(header) > len(existing):
+            deduped[c] = header
+    hotel_candidates = sorted(deduped.items())
+
     if not hotel_candidates:
         return None, None, (
             f"Could not match selected hotel '{hotel_name}' to a Strategy Report header."
         )
 
-    rate_col, matched_header = min(hotel_candidates, key=lambda x: x[0])
+    # IMPORTANT: if the hotel name repeats across TY/LY pricing columns, select
+    # the column explicitly labeled for the Strategy tab's current year.
+    year_candidates = []
+    if strategy_year is not None:
+        year_re = re.compile(rf"(?<!\d){strategy_year}(?!\d)")
+        for c, header in hotel_candidates:
+            if year_re.search(header):
+                year_candidates.append((c, header))
+
+    if year_candidates:
+        rate_col, matched_header = min(year_candidates, key=lambda x: x[0])
+        year_note = f", current year {strategy_year}"
+    else:
+        # Preserve the prior leftmost-match fallback for templates without
+        # explicit year labels in the hotel-rate bank.
+        rate_col, matched_header = min(hotel_candidates, key=lambda x: x[0])
+        year_note = (
+            f", Strategy year {strategy_year} not found in hotel headers"
+            if strategy_year is not None
+            else ", Strategy year could not be detected"
+        )
 
     restriction_candidates = []
     for c in range(1, ws.max_column + 1):
@@ -3223,7 +3286,7 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
 
     diag = (
         f"Matched '{hotel_name}' to Strategy header '{matched_header}' "
-        f"(rate col {rate_col}"
+        f"(rate col {rate_col}{year_note}"
         + (f", restrictions col {restric_col})"
            if restric_col else ", restrictions not found)")
     )
