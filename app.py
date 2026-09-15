@@ -3132,14 +3132,23 @@ def _strategy_hotel_aliases(hotel_name):
 
 
 def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
-    """Find the selected hotel's *current-year* SNT Rate + Restrictions columns.
+    """Find the selected hotel's current SNT Rate + Restrictions columns.
 
-    Some Strategy templates repeat the hotel's name across a bank of columns
-    for current-year and prior-year/reference pricing. Crowne Pointe is a real
-    example: AA:AJ all say CROWNE POINTE, but AA is 2026 while AB:AJ are 2025.
-    Therefore the hotel-name match alone is not enough; when multiple matches
-    exist, anchor the destination to the Strategy tab's current-year date
-    column and prefer the candidate whose header contains that same year.
+    The reliable layout rule across the real Strategy files is structural:
+
+      Restrictions column -> current hotel rate -> comp set / LY hotel columns
+
+    Confirmed examples:
+      Middletown:    X = Restrictions, Y = current Inn at Middletown rate
+      Crowne Pointe: Z = Restrictions, AA = current Crowne Pointe rate
+
+    Some templates repeat the hotel name again in prior-year/reference columns,
+    so matching by hotel name + detected year is not safe: a left-side LY date
+    column can make the sheet look like the prior year and send rates into the
+    wrong comparison column.
+
+    Ashworth remains a special case because its own rate is explicitly in the
+    ASH column after the Casino Ballroom section.
     """
     aliases = _strategy_hotel_aliases(hotel_name)
     header_max_row = min(4, ws.max_row)
@@ -3159,40 +3168,8 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
             for a in aliases
         )
 
-    # Determine the Strategy tab's current year from its actual daily date
-    # column, not from the first numeric year header we happen to encounter.
-    strategy_year = None
-    try:
-        date_col = detect_date_column(ws, wb=ws.parent)
-        years = []
-        for r in range(5, min(ws.max_row, 400) + 1):
-            v = ws.cell(r, date_col).value
-            if isinstance(v, datetime.datetime):
-                years.append(v.year)
-            elif isinstance(v, datetime.date):
-                years.append(v.year)
-        if years:
-            strategy_year = collections.Counter(years).most_common(1)[0][0]
-    except Exception:
-        strategy_year = None
-
-    # Fallback: look for a plausible current-year label in rows 1:4.
-    if strategy_year is None:
-        header_years = []
-        for c in range(1, ws.max_column + 1):
-            for r in range(1, header_max_row + 1):
-                v = ws.cell(r, c).value
-                try:
-                    y = int(float(v))
-                except Exception:
-                    continue
-                if 2000 <= y <= 2100:
-                    header_years.append(y)
-        if header_years:
-            strategy_year = max(header_years)
-
-    # Ashworth/Hampton has a Casino Ballroom block before its far-right
-    # rate-shopping section. Its own SNT rate belongs in the exact ASH column.
+    # Ashworth/Hampton special layout: exact ASH rate column + dynamic
+    # Restrictions finder. Keep this isolated from the generic rule.
     sheet_title = _strategy_norm(ws["A1"].value)
     requested = _strategy_norm(hotel_name)
     is_ashworth = (
@@ -3211,6 +3188,7 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
             if _strategy_norm(hdr) == "ASH":
                 rate_col = c
                 break
+
         restric_col = _find_restrictions_col(ws)
         if rate_col:
             return rate_col, restric_col, (
@@ -3218,6 +3196,24 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
                 f"(rate col {rate_col}, restrictions col {restric_col})"
             )
 
+    # Find Restrictions first. This anchors the current-year hotel-rate bank.
+    restriction_candidates = []
+    for c in range(1, ws.max_column + 1):
+        compact = re.sub(r"[^A-Z]", "", col_header_text(c).upper())
+        if (
+            "RESTRICTIONS" in compact
+            or compact.startswith("RESTRIC")
+            or ("REST" in compact and "TION" in compact)
+        ):
+            restriction_candidates.append(c)
+
+    restric_col = (
+        min(restriction_candidates)
+        if restriction_candidates
+        else _find_restrictions_col(ws)
+    )
+
+    # Collect every column whose header matches the selected hotel.
     hotel_candidates = []
     for c in range(1, ws.max_column + 1):
         header = col_header_text(c)
@@ -3231,64 +3227,57 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
         value = ws.cell(rng.min_row, rng.min_col).value
         if matches_hotel(value):
             for c in range(rng.min_col, rng.max_col + 1):
-                hotel_candidates.append((c, str(value or "").strip()))
+                hotel_candidates.append(
+                    (c, col_header_text(c) or str(value or "").strip())
+                )
 
-    # Deduplicate by column while preserving the richest header text.
+    # Deduplicate columns, preserving the richest header.
     deduped = {}
     for c, header in hotel_candidates:
-        existing = deduped.get(c, "")
-        if len(header) > len(existing):
+        if len(header) > len(deduped.get(c, "")):
             deduped[c] = header
     hotel_candidates = sorted(deduped.items())
 
     if not hotel_candidates:
-        return None, None, (
-            f"Could not match selected hotel '{hotel_name}' to a Strategy Report header."
+        return None, restric_col, (
+            f"Could not match selected hotel '{hotel_name}' "
+            f"to a Strategy Report header."
         )
 
-    # IMPORTANT: if the hotel name repeats across TY/LY pricing columns, select
-    # the column explicitly labeled for the Strategy tab's current year.
-    year_candidates = []
-    if strategy_year is not None:
-        year_re = re.compile(rf"(?<!\d){strategy_year}(?!\d)")
-        for c, header in hotel_candidates:
-            if year_re.search(header):
-                year_candidates.append((c, header))
+    # Primary rule: current hotel rate is the nearest matching hotel column
+    # immediately to the RIGHT of Restrictions.
+    right_of_restrictions = []
+    if restric_col:
+        right_of_restrictions = [
+            (c, header)
+            for c, header in hotel_candidates
+            if c > restric_col
+        ]
 
-    if year_candidates:
-        rate_col, matched_header = min(year_candidates, key=lambda x: x[0])
-        year_note = f", current year {strategy_year}"
+    if right_of_restrictions:
+        rate_col, matched_header = min(
+            right_of_restrictions,
+            key=lambda x: x[0],
+        )
+        match_note = "first hotel column right of Restrictions"
     else:
-        # Preserve the prior leftmost-match fallback for templates without
-        # explicit year labels in the hotel-rate bank.
-        rate_col, matched_header = min(hotel_candidates, key=lambda x: x[0])
-        year_note = (
-            f", Strategy year {strategy_year} not found in hotel headers"
-            if strategy_year is not None
-            else ", Strategy year could not be detected"
+        # Fallback for any unusual template lacking a detectable Restrictions
+        # header: use the leftmost matched hotel column rather than attempting
+        # unreliable year inference from mixed TY/LY date columns.
+        rate_col, matched_header = min(
+            hotel_candidates,
+            key=lambda x: x[0],
         )
-
-    restriction_candidates = []
-    for c in range(1, ws.max_column + 1):
-        compact = re.sub(r"[^A-Z]", "", col_header_text(c).upper())
-        if "RESTRICTIONS" in compact or compact.startswith("RESTRIC"):
-            restriction_candidates.append(c)
-
-    restric_col = None
-    left = [c for c in restriction_candidates if c < rate_col]
-    if left:
-        restric_col = max(left)
-    elif restriction_candidates:
-        restric_col = min(
-            restriction_candidates,
-            key=lambda c: abs(c - rate_col)
-        )
+        match_note = "leftmost matched hotel column (Restrictions not found)"
 
     diag = (
         f"Matched '{hotel_name}' to Strategy header '{matched_header}' "
-        f"(rate col {rate_col}{year_note}"
-        + (f", restrictions col {restric_col})"
-           if restric_col else ", restrictions not found)")
+        f"(rate col {rate_col}, {match_note}"
+        + (
+            f", restrictions col {restric_col})"
+            if restric_col
+            else ", restrictions not found)"
+        )
     )
     return rate_col, restric_col, diag
 
@@ -7637,16 +7626,13 @@ def _write_forecast_budget_block(
     return None
 
 
-def _ashworth_forecast_template_fallback(
+def _prior_month_forecast_template_fallback(
     service,
     hotel_id,
     hotel_name,
     target_month,
 ):
-    """Ashworth can use the prior month's Forecast when no master exists."""
-    if not _is_ashworth_hotel(hotel_name):
-        return None, None
-
+    """Use the immediately prior month's Forecast when no master exists."""
     prior_month = _previous_month(target_month)
     result, err = resolve_drive_workbook(
         service,
@@ -7676,7 +7662,7 @@ def setup_new_forecast_month(
     Normal properties:
       Forecast master -> target month Forecast.
 
-    Ashworth fallback:
+    Fallback:
       If no Forecast master exists, copy the immediately prior month's
       Forecast workbook instead.
 
@@ -7733,10 +7719,10 @@ def setup_new_forecast_month(
             hotel_id,
         )
 
-        # Ashworth has no Forecast master in its Drive tree. Use the prior
-        # month's live Forecast as the template rather than failing setup.
+        # If no Forecast master exists for this property, use the prior month's
+        # live Forecast as the template rather than failing setup.
         if not master_id:
-            fallback, fallback_err = _ashworth_forecast_template_fallback(
+            fallback, fallback_err = _prior_month_forecast_template_fallback(
                 service,
                 hotel_id,
                 hotel_name,
