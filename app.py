@@ -3131,46 +3131,77 @@ def _strategy_hotel_aliases(hotel_name):
     return {a for a in aliases if len(a) >= 4}
 
 
-def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
-    """Find the selected hotel's current SNT Rate + Restrictions columns.
 
-    The reliable layout rule across the real Strategy files is structural:
+def _strategy_resolve_header_value(ws, row, col, depth=0):
+    """Resolve simple Strategy header cross-sheet references.
 
-      Restrictions column -> current hotel rate -> comp set / LY hotel columns
-
-    Confirmed examples:
-      Middletown:    X = Restrictions, Y = current Inn at Middletown rate
-      Crowne Pointe: Z = Restrictions, AA = current Crowne Pointe rate
-
-    Some templates repeat the hotel name again in prior-year/reference columns,
-    so matching by hotel name + detected year is not safe: a left-side LY date
-    column can make the sheet look like the prior year and send rates into the
-    wrong comparison column.
-
-    Ashworth remains a special case because its own rate is explicitly in the
-    ASH column after the Casino Ballroom section.
+    Later week tabs frequently mirror WKONE's hotel headers with formulas such
+    as =WKONE!Z3. Header matching must use the referenced text, not the literal
+    formula string, or current hotel/competitor columns are misidentified.
     """
-    aliases = _strategy_hotel_aliases(hotel_name)
+    if depth > 10:
+        return ws.cell(row, col).value
+
+    value = ws.cell(row, col).value
+    if not isinstance(value, str) or not value.strip().startswith("="):
+        return value
+
+    formula = value.strip()
+    m = re.fullmatch(
+        r"=(?:'([^']+)'|([A-Za-z0-9_]+))!\$?([A-Z]+)\$?(\d+)",
+        formula,
+    )
+    if not m:
+        return value
+
+    sheet_name = m.group(1) or m.group(2)
+    if sheet_name not in ws.parent.sheetnames:
+        return value
+
+    ref_col = column_index_from_string(m.group(3))
+    ref_row = int(m.group(4))
+    return _strategy_resolve_header_value(
+        ws.parent[sheet_name],
+        ref_row,
+        ref_col,
+        depth + 1,
+    )
+
+
+def _strategy_header_text(ws, col, header_rows=range(1, 5)):
+    parts = []
+    for r in header_rows:
+        value = _strategy_resolve_header_value(ws, r, col)
+        if value not in (None, ""):
+            parts.append(str(value).strip())
+    return " ".join(parts).strip()
+
+
+def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
+    """Find current SNT Rate + Restrictions columns.
+
+    Real Strategy layout rule:
+      Restrictions -> current hotel's own rate -> competitor rate columns ->
+      prior-year/current comparison columns.
+
+    Confirmed:
+      Plymouth WKONE   Y -> Z
+      Plymouth WKTHREE Z -> AA
+      Middletown       X -> Y
+      Crowne Pointe    Z -> AA
+
+    Later week tabs often mirror WKONE headers through formulas, so using
+    literal hotel-name text alone is unreliable. The own-rate column is the
+    cell immediately to the right of Restrictions.
+
+    Ashworth remains a special layout: its own rate is the explicit ASH column.
+    """
     header_max_row = min(4, ws.max_row)
 
-    def col_header_text(col):
-        parts = []
-        for r in range(1, header_max_row + 1):
-            v = ws.cell(r, col).value
-            if v not in (None, ""):
-                parts.append(str(v).strip())
-        return " ".join(parts).strip()
-
-    def matches_hotel(value):
-        n = _strategy_norm(value)
-        return bool(n) and any(
-            a == n or a in n or n in a
-            for a in aliases
-        )
-
-    # Ashworth/Hampton special layout: exact ASH rate column + dynamic
-    # Restrictions finder. Keep this isolated from the generic rule.
-    sheet_title = _strategy_norm(ws["A1"].value)
+    # Ashworth/Hampton special layout.
+    sheet_title = _strategy_norm(
+        _strategy_resolve_header_value(ws, 1, 1)
+    )
     requested = _strategy_norm(hotel_name)
     is_ashworth = (
         "ASHWORTH" in sheet_title
@@ -3180,12 +3211,7 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
     if is_ashworth:
         rate_col = None
         for c in range(1, ws.max_column + 1):
-            hdr = " ".join(
-                str(ws.cell(r, c).value).strip()
-                for r in range(1, header_max_row + 1)
-                if ws.cell(r, c).value not in (None, "")
-            )
-            if _strategy_norm(hdr) == "ASH":
+            if _strategy_norm(_strategy_header_text(ws, c)) == "ASH":
                 rate_col = c
                 break
 
@@ -3196,90 +3222,28 @@ def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
                 f"(rate col {rate_col}, restrictions col {restric_col})"
             )
 
-    # Find Restrictions first. This anchors the current-year hotel-rate bank.
-    restriction_candidates = []
-    for c in range(1, ws.max_column + 1):
-        compact = re.sub(r"[^A-Z]", "", col_header_text(c).upper())
-        if (
-            "RESTRICTIONS" in compact
-            or compact.startswith("RESTRIC")
-            or ("REST" in compact and "TION" in compact)
-        ):
-            restriction_candidates.append(c)
+    restric_col = _find_restrictions_col(ws)
+    if not restric_col:
+        restric_col = find_restrictions_col(ws)
 
-    restric_col = (
-        min(restriction_candidates)
-        if restriction_candidates
-        else _find_restrictions_col(ws)
-    )
+    if not restric_col:
+        return None, None, (
+            f"Could not locate Restrictions for '{hotel_name}'."
+        )
 
-    # Collect every column whose header matches the selected hotel.
-    hotel_candidates = []
-    for c in range(1, ws.max_column + 1):
-        header = col_header_text(c)
-        if matches_hotel(header):
-            hotel_candidates.append((c, header))
-
-    # Merged hotel headings, if present.
-    for rng in ws.merged_cells.ranges:
-        if rng.min_row > header_max_row:
-            continue
-        value = ws.cell(rng.min_row, rng.min_col).value
-        if matches_hotel(value):
-            for c in range(rng.min_col, rng.max_col + 1):
-                hotel_candidates.append(
-                    (c, col_header_text(c) or str(value or "").strip())
-                )
-
-    # Deduplicate columns, preserving the richest header.
-    deduped = {}
-    for c, header in hotel_candidates:
-        if len(header) > len(deduped.get(c, "")):
-            deduped[c] = header
-    hotel_candidates = sorted(deduped.items())
-
-    if not hotel_candidates:
+    rate_col = restric_col + 1
+    if rate_col > ws.max_column:
         return None, restric_col, (
-            f"Could not match selected hotel '{hotel_name}' "
-            f"to a Strategy Report header."
+            f"Restrictions found in col {restric_col}, but there is no "
+            f"column to its right for '{hotel_name}' rate."
         )
 
-    # Primary rule: current hotel rate is the nearest matching hotel column
-    # immediately to the RIGHT of Restrictions.
-    right_of_restrictions = []
-    if restric_col:
-        right_of_restrictions = [
-            (c, header)
-            for c, header in hotel_candidates
-            if c > restric_col
-        ]
-
-    if right_of_restrictions:
-        rate_col, matched_header = min(
-            right_of_restrictions,
-            key=lambda x: x[0],
-        )
-        match_note = "first hotel column right of Restrictions"
-    else:
-        # Fallback for any unusual template lacking a detectable Restrictions
-        # header: use the leftmost matched hotel column rather than attempting
-        # unreliable year inference from mixed TY/LY date columns.
-        rate_col, matched_header = min(
-            hotel_candidates,
-            key=lambda x: x[0],
-        )
-        match_note = "leftmost matched hotel column (Restrictions not found)"
-
-    diag = (
-        f"Matched '{hotel_name}' to Strategy header '{matched_header}' "
-        f"(rate col {rate_col}, {match_note}"
-        + (
-            f", restrictions col {restric_col})"
-            if restric_col
-            else ", restrictions not found)"
-        )
+    resolved_header = _strategy_header_text(ws, rate_col)
+    return rate_col, restric_col, (
+        f"Strategy structural mapping for '{hotel_name}': "
+        f"restrictions col {restric_col}, own rate col {rate_col} "
+        f"('{resolved_header}')"
     )
-    return rate_col, restric_col, diag
 
 
 def parse_lighthouse_rates_xlsx(file_bytes):
@@ -3384,11 +3348,11 @@ def find_strategy_compset_rate_col(ws, lighthouse_hotel):
     header_max_row = min(4, ws.max_row)
 
     def combined(col):
-        return " ".join(
-            str(ws.cell(r, col).value or "").strip()
-            for r in range(1, header_max_row + 1)
-            if ws.cell(r, col).value not in (None, "")
-        ).strip()
+        return _strategy_header_text(
+            ws,
+            col,
+            header_rows=range(1, header_max_row + 1),
+        )
 
     candidates = []
     for c in range(1, ws.max_column + 1):
@@ -3418,7 +3382,11 @@ def find_strategy_compset_rate_col(ws, lighthouse_hotel):
 # matcher, so this Plymouth correction does not change other hotels.
 LIGHTHOUSE_VALIDATED_COMPSET_MAP = {
     "HOTEL1620": [
+        ("FAIRFIELDINNSUITES", "FAIRFIELDINNSUITES"),
         ("BESTWESTERN", "BESTWESTERN"),
+        ("HOLIDAYINNEXPRESS", "HOLIDAYINN"),
+        ("HAMPTONINN", "HAMPTONINN"),
+        ("HILTONGARDENINN", "HILTONGARDEN"),
     ],
 }
 
@@ -3428,11 +3396,11 @@ def _find_strategy_header_col_by_fragment(ws, fragment):
     header_max_row = min(4, ws.max_row)
 
     for c in range(1, ws.max_column + 1):
-        header = " ".join(
-            str(ws.cell(r, c).value or "").strip()
-            for r in range(1, header_max_row + 1)
-            if ws.cell(r, c).value not in (None, "")
-        ).strip()
+        header = _strategy_header_text(
+            ws,
+            c,
+            header_rows=range(1, header_max_row + 1),
+        )
         if not header:
             continue
 
@@ -3456,8 +3424,20 @@ def _validated_lighthouse_matches(ws, lighthouse_data, hotel_name):
     matched = {}
     ignored = []
 
+    selected_aliases = _strategy_hotel_aliases(hotel_name)
+
     for lh_hotel in lighthouse_data.get("hotels", []):
         lh_norm = _strategy_norm(lh_hotel)
+
+        # Own rate always comes from SNT Rates & Restrictions, never the
+        # Booking.com/Lighthouse file.
+        if any(
+            alias == lh_norm or alias in lh_norm or lh_norm in alias
+            for alias in selected_aliases
+        ):
+            ignored.append(lh_hotel)
+            continue
+
         target_fragment = None
 
         for source_fragment, strategy_fragment in rules:
