@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.chart import PieChart, BarChart, Reference
 from openpyxl.chart.label import DataLabelList
@@ -9576,6 +9576,189 @@ def ancillary_build_monthly_report(template_bytes, property_name, report_month, 
     return output, {'mainRows':main,'stly':stly,'variance':variance,'operational':addon['operational'],'itemized':addon['itemized'],'upgrades':upgrades,'staff':staff}
 
 
+
+# ── Hilton Ancillary Revenue — NOR1 + Lobby ──────────────────────────────────
+HILTON_ANCILLARY_LOBBY_EXCLUDE_FROM_MAIN = {"self parking"}
+
+
+def _hilton_ar_round_revenue(value):
+    n = _ar_num(value)
+    if n is None:
+        return 0.0
+    return float(math.floor(n + 0.5)) if n >= 0 else float(math.ceil(n - 0.5))
+
+
+def hilton_ancillary_parse_nor1(uploaded_file):
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("NOR1 report is empty.")
+    h = _ar_header_map(raw[0])
+    name_i = _ar_col(h, ["Category Name"])
+    revenue_i = _ar_col(h, ["Total Revenue"])
+    count_i = _ar_col(h, ["Total Upgrades", "ES Upgrades", "Accepted Quantity"])
+    type_i = _ar_col(h, ["Reporting Type"])
+    property_i = _ar_col(h, ["Property Name"])
+    if min(name_i, revenue_i, count_i) < 0:
+        raise ValueError("NOR1 report must contain Category Name, Total Revenue, and Total Upgrades.")
+    rows=[]; property_name=None
+    for row in raw[1:]:
+        if name_i >= len(row): continue
+        name=str(row[name_i] or '').strip()
+        if not name: continue
+        count=float(_ar_num(row[count_i]) or 0) if count_i < len(row) else 0.0
+        revenue=float(_ar_num(row[revenue_i]) or 0) if revenue_i < len(row) else 0.0
+        if property_name is None and property_i >= 0 and property_i < len(row):
+            property_name=str(row[property_i] or '').strip() or None
+        if abs(count) < 1e-9 and abs(revenue) < 1e-9: continue
+        reporting_type=str(row[type_i] or '').strip() if type_i >= 0 and type_i < len(row) else ''
+        rows.append({'name':name,'count':count,'revenue':revenue,'avg':revenue/count if count else 0.0,'source':'NOR1','reporting_type':reporting_type})
+    return {'rows':rows,'property_name':property_name,'total_count':sum(r['count'] for r in rows),'total_revenue':sum(r['revenue'] for r in rows)}
+
+
+def hilton_ancillary_parse_lobby(uploaded_file):
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("Lobby add-ons report is empty.")
+    h=_ar_header_map(raw[0])
+    name_i=_ar_col(h,["Add-on Name","Add On Name"])
+    count_i=_ar_col(h,["AO Units","Units"])
+    revenue_i=_ar_col(h,["AO Stayed Revenue","AO Revenue","Stayed Revenue"])
+    inn_i=_ar_col(h,["Inn Code","InnCode"])
+    if min(name_i,count_i,revenue_i) < 0:
+        raise ValueError("Lobby report must contain Add-on Name, AO Units, and AO Stayed Revenue (or AO Revenue).")
+    by_name=collections.OrderedDict(); inn_codes=set()
+    for row in raw[1:]:
+        if name_i >= len(row): continue
+        name=str(row[name_i] or '').strip()
+        if not name: continue
+        count=float(_ar_num(row[count_i]) or 0) if count_i < len(row) else 0.0
+        revenue=float(_ar_num(row[revenue_i]) or 0) if revenue_i < len(row) else 0.0
+        if inn_i >= 0 and inn_i < len(row):
+            code=str(row[inn_i] or '').strip().upper()
+            if code: inn_codes.add(code)
+        key=_ar_norm(name)
+        item=by_name.setdefault(key,{'name':name,'count':0.0,'revenue_raw':0.0,'source':'Lobby','reporting_type':'lobby_addon'})
+        item['count'] += count; item['revenue_raw'] += revenue
+    rows=[]; self_parking=None
+    for key,item in by_name.items():
+        item['revenue']=_hilton_ar_round_revenue(item.pop('revenue_raw'))
+        item['avg']=item['revenue']/item['count'] if item['count'] else 0.0
+        if key in HILTON_ANCILLARY_LOBBY_EXCLUDE_FROM_MAIN: self_parking=dict(item)
+        else: rows.append(item)
+    return {'rows':rows,'self_parking':self_parking,'inn_codes':sorted(inn_codes),'total_count':sum(r['count'] for r in rows),'total_revenue':sum(r['revenue'] for r in rows)}
+
+
+def hilton_ancillary_parse_dashboard(uploaded_file, hotel_name, report_month):
+    data=uploaded_file.getvalue() if hasattr(uploaded_file,'getvalue') else uploaded_file
+    inn_code=HILTON_INNCODES.get(hotel_name)
+    if not inn_code: raise ValueError(f"No Hilton InnCode mapping is configured for {hotel_name}.")
+    wb=openpyxl.load_workbook(io.BytesIO(data),data_only=True,read_only=True)
+    if 'Data_Compact' not in wb.sheetnames: raise ValueError("Front Desk dashboard is missing the Data_Compact sheet.")
+    ws=wb['Data_Compact']
+    headers=list(next(ws.iter_rows(min_row=1,max_row=1,values_only=True)))
+    hmap={str(v or '').strip():i for i,v in enumerate(headers) if str(v or '').strip()}
+    target_row=None; target_key=None; prefix=inn_code.strip().upper()+'|'
+    for row_idx,values in enumerate(ws.iter_rows(min_row=2,min_col=1,max_col=1,values_only=True),start=2):
+        key=str(values[0] or '').strip().upper()
+        if key.startswith(prefix): target_row=row_idx; target_key=key; break
+    if target_row is None: raise ValueError(f"Could not find InnCode {inn_code} in the dashboard.")
+    values=list(next(ws.iter_rows(min_row=target_row,max_row=target_row,values_only=True)))
+    def period_values(year):
+        period=f"{year}{report_month.month:02d}"
+        def field(label):
+            idx=hmap.get(f"{period} {label}")
+            return _ar_num(values[idx]) if idx is not None and idx < len(values) else None
+        return {'year':year,'front_desk':field('Front Office Revenue'),'awarded':field('Awarded Revenue'),'expired':field('Expired Revenue'),'potential':field('Potential Revenue')}
+    return {'hotel_key':target_key,'inn_code':inn_code,'current':period_values(report_month.year),'stly':period_values(report_month.year-1)}
+
+
+def _hilton_ar_variance_key(name):
+    key=_ar_norm(name).replace(' ','')
+    return {'pets':'petfee','pet':'petfee','latecheckout':'latecheckout'}.get(key,key)
+
+
+def _hilton_ar_main_sort_key(row):
+    name=_ar_norm(row.get('name')).replace(' ',''); source=row.get('source'); rtype=_ar_norm(row.get('reporting_type')).replace(' ','')
+    if name in ('pets','petfee'): return (10,name)
+    if source=='Lobby' and 'breakfast' in name: return (20,name)
+    if source=='NOR1' and (rtype=='foodbeverage' or 'breakfast' in name): return (30,name)
+    if source=='Lobby' and 'latecheckout' in name: return (40,name)
+    if rtype=='earlycheckin': return (50,name)
+    if source=='Lobby' and 'morepoints' in name: return (60,name)
+    if rtype=='roomupgrade': return (70,name)
+    if rtype=='latecheckout': return (80,name)
+    return (90,name)
+
+
+def hilton_ancillary_build_report(property_name, report_month, nor1_current_file, lobby_file, nor1_stly_file, dashboard_file, historical_front_desk=None):
+    current_nor1=hilton_ancillary_parse_nor1(nor1_current_file)
+    lobby=hilton_ancillary_parse_lobby(lobby_file)
+    stly_nor1=hilton_ancillary_parse_nor1(nor1_stly_file)
+    dash=hilton_ancillary_parse_dashboard(dashboard_file,property_name,report_month)
+    historical_front_desk=historical_front_desk or {}
+    main_rows=[*[dict(r) for r in lobby['rows']],*[dict(r) for r in current_nor1['rows']]]
+    main_rows.sort(key=_hilton_ar_main_sort_key)
+    stly_rows=[dict(r) for r in stly_nor1['rows']]
+    stly_rows.sort(key=lambda r:(_ar_norm(r.get('reporting_type')),_ar_norm(r.get('name'))))
+    stly_by_key={_hilton_ar_variance_key(r['name']):r for r in stly_rows}
+    variance=[]
+    for cur in main_rows:
+        ly=stly_by_key.get(_hilton_ar_variance_key(cur['name']))
+        variance.append({'name':cur['name'],'count':cur['count']-(ly['count'] if ly else 0),'revenue':cur['revenue']-(ly['revenue'] if ly else 0),'avg':cur['avg']-(ly['avg'] if ly else 0)})
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title='Report'
+    dark='1F4E78'; head='DDEBF7'; stly_fill='FFF2CC'; var_fill='E2F0D9'; white='FFFFFF'; side=Side(style='thin',color='B7B7B7'); border=Border(left=side,right=side,top=side,bottom=side)
+    ws['A1']=f"{property_name} Upsell Overview - {report_month.strftime('%B')}"; ws['A2']=report_month.year; ws.merge_cells('A1:E1')
+    ws['A1'].font=Font(size=16,bold=True,color=white)
+    for c in range(1,6): ws.cell(1,c).fill=PatternFill('solid',fgColor=dark)
+    headers=['Upsell Name','Total number','Total Revenue','Average revenue','Expired Revenue']
+    for c,v in enumerate(headers,1): ws.cell(3,c,v); ws.cell(3,c).font=Font(bold=True); ws.cell(3,c).fill=PatternFill('solid',fgColor=head); ws.cell(3,c).border=border
+    start=4
+    for i,row in enumerate(main_rows,start):
+        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,f'=IFERROR(C{i}/B{i},0)')
+        for c in range(1,6): ws.cell(i,c).border=border
+    total=start+len(main_rows); ws.cell(total,1,'TOTALS'); ws.cell(total,2,f'=SUM(B{start}:B{total-1})'); ws.cell(total,3,f'=SUM(C{start}:C{total-1})'); ws.cell(total,4,f'=IFERROR(C{total}/B{total},0)'); ws.cell(total,5,dash['current'].get('expired') or 0)
+    for c in range(1,6): ws.cell(total,c).font=Font(bold=True); ws.cell(total,c).fill=PatternFill('solid',fgColor=head); ws.cell(total,c).border=border
+    ws['H3']='Year'; ws['I3']='Front Desk Upsell Revenue'
+    for cell in ('H3','I3'): ws[cell].font=Font(bold=True); ws[cell].fill=PatternFill('solid',fgColor=head); ws[cell].border=border
+    fd=[(report_month.year,dash['current'].get('front_desk')),(report_month.year-1,dash['stly'].get('front_desk'))]
+    for y in sorted(historical_front_desk,reverse=True):
+        if y not in (report_month.year,report_month.year-1): fd.append((y,historical_front_desk[y]))
+    for r,(y,v) in enumerate(fd,4): ws.cell(r,8,y); ws.cell(r,9,v or 0); ws.cell(r,8).border=border; ws.cell(r,9).border=border; ws.cell(r,9).number_format='$#,##0.00'
+    parking=lobby.get('self_parking')
+    if parking:
+        pr=max(10,4+len(fd)+2); ws.cell(pr,8,parking['name']); ws.cell(pr,9,parking['count']); ws.cell(pr,10,parking['revenue']); ws.cell(pr,11,f'=IFERROR(J{pr}/I{pr},0)')
+        for c in range(8,12): ws.cell(pr,c).border=border
+    st_title=total+1; st_head=st_title+1; st_start=st_head+1
+    ws.cell(st_title,1,'STLY').font=Font(bold=True); ws.cell(st_title,1).fill=PatternFill('solid',fgColor=stly_fill)
+    for c,v in enumerate(['Upsell Name','Total Count','Total Revenue','Average Revenue','Expired Revenue'],1): ws.cell(st_head,c,v); ws.cell(st_head,c).font=Font(bold=True); ws.cell(st_head,c).fill=PatternFill('solid',fgColor=stly_fill); ws.cell(st_head,c).border=border
+    for i,row in enumerate(stly_rows,st_start):
+        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,f'=IFERROR(C{i}/B{i},0)')
+        for c in range(1,6): ws.cell(i,c).border=border
+    st_total=st_start+len(stly_rows); ws.cell(st_total,1,'TOTALS'); ws.cell(st_total,2,f'=SUM(B{st_start}:B{st_total-1})'); ws.cell(st_total,3,f'=SUM(C{st_start}:C{st_total-1})'); ws.cell(st_total,4,f'=IFERROR(C{st_total}/B{st_total},0)'); ws.cell(st_total,5,dash['stly'].get('expired') or 0)
+    for c in range(1,6): ws.cell(st_total,c).font=Font(bold=True); ws.cell(st_total,c).fill=PatternFill('solid',fgColor=stly_fill); ws.cell(st_total,c).border=border
+    vt=st_total+1; vh=vt+1; vs=vh+1
+    ws.cell(vt,1,'Variance').font=Font(bold=True); ws.cell(vt,1).fill=PatternFill('solid',fgColor=var_fill)
+    for c,v in enumerate(['Upsell Name','Total Count','Total Revenue','Average Revenue','Expired Revenue'],1): ws.cell(vh,c,v); ws.cell(vh,c).font=Font(bold=True); ws.cell(vh,c).fill=PatternFill('solid',fgColor=var_fill); ws.cell(vh,c).border=border
+    for i,row in enumerate(variance,vs):
+        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,row['avg'])
+        for c in range(1,6): ws.cell(i,c).border=border
+    vr=vs+len(variance); ws.cell(vr,1,'TOTALS'); ws.cell(vr,2,f'=B{total}-B{st_total}'); ws.cell(vr,3,f'=C{total}-C{st_total}'); ws.cell(vr,4,f'=D{total}-D{st_total}'); ws.cell(vr,5,f'=E{total}-E{st_total}')
+    for c in range(1,6): ws.cell(vr,c).font=Font(bold=True); ws.cell(vr,c).fill=PatternFill('solid',fgColor=var_fill); ws.cell(vr,c).border=border
+    for r in range(4,vr+1): ws.cell(r,2).number_format='0'; ws.cell(r,3).number_format='$#,##0.00'; ws.cell(r,4).number_format='$#,##0.00'; ws.cell(r,5).number_format='$#,##0.00'
+    for col,width in {'A':30,'B':14,'C':16,'D':16,'E':16,'H':18,'I':22,'J':16,'K':16}.items(): ws.column_dimensions[col].width=width
+    ws.freeze_panes='A4'
+    for row in ws.iter_rows(min_row=1,max_row=ws.max_row,min_col=1,max_col=11):
+        for cell in row: cell.alignment=Alignment(vertical='center',wrap_text=True)
+    warnings=[]
+    ca=dash['current'].get('awarded'); sa=dash['stly'].get('awarded')
+    if ca is not None and abs(ca-current_nor1['total_revenue'])>1: warnings.append(f"Current NOR1 total (${current_nor1['total_revenue']:,.2f}) does not match dashboard Awarded Revenue (${ca:,.2f}).")
+    if sa is not None and abs(sa-stly_nor1['total_revenue'])>1: warnings.append(f"STLY NOR1 total (${stly_nor1['total_revenue']:,.2f}) does not match dashboard Awarded Revenue (${sa:,.2f}).")
+    expected=HILTON_INNCODES.get(property_name)
+    if lobby['inn_codes'] and expected and expected not in lobby['inn_codes']: warnings.append(f"Lobby report InnCode(s) {', '.join(lobby['inn_codes'])} do not include expected {expected} for {property_name}.")
+    out=io.BytesIO(); wb.save(out)
+    return out.getvalue(),{'mainRows':main_rows,'stlyRows':stly_rows,'varianceRows':variance,'selfParking':parking,'dashboard':dash,'warnings':warnings,'currentTotalCount':sum(r['count'] for r in main_rows),'currentTotalRevenue':sum(r['revenue'] for r in main_rows),'stlyTotalCount':sum(r['count'] for r in stly_rows),'stlyTotalRevenue':sum(r['revenue'] for r in stly_rows)}
+
+
 # ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
 PLYMOUTH_WEEKLY_COLS = {
     1: (2, 3),   # B/C
@@ -14140,6 +14323,47 @@ with tab_weekly:
 
 with tab_ancillary:
     st.subheader("Monthly Ancillary Revenue Report Builder")
+
+    with st.expander("Hilton — NOR1 + Lobby Report Builder", expanded=True):
+        st.caption("Hilton uses four source reports: current NOR1, current Lobby Add-ons, STLY NOR1, and the Hilton Front Desk Upsell Dashboard. The dashboard also supplies current/STLY expired revenue.")
+        har_property = st.selectbox("Hilton Property", list(PORTFOLIO_HOTELS["Hilton"].keys()), key="har_property")
+        har_month_date = st.date_input("Hilton report month", value=datetime.date.today().replace(day=1), key="har_month")
+        har_month_dt = datetime.datetime(har_month_date.year, har_month_date.month, 1)
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            har_nor1_current = st.file_uploader(f"{har_month_dt:%b %Y} — NOR1 Custom Export", type=["xlsx"], key="har_nor1_current")
+            har_lobby = st.file_uploader(f"{har_month_dt:%b %Y} — Lobby Add-ons Hotel-Level Dashboard", type=["xlsx"], key="har_lobby")
+        with hc2:
+            har_nor1_stly = st.file_uploader(f"{har_month_dt.year - 1} {har_month_dt:%b} — STLY NOR1 Custom Export", type=["xlsx"], key="har_nor1_stly")
+            har_dashboard = st.file_uploader("Hilton Front Desk Upsell Dashboard", type=["xlsm","xlsx"], key="har_dashboard")
+        with st.expander("Older Front Desk history (optional)", expanded=False):
+            st.caption("The current Hilton dashboard contains 2025–2026. Older years are optional and do not require another upload.")
+            h1,h2=st.columns(2)
+            with h1: har_fd_2024=st.number_input("2024 Front Desk Upsell Revenue", value=0.0, step=1.0, key="har_fd_2024")
+            with h2: har_fd_2023=st.number_input("2023 Front Desk Upsell Revenue", value=0.0, step=1.0, key="har_fd_2023")
+        har_ready=all([har_nor1_current is not None,har_lobby is not None,har_nor1_stly is not None,har_dashboard is not None])
+        if st.button("Build Hilton Ancillary Revenue Report", type="primary", key="har_build", disabled=not har_ready, use_container_width=True):
+            try:
+                with st.spinner("Building Hilton ancillary report..."):
+                    har_output,har_summary=hilton_ancillary_build_report(har_property,har_month_dt,har_nor1_current,har_lobby,har_nor1_stly,har_dashboard,{2024:har_fd_2024,2023:har_fd_2023})
+                    st.session_state["har_output"]=har_output; st.session_state["har_summary"]=har_summary; st.session_state["har_filename"]=f"{har_month_dt.year} {har_property} NOR1 Upsell Report.xlsx"
+                st.success("Hilton report built. Review the totals below before downloading.")
+            except Exception as e:
+                st.error(f"Hilton ancillary report build error: {e}")
+        if "har_output" in st.session_state:
+            hs=st.session_state.get("har_summary",{}); m1,m2,m3=st.columns(3)
+            m1.metric("Current Revenue",f"${hs.get('currentTotalRevenue',0):,.2f}"); m2.metric("STLY NOR1 Revenue",f"${hs.get('stlyTotalRevenue',0):,.2f}"); m3.metric("YoY Revenue Variance",f"${hs.get('currentTotalRevenue',0)-hs.get('stlyTotalRevenue',0):,.2f}")
+            ds=hs.get("dashboard",{}); dc=ds.get("current",{}); dl=ds.get("stly",{})
+            st.caption(f"Dashboard check — {har_month_dt.year}: Front Desk ${(dc.get('front_desk') or 0):,.2f}, Expired ${(dc.get('expired') or 0):,.2f}; {har_month_dt.year-1}: Front Desk ${(dl.get('front_desk') or 0):,.2f}, Expired ${(dl.get('expired') or 0):,.2f}.")
+            for warning in hs.get("warnings",[]): st.warning(warning)
+            with st.expander("Preview Hilton current-year rows"):
+                st.dataframe(pd.DataFrame(hs.get("mainRows",[])),use_container_width=True,hide_index=True)
+            with st.expander("Preview Hilton STLY NOR1 rows"):
+                st.dataframe(pd.DataFrame(hs.get("stlyRows",[])),use_container_width=True,hide_index=True)
+            st.download_button("Download Hilton Ancillary Revenue Report",data=st.session_state["har_output"],file_name=st.session_state["har_filename"],mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="har_download",use_container_width=True)
+
+    st.divider()
+    st.markdown("### Independent Hotels — SNT / Canary Builder")
     st.caption(
         "Builds the monthly report from the universal template. After reviewing "
         "the result, you can save the month directly into the hotel's existing "
