@@ -4727,12 +4727,13 @@ def service_account_email():
 # declared hotel and reports a sharing problem when one is actually run.
 
 
-def drive_find_folder_by_keyword(service, keyword, parent_id=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def drive_find_folder_by_keyword(_service, keyword, parent_id=None):
     """Return the first folder whose name contains keyword (case-insensitive)."""
     q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += " and '%s' in parents" % parent_id
-    result = service.files().list(
+    result = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
@@ -4824,7 +4825,8 @@ def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
 
     return None
 
-def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def _find_rev_reports_folder_for_year(_service, hotel_id, year_kw, month_kw=None):
     """Find the REVENUE REPORTS folder to use for a given year (and,
     preferably, the specific target month — see _pick_rev_reports_candidate
     for the ranking; the old first-year-substring-match behavior silently
@@ -4841,7 +4843,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
         candidates = []
         for cid in candidate_ids:
             try:
-                info = service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
+                info = _service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
                 candidates.append({"id": cid, "name": info["name"]})
             except Exception:
                 continue
@@ -4852,7 +4854,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
 
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
          "and '%s' in parents") % hotel_id
-    children = service.files().list(
+    children = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
@@ -4868,7 +4870,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
     # IS that folder already in that case, not its parent, so there's no
     # child to find. Check hotel_id's own name before giving up.
     try:
-        self_info = service.files().get(
+        self_info = _service.files().get(
             fileId=hotel_id, fields="name", supportsAllDrives=True
         ).execute()
         if "revenue reports" in self_info.get("name", "").lower():
@@ -4879,7 +4881,8 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
     return None, None
 
 
-def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name):
+@st.cache_data(ttl=600, show_spinner=False)
+def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_month, hotel_name):
     """Locate the month folder for a new-month setup, handling both layouts:
     month folders directly inside the REVENUE REPORTS folder (common when
     there's one REVENUE REPORTS folder per year), or nested under a year
@@ -4900,7 +4903,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
     # names the target month — it IS the month folder; there is no month
     # subfolder inside it to find.
     try:
-        rev_info = service.files().get(fileId=rev_id, fields="name", supportsAllDrives=True).execute()
+        rev_info = _service.files().get(fileId=rev_id, fields="name", supportsAllDrives=True).execute()
         rev_name = rev_info.get("name", "")
         month_kw_2digit = month_kw[:3] + month_kw[-2:]
         if month_kw in rev_name.upper() or month_kw_2digit in rev_name.upper():
@@ -4908,13 +4911,13 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
     except Exception:
         pass
 
-    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=rev_id)
+    month_id, month_name = drive_find_folder_by_keyword(_service, month_kw, parent_id=rev_id)
     if month_id:
         return month_id, month_name
 
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
          "and '%s' in parents") % rev_id
-    siblings = service.files().list(
+    siblings = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
@@ -4925,7 +4928,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
             year_id = f["id"]
             break
     if year_id:
-        return drive_find_month_folder(service, year_id, month_kw)
+        return drive_find_month_folder(_service, year_id, month_kw)
 
     # Fallback: search recursively through nested folders (handles deep nesting like SALEM)
     # Some hotels have multiple intermediate folders before reaching the month folder
@@ -4935,7 +4938,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
         try:
             q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
                  "and '%s' in parents") % parent_id
-            children = service.files().list(
+            children = _service.files().list(
                 q=q, fields="files(id, name)", pageSize=100,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute().get("files", [])
@@ -4991,14 +4994,23 @@ def drive_find_file(service, keyword, parent_id):
     return None, None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _drive_mime_type(_service, file_id):
+    return _service.files().get(
+        fileId=file_id,
+        fields="mimeType",
+        supportsAllDrives=True,
+    ).execute().get("mimeType")
+
+
 def drive_download(service, file_id) -> bytes:
     """Download a file's bytes. Native Google Sheets (created directly in
     Drive rather than uploaded as .xlsx — confirmed real case: Hotel 1620's
     Forecast workbook) can't be read via get_media like a normal blob file;
     they must be exported to xlsx format instead."""
-    meta = service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+    mime_type = _drive_mime_type(service, file_id)
     buf = io.BytesIO()
-    if meta.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+    if mime_type == "application/vnd.google-apps.spreadsheet":
         req = service.files().export_media(
             fileId=file_id,
             mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5367,7 +5379,8 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
     return copied["id"], copied["name"]
 
 
-def _hotel_search_scope_ids(service, hotel_id):
+@st.cache_data(ttl=600, show_spinner=False)
+def _hotel_search_scope_ids(_service, hotel_id):
     """Return every folder id that could plausibly hold a hotel's MASTER
     template files: each of the hotel's own root candidate folder(s)
     (unwrapping a MULTI:<id>,<id>,... group) plus their direct children.
@@ -5388,7 +5401,7 @@ def _hotel_search_scope_ids(service, hotel_id):
         q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
              "and '%s' in parents") % rid
         try:
-            children = service.files().list(
+            children = _service.files().list(
                 q=q, fields="files(id)", pageSize=100,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute().get("files", [])
