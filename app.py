@@ -12948,17 +12948,48 @@ def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
     """Build the Forecast job for one Hilton hotel and one month.
 
     month_date picks which month's workbook to open; None means the current
-    one. Nothing else differs between the two. The SRP export runs a year
-    forward, and build_hilton_forecast_plan already sends every date that
-    hasn't happened yet to the OTB rows, so next month needs no separate
-    builder the way IHG's does — there, next month genuinely comes from a
-    different report.
+    one. If a requested future-month Forecast does not exist yet, the job
+    creates it first using setup_new_forecast_month (master if available,
+    otherwise the prior month's Forecast as the template), then fills it.
+
+    The SRP export runs a year forward, and build_hilton_forecast_plan already
+    sends every date that has not happened yet to the OTB rows.
 
     Returns the job, or None having appended the reason to `problems`.
     """
     label = f"Forecast ({month_date:%b %Y})" if month_date else "Forecast"
     result, err = resolve_drive_workbook(
-        svc, hotel_id, hotel_name, "Forecast", month_date=month_date)
+        svc, hotel_id, hotel_name, "Forecast", month_date=month_date
+    )
+
+    # For a requested future month, do not fail just because that Forecast
+    # workbook has not been created yet. Use the same setup path as the other
+    # portfolios: Forecast master when available, otherwise prior month's
+    # Forecast as the template, then resolve the newly-created workbook.
+    if (err or not result) and month_date is not None:
+        created_name, create_err = setup_new_forecast_month(
+            svc,
+            hotel_id,
+            hotel_name,
+            month_date,
+        )
+        if create_err:
+            problems.append(
+                f"{hotel_name} — {label}: could not create the next-month "
+                f"Forecast — {create_err}"
+            )
+            return None
+
+        # Resolve again after creation so the normal Hilton Forecast job can
+        # preview/apply changes to the exact new workbook.
+        result, err = resolve_drive_workbook(
+            svc,
+            hotel_id,
+            hotel_name,
+            "Forecast",
+            month_date=month_date,
+        )
+
     if err or not result:
         problems.append(f"{hotel_name} — {label}: {err}")
         return None
