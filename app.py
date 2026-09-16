@@ -9690,73 +9690,465 @@ def _hilton_ar_main_sort_key(row):
     return (90,name)
 
 
-def hilton_ancillary_build_report(property_name, report_month, nor1_current_file, lobby_file, nor1_stly_file, dashboard_file, historical_front_desk=None):
-    current_nor1=hilton_ancillary_parse_nor1(nor1_current_file)
-    lobby=hilton_ancillary_parse_lobby(lobby_file)
-    stly_nor1=hilton_ancillary_parse_nor1(nor1_stly_file)
-    dash=hilton_ancillary_parse_dashboard(dashboard_file,property_name,report_month)
-    historical_front_desk=historical_front_desk or {}
-    main_rows=[*[dict(r) for r in lobby['rows']],*[dict(r) for r in current_nor1['rows']]]
+def hilton_ancillary_build_report(
+    property_name,
+    report_month,
+    nor1_current_file,
+    lobby_file,
+    nor1_stly_file,
+    dashboard_file,
+    historical_front_desk=None,
+):
+    """Build one Hilton monthly ancillary report matching the completed
+    month-tab format used in the Hilton report workbook.
+
+    Key rules confirmed against the corrected Ann Arbor August report:
+      - Current rows = Lobby add-ons (except Self-Parking) + current NOR1.
+      - STLY rows = STLY NOR1 only.
+      - Main/STLY average TOTAL = AVERAGE of row averages.
+      - Variance is formula-driven.
+      - Current-only rows carry through as positive variance.
+      - STLY-only rows are added as negative variance rows.
+      - Expired Revenue variance = current total expired - STLY total expired.
+      - Self-Parking remains outside the main totals.
+    """
+    current_nor1 = hilton_ancillary_parse_nor1(nor1_current_file)
+    lobby = hilton_ancillary_parse_lobby(lobby_file)
+    stly_nor1 = hilton_ancillary_parse_nor1(nor1_stly_file)
+    dash = hilton_ancillary_parse_dashboard(
+        dashboard_file,
+        property_name,
+        report_month,
+    )
+    historical_front_desk = historical_front_desk or {}
+
+    main_rows = [
+        *[dict(r) for r in lobby["rows"]],
+        *[dict(r) for r in current_nor1["rows"]],
+    ]
     main_rows.sort(key=_hilton_ar_main_sort_key)
-    stly_rows=[dict(r) for r in stly_nor1['rows']]
-    stly_rows.sort(key=lambda r:(_ar_norm(r.get('reporting_type')),_ar_norm(r.get('name'))))
-    stly_by_key={_hilton_ar_variance_key(r['name']):r for r in stly_rows}
-    variance=[]
-    for cur in main_rows:
-        ly=stly_by_key.get(_hilton_ar_variance_key(cur['name']))
-        variance.append({'name':cur['name'],'count':cur['count']-(ly['count'] if ly else 0),'revenue':cur['revenue']-(ly['revenue'] if ly else 0),'avg':cur['avg']-(ly['avg'] if ly else 0)})
-    wb=openpyxl.Workbook(); ws=wb.active; ws.title='Report'
-    dark='1F4E78'; head='DDEBF7'; stly_fill='FFF2CC'; var_fill='E2F0D9'; white='FFFFFF'; side=Side(style='thin',color='B7B7B7'); border=Border(left=side,right=side,top=side,bottom=side)
-    ws['A1']=f"{property_name} Upsell Overview - {report_month.strftime('%B')}"; ws['A2']=report_month.year; ws.merge_cells('A1:E1')
-    ws['A1'].font=Font(size=16,bold=True,color=white)
-    for c in range(1,6): ws.cell(1,c).fill=PatternFill('solid',fgColor=dark)
-    headers=['Upsell Name','Total number','Total Revenue','Average revenue','Expired Revenue']
-    for c,v in enumerate(headers,1): ws.cell(3,c,v); ws.cell(3,c).font=Font(bold=True); ws.cell(3,c).fill=PatternFill('solid',fgColor=head); ws.cell(3,c).border=border
-    start=4
-    for i,row in enumerate(main_rows,start):
-        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,f'=IFERROR(C{i}/B{i},0)')
-        for c in range(1,6): ws.cell(i,c).border=border
-    total=start+len(main_rows); ws.cell(total,1,'TOTALS'); ws.cell(total,2,f'=SUM(B{start}:B{total-1})'); ws.cell(total,3,f'=SUM(C{start}:C{total-1})'); ws.cell(total,4,f'=IFERROR(C{total}/B{total},0)'); ws.cell(total,5,dash['current'].get('expired') or 0)
-    for c in range(1,6): ws.cell(total,c).font=Font(bold=True); ws.cell(total,c).fill=PatternFill('solid',fgColor=head); ws.cell(total,c).border=border
-    ws['H3']='Year'; ws['I3']='Front Desk Upsell Revenue'
-    for cell in ('H3','I3'): ws[cell].font=Font(bold=True); ws[cell].fill=PatternFill('solid',fgColor=head); ws[cell].border=border
-    fd=[(report_month.year,dash['current'].get('front_desk')),(report_month.year-1,dash['stly'].get('front_desk'))]
-    for y in sorted(historical_front_desk,reverse=True):
-        if y not in (report_month.year,report_month.year-1): fd.append((y,historical_front_desk[y]))
-    for r,(y,v) in enumerate(fd,4): ws.cell(r,8,y); ws.cell(r,9,v or 0); ws.cell(r,8).border=border; ws.cell(r,9).border=border; ws.cell(r,9).number_format='$#,##0.00'
-    parking=lobby.get('self_parking')
+
+    stly_rows = [dict(r) for r in stly_nor1["rows"]]
+    stly_rows.sort(
+        key=lambda r: (
+            _ar_norm(r.get("reporting_type")),
+            _ar_norm(r.get("name")),
+        )
+    )
+
+    # Create row matching with the same alias behavior used for variance.
+    current_key_to_index = {}
+    for idx, row in enumerate(main_rows):
+        current_key_to_index.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            idx,
+        )
+
+    stly_key_to_index = {}
+    for idx, row in enumerate(stly_rows):
+        stly_key_to_index.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            idx,
+        )
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = report_month.strftime("%b").upper()
+
+    dark = "1F4E78"
+    section = "D9EAF7"
+    subheader = "DDEBF7"
+    stly_fill = "FFF2CC"
+    variance_fill = "E2F0D9"
+    white = "FFFFFF"
+    thin_gray = Side(style="thin", color="B7B7B7")
+    border = Border(
+        left=thin_gray,
+        right=thin_gray,
+        top=thin_gray,
+        bottom=thin_gray,
+    )
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    ws["A1"] = (
+        f"{property_name} Upsell Overview - "
+        f"{report_month.strftime('%B')}"
+    )
+    ws["A2"] = report_month.year
+    ws["A1"].font = Font(size=16, bold=True, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=dark)
+    ws.merge_cells("A1:E1")
+    for c in range(1, 6):
+        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
+
+    headers = [
+        "Upsell Name",
+        "Total number",
+        "Total Revenue",
+        "Average revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(headers, start=1):
+        cell = ws.cell(3, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=subheader)
+        cell.border = border
+
+    # ── Current-year table ───────────────────────────────────────────────────
+    current_start = 4
+    current_row_by_key = {}
+    for i, row in enumerate(main_rows, start=current_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+        current_row_by_key.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            i,
+        )
+
+    current_total_row = current_start + len(main_rows)
+    ws.cell(current_total_row, 1, "TOTALS")
+    ws.cell(
+        current_total_row,
+        2,
+        f"=SUM(B{current_start}:B{current_total_row-1})",
+    )
+    ws.cell(
+        current_total_row,
+        3,
+        f"=SUM(C{current_start}:C{current_total_row-1})",
+    )
+    ws.cell(
+        current_total_row,
+        4,
+        f"=AVERAGE(D{current_start}:D{current_total_row-1})",
+    )
+    ws.cell(
+        current_total_row,
+        5,
+        dash["current"].get("expired") or 0,
+    )
+    for c in range(1, 6):
+        ws.cell(current_total_row, c).font = Font(bold=True)
+        ws.cell(current_total_row, c).fill = PatternFill(
+            "solid",
+            fgColor=section,
+        )
+        ws.cell(current_total_row, c).border = border
+
+    # ── Front Desk history ───────────────────────────────────────────────────
+    ws["H3"] = "Year"
+    ws["I3"] = "Front Desk Upsell Revenue"
+    for cell in ("H3", "I3"):
+        ws[cell].font = Font(bold=True)
+        ws[cell].fill = PatternFill("solid", fgColor=subheader)
+        ws[cell].border = border
+
+    front_desk_rows = [
+        (report_month.year, dash["current"].get("front_desk")),
+        (report_month.year - 1, dash["stly"].get("front_desk")),
+    ]
+    for year in sorted(historical_front_desk.keys(), reverse=True):
+        if year not in (report_month.year, report_month.year - 1):
+            front_desk_rows.append(
+                (year, historical_front_desk.get(year))
+            )
+
+    for r, (year, value) in enumerate(front_desk_rows, start=4):
+        ws.cell(r, 8, year)
+        ws.cell(r, 9, value if value is not None else 0)
+        ws.cell(r, 8).border = border
+        ws.cell(r, 9).border = border
+
+    # Self-Parking remains separate from the main table and does NOT get an
+    # average formula in the corrected Hilton report.
+    parking = lobby.get("self_parking")
     if parking:
-        pr=max(10,4+len(fd)+2); ws.cell(pr,8,parking['name']); ws.cell(pr,9,parking['count']); ws.cell(pr,10,parking['revenue']); ws.cell(pr,11,f'=IFERROR(J{pr}/I{pr},0)')
-        for c in range(8,12): ws.cell(pr,c).border=border
-    st_title=total+1; st_head=st_title+1; st_start=st_head+1
-    ws.cell(st_title,1,'STLY').font=Font(bold=True); ws.cell(st_title,1).fill=PatternFill('solid',fgColor=stly_fill)
-    for c,v in enumerate(['Upsell Name','Total Count','Total Revenue','Average Revenue','Expired Revenue'],1): ws.cell(st_head,c,v); ws.cell(st_head,c).font=Font(bold=True); ws.cell(st_head,c).fill=PatternFill('solid',fgColor=stly_fill); ws.cell(st_head,c).border=border
-    for i,row in enumerate(stly_rows,st_start):
-        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,f'=IFERROR(C{i}/B{i},0)')
-        for c in range(1,6): ws.cell(i,c).border=border
-    st_total=st_start+len(stly_rows); ws.cell(st_total,1,'TOTALS'); ws.cell(st_total,2,f'=SUM(B{st_start}:B{st_total-1})'); ws.cell(st_total,3,f'=SUM(C{st_start}:C{st_total-1})'); ws.cell(st_total,4,f'=IFERROR(C{st_total}/B{st_total},0)'); ws.cell(st_total,5,dash['stly'].get('expired') or 0)
-    for c in range(1,6): ws.cell(st_total,c).font=Font(bold=True); ws.cell(st_total,c).fill=PatternFill('solid',fgColor=stly_fill); ws.cell(st_total,c).border=border
-    vt=st_total+1; vh=vt+1; vs=vh+1
-    ws.cell(vt,1,'Variance').font=Font(bold=True); ws.cell(vt,1).fill=PatternFill('solid',fgColor=var_fill)
-    for c,v in enumerate(['Upsell Name','Total Count','Total Revenue','Average Revenue','Expired Revenue'],1): ws.cell(vh,c,v); ws.cell(vh,c).font=Font(bold=True); ws.cell(vh,c).fill=PatternFill('solid',fgColor=var_fill); ws.cell(vh,c).border=border
-    for i,row in enumerate(variance,vs):
-        ws.cell(i,1,row['name']); ws.cell(i,2,row['count']); ws.cell(i,3,row['revenue']); ws.cell(i,4,row['avg'])
-        for c in range(1,6): ws.cell(i,c).border=border
-    vr=vs+len(variance); ws.cell(vr,1,'TOTALS'); ws.cell(vr,2,f'=B{total}-B{st_total}'); ws.cell(vr,3,f'=C{total}-C{st_total}'); ws.cell(vr,4,f'=D{total}-D{st_total}'); ws.cell(vr,5,f'=E{total}-E{st_total}')
-    for c in range(1,6): ws.cell(vr,c).font=Font(bold=True); ws.cell(vr,c).fill=PatternFill('solid',fgColor=var_fill); ws.cell(vr,c).border=border
-    for r in range(4,vr+1): ws.cell(r,2).number_format='0'; ws.cell(r,3).number_format='$#,##0.00'; ws.cell(r,4).number_format='$#,##0.00'; ws.cell(r,5).number_format='$#,##0.00'
-    for col,width in {'A':30,'B':14,'C':16,'D':16,'E':16,'H':18,'I':22,'J':16,'K':16}.items(): ws.column_dimensions[col].width=width
-    ws.freeze_panes='A4'
-    for row in ws.iter_rows(min_row=1,max_row=ws.max_row,min_col=1,max_col=11):
-        for cell in row: cell.alignment=Alignment(vertical='center',wrap_text=True)
-    warnings=[]
-    ca=dash['current'].get('awarded'); sa=dash['stly'].get('awarded')
-    if ca is not None and abs(ca-current_nor1['total_revenue'])>1: warnings.append(f"Current NOR1 total (${current_nor1['total_revenue']:,.2f}) does not match dashboard Awarded Revenue (${ca:,.2f}).")
-    if sa is not None and abs(sa-stly_nor1['total_revenue'])>1: warnings.append(f"STLY NOR1 total (${stly_nor1['total_revenue']:,.2f}) does not match dashboard Awarded Revenue (${sa:,.2f}).")
-    expected=HILTON_INNCODES.get(property_name)
-    if lobby['inn_codes'] and expected and expected not in lobby['inn_codes']: warnings.append(f"Lobby report InnCode(s) {', '.join(lobby['inn_codes'])} do not include expected {expected} for {property_name}.")
-    out=io.BytesIO(); wb.save(out)
-    return out.getvalue(),{'mainRows':main_rows,'stlyRows':stly_rows,'varianceRows':variance,'selfParking':parking,'dashboard':dash,'warnings':warnings,'currentTotalCount':sum(r['count'] for r in main_rows),'currentTotalRevenue':sum(r['revenue'] for r in main_rows),'stlyTotalCount':sum(r['count'] for r in stly_rows),'stlyTotalRevenue':sum(r['revenue'] for r in stly_rows)}
+        p_row = max(10, 4 + len(front_desk_rows) + 2)
+        ws.cell(p_row, 8, parking["name"])
+        ws.cell(p_row, 9, parking["count"])
+        ws.cell(p_row, 10, parking["revenue"])
+        for c in range(8, 11):
+            ws.cell(p_row, c).border = border
+            if c == 8:
+                ws.cell(p_row, c).font = Font(bold=True)
+
+    # ── STLY table ───────────────────────────────────────────────────────────
+    stly_title_row = current_total_row + 1
+    stly_header_row = stly_title_row + 1
+    stly_start = stly_header_row + 1
+
+    ws.cell(stly_title_row, 1, "STLY")
+    ws.cell(stly_title_row, 1).font = Font(bold=True)
+    ws.cell(stly_title_row, 1).fill = PatternFill(
+        "solid",
+        fgColor=stly_fill,
+    )
+
+    stly_headers = [
+        "Upsell Name",
+        "Total number",
+        "Total Revenue",
+        "Average revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(stly_headers, start=1):
+        cell = ws.cell(stly_header_row, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=stly_fill)
+        cell.border = border
+
+    stly_row_by_key = {}
+    for i, row in enumerate(stly_rows, start=stly_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+        stly_row_by_key.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            i,
+        )
+
+    stly_total_row = stly_start + len(stly_rows)
+    ws.cell(stly_total_row, 1, "TOTALS")
+    ws.cell(
+        stly_total_row,
+        2,
+        f"=SUM(B{stly_start}:B{stly_total_row-1})",
+    )
+    ws.cell(
+        stly_total_row,
+        3,
+        f"=SUM(C{stly_start}:C{stly_total_row-1})",
+    )
+    ws.cell(
+        stly_total_row,
+        4,
+        f"=AVERAGE(D{stly_start}:D{stly_total_row-1})",
+    )
+    ws.cell(
+        stly_total_row,
+        5,
+        dash["stly"].get("expired") or 0,
+    )
+    for c in range(1, 6):
+        ws.cell(stly_total_row, c).font = Font(bold=True)
+        ws.cell(stly_total_row, c).fill = PatternFill(
+            "solid",
+            fgColor=stly_fill,
+        )
+        ws.cell(stly_total_row, c).border = border
+
+    # ── Variance table ───────────────────────────────────────────────────────
+    variance_title_row = stly_total_row + 1
+    variance_header_row = variance_title_row + 1
+    variance_start = variance_header_row + 1
+
+    ws.cell(variance_title_row, 1, "Variance")
+    ws.cell(variance_title_row, 1).font = Font(bold=True)
+    ws.cell(variance_title_row, 1).fill = PatternFill(
+        "solid",
+        fgColor=variance_fill,
+    )
+
+    variance_headers = [
+        "Upsell Name",
+        "Total Count",
+        "Total Revenue",
+        "Average Revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(variance_headers, start=1):
+        cell = ws.cell(variance_header_row, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=variance_fill)
+        cell.border = border
+
+    # Preserve current-year row order first.
+    variance_specs = []
+    used_stly_keys = set()
+    for cur in main_rows:
+        key = _hilton_ar_variance_key(cur["name"])
+        variance_specs.append(
+            {
+                "name": cur["name"],
+                "current_row": current_row_by_key.get(key),
+                "stly_row": stly_row_by_key.get(key),
+            }
+        )
+        if key in stly_row_by_key:
+            used_stly_keys.add(key)
+
+    # Then append STLY-only items as negative variance rows.
+    for stly in stly_rows:
+        key = _hilton_ar_variance_key(stly["name"])
+        if key in used_stly_keys or key in current_row_by_key:
+            continue
+        variance_specs.append(
+            {
+                "name": stly["name"],
+                "current_row": None,
+                "stly_row": stly_row_by_key.get(key),
+            }
+        )
+
+    variance_rows = []
+    for offset, spec in enumerate(variance_specs):
+        i = variance_start + offset
+        cr = spec["current_row"]
+        sr = spec["stly_row"]
+
+        ws.cell(i, 1, spec["name"])
+
+        if cr and sr:
+            for col_letter, col_num in zip("BCDE", range(2, 6)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{cr}-{col_letter}{sr}",
+                )
+        elif cr:
+            for col_letter, col_num in zip("BCDE", range(2, 6)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{cr}",
+                )
+        elif sr:
+            for col_letter, col_num in zip("BCDE", range(2, 6)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{sr}*-1",
+                )
+
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+
+        variance_rows.append({
+            "name": spec["name"],
+            "current_row": cr,
+            "stly_row": sr,
+        })
+
+    variance_total_row = variance_start + len(variance_specs)
+    ws.cell(variance_total_row, 1, "TOTALS")
+    ws.cell(
+        variance_total_row,
+        2,
+        f"=SUM(B{variance_start}:B{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        3,
+        f"=SUM(C{variance_start}:C{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        4,
+        f"=SUM(D{variance_start}:D{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        5,
+        f"=E{current_total_row}-E{stly_total_row}",
+    )
+    for c in range(1, 6):
+        ws.cell(variance_total_row, c).font = Font(bold=True)
+        ws.cell(variance_total_row, c).fill = PatternFill(
+            "solid",
+            fgColor=variance_fill,
+        )
+        ws.cell(variance_total_row, c).border = border
+
+    # ── Number formats / dimensions ──────────────────────────────────────────
+    for row in range(4, variance_total_row + 1):
+        ws.cell(row, 2).number_format = "0"
+        ws.cell(row, 3).number_format = "$#,##0.00"
+        ws.cell(row, 4).number_format = "$#,##0.00"
+        ws.cell(row, 5).number_format = "$#,##0.00"
+
+    for row in range(4, 4 + len(front_desk_rows)):
+        ws.cell(row, 9).number_format = "$#,##0.00"
+
+    if parking:
+        ws.cell(p_row, 9).number_format = "0"
+        ws.cell(p_row, 10).number_format = "$#,##0.00"
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["H"].width = 18
+    ws.column_dimensions["I"].width = 22
+    ws.column_dimensions["J"].width = 16
+    ws.freeze_panes = "A4"
+
+    for row in ws.iter_rows(
+        min_row=1,
+        max_row=ws.max_row,
+        min_col=1,
+        max_col=10,
+    ):
+        for cell in row:
+            cell.alignment = Alignment(
+                vertical="center",
+                wrap_text=True,
+            )
+
+    # ── Source validation warnings ───────────────────────────────────────────
+    warnings = []
+    current_awarded = dash["current"].get("awarded")
+    if current_awarded is not None and abs(
+        current_awarded - current_nor1["total_revenue"]
+    ) > 1.0:
+        warnings.append(
+            f"Current NOR1 total (${current_nor1['total_revenue']:,.2f}) "
+            f"does not match dashboard Awarded Revenue "
+            f"(${current_awarded:,.2f})."
+        )
+
+    stly_awarded = dash["stly"].get("awarded")
+    if stly_awarded is not None and abs(
+        stly_awarded - stly_nor1["total_revenue"]
+    ) > 1.0:
+        warnings.append(
+            f"STLY NOR1 total (${stly_nor1['total_revenue']:,.2f}) "
+            f"does not match dashboard Awarded Revenue "
+            f"(${stly_awarded:,.2f})."
+        )
+
+    expected_inn = HILTON_INNCODES.get(property_name)
+    if (
+        lobby["inn_codes"]
+        and expected_inn
+        and expected_inn not in lobby["inn_codes"]
+    ):
+        warnings.append(
+            f"Lobby report InnCode(s) {', '.join(lobby['inn_codes'])} "
+            f"do not include expected {expected_inn} for {property_name}."
+        )
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), {
+        "mainRows": main_rows,
+        "stlyRows": stly_rows,
+        "varianceRows": variance_rows,
+        "selfParking": parking,
+        "dashboard": dash,
+        "warnings": warnings,
+        "currentTotalCount": sum(r["count"] for r in main_rows),
+        "currentTotalRevenue": sum(r["revenue"] for r in main_rows),
+        "stlyTotalCount": sum(r["count"] for r in stly_rows),
+        "stlyTotalRevenue": sum(r["revenue"] for r in stly_rows),
+    }
 
 
 # ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
