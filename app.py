@@ -1474,13 +1474,20 @@ def build_hilton_rob_plan(
             # Forecast actual MTD as the two visible formula components.
             srp_rooms_formula = int(round(current_month_total["srp_rooms"]))
             actual_rooms_formula = int(round(current_month_total["actual_rooms"]))
-            srp_revenue_formula = int(current_month_total["srp_revenue"])
+            srp_revenue_formula = current_month_total["srp_revenue"]
             actual_revenue_formula = round(
                 current_month_total["actual_revenue"], 2
             )
 
+            def _formula_num(value):
+                value = float(value or 0)
+                if abs(value - round(value)) < 1e-9:
+                    return str(int(round(value)))
+                return f"{value:.2f}"
+
             revenue_write = (
-                f"={srp_revenue_formula} + {actual_revenue_formula:.2f}"
+                f"={_formula_num(srp_revenue_formula)} + "
+                f"{_formula_num(actual_revenue_formula)}"
             )
             rooms_write = (
                 f"={srp_rooms_formula} + {actual_rooms_formula}"
@@ -1504,78 +1511,111 @@ def build_hilton_rob_plan(
 
 
 def build_hilton_forecast_plan(srp_days, ws, as_of=None):
-    """Forecast changes for one Hilton hotel from the SRP export.
+    """Write Hilton Forecast OTB inputs only.
 
-    The Hilton Forecast is the same shape as every other Forecast the app
-    writes — dates running across row 4, with OTB rooms, OTB ADR, actual rooms
-    and actual revenue each on their own titled row — so it is located with the
-    shared helpers rather than a second Hilton-specific set.
+    Validated against completed Nashua files:
+      - OTB Rooms Sold -> the first "Rooms Sold" row above "ADR OTB"
+        (row 6 in Nashua)
+      - OTB ADR -> "ADR OTB" row (row 14 in Nashua)
 
-    The rule, confirmed with the user: this fills today to month end and
-    nothing else. Days that have actualised are entered by hand.
+    Do NOT write:
+      - Forecast Rooms Sold / Forecast ADR
+      - Estimated Pick Up / Est. Group Pick Up
+      - Actual Rooms / Actual Revenue
+      - As-of date
+      - Pick-up tracking chart
 
-    That matches what the export can actually support. SRP Activity lists
-    reservations that are still live, so a completed day's rooms decay as it
-    recedes: on a 17 Aug export one hotel's 1 Aug read 4 rooms against a real
-    245, 8 Aug read 11, 13 Aug read 83, and only 14–16 Aug came back right.
-    Writing those into the actuals row is worse than leaving it empty — the day
-    looks filled and reads twenty times low, which is how this was found.
-
-    'Estimated Pick Up' and the forecast ADR are likewise never written: they
-    are the revenue manager's judgement, not anything the export knows.
+    Current-month cutoff:
+      T-1 remains manual/blank; T through month-end comes from SRP.
+    Future-month Forecast:
+      every date in that workbook month comes from SRP.
     """
     as_of = as_of or datetime.date.today()
+    if isinstance(as_of, datetime.datetime):
+        as_of = as_of.date()
+
     rows = locate_forecast_rows(ws)
     if not rows:
-        return [], ["could not read its row titles (As-of date / Rooms Sold / "
-                    "ADR OTB / Revenue)."]
-    col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
+        return [], [
+            "could not locate the Forecast Rooms Sold / ADR OTB rows."
+        ]
+
+    col_map = build_forecast_date_col_map(
+        ws,
+        ws.parent,
+        date_row=rows["date_row"],
+    )
     if not col_map:
         return [], ["could not read its date row."]
 
-    changes, warns = [], []
+    changes = []
+    warns = []
 
     def put(label, row, col, value):
         changes.append({
-            "label": label, "row": row, "col": col, "new_value": value,
-            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+            "label": label,
+            "row": row,
+            "col": col,
+            "new_value": value,
+            "skip_reason": (
+                "formula"
+                if is_formula(ws.cell(row, col).value)
+                else None
+            ),
         })
 
-    put("As-of date", rows["as_of_row"], 1, as_of)
+    workbook_month = min(col_map).replace(day=1)
+    as_of_month = as_of.replace(day=1)
+    is_future_month = workbook_month > as_of_month
 
-    dated, past = 0, 0
+    written = 0
+    skipped_past = 0
+
     for d, col in sorted(col_map.items()):
-        if d < as_of:
-            past += 1
+        # Current-month workflow leaves yesterday (T-1) and all earlier
+        # dates alone. For a future-month Forecast, populate the full month.
+        if not is_future_month and d < as_of:
+            skipped_past += 1
             continue
-        rooms, rev = _srp_seg(srp_days.get(d), "TOT")
-        if not rooms:
-            continue
-        dated += 1
-        put(f"Rooms Sold (OTB) {d}", rows["otb_rooms_row"], col, int(round(rooms)))
-        put(f"ADR OTB {d}", rows["adr_otb_row"], col, round(rev / rooms, 2))
 
-    if not dated:
-        return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms still "
-                    f"on the books. Is this the right month's workbook?"]
-    if past:
-        warns.append(f"filled {dated} day(s) from {as_of:%b %d} to month end. The "
-                     f"{past} day(s) before that have actualised and are left for "
-                     f"you to enter by hand, as agreed.")
+        rooms, revenue = _srp_seg(srp_days.get(d), "TOT")
+        rooms_value = int(round(rooms or 0))
+        adr_value = (
+            round(revenue / rooms, 2)
+            if rooms
+            else 0
+        )
 
-    # Pick-up tracking chart: this week's on-the-books rooms written under the
-    # previous weeks', which is what makes the week-on-week build visible. Same
-    # cutoff — a completed day's figure here would be as wrong as it is above.
-    track = find_next_pickup_data_row(ws)
-    if track:
-        put("Pickup tracking: date", track, 1, as_of)
-        for d, col in sorted(col_map.items()):
-            if d < as_of:
-                continue
-            rooms, _ = _srp_seg(srp_days.get(d), "TOT")
-            put(f"Pickup tracking: Rooms Sold {d}", track, col, int(round(rooms)))
-    else:
-        warns.append("no free row left in its pick-up tracking chart.")
+        put(
+            f"Rooms Sold (OTB) {d}",
+            rows["otb_rooms_row"],
+            col,
+            rooms_value,
+        )
+        put(
+            f"ADR OTB {d}",
+            rows["adr_otb_row"],
+            col,
+            adr_value,
+        )
+        written += 1
+
+    if not written:
+        return [], [
+            f"none of the Forecast dates in {workbook_month:%b %Y} "
+            f"could be populated."
+        ]
+
+    if is_future_month:
+        warns.append(
+            f"filled Rooms Sold and ADR OTB for all {written} day(s) "
+            f"in {workbook_month:%b %Y}."
+        )
+    elif skipped_past:
+        warns.append(
+            f"filled Rooms Sold and ADR OTB for {written} day(s) from "
+            f"{as_of:%b %d} to month end. T-1 and earlier were left alone."
+        )
 
     return changes, warns
 
@@ -12847,9 +12887,17 @@ def render_hilton_update(hotels):
                         srp_revenue_raw += rev
                         d += datetime.timedelta(days=1)
 
-                    srp_revenue = int(
-                        math.floor(srp_revenue_raw + 0.5)
-                    )
+                    # Completed Hilton ROBs are not uniform here:
+                    # Nashua preserves the live SRP tail to cents, while the
+                    # previously-confirmed Ann Arbor workbook uses a whole-
+                    # dollar SRP component. Preserve both known conventions
+                    # until the remaining Hilton properties are validated.
+                    if "ann arbor" in str(name or "").strip().lower():
+                        srp_revenue = int(
+                            math.floor(srp_revenue_raw + 0.5)
+                        )
+                    else:
+                        srp_revenue = round(srp_revenue_raw, 2)
 
                     current_month_total = {
                         "rooms": manual_rooms + srp_rooms,
