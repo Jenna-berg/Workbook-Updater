@@ -7683,6 +7683,107 @@ def _prior_month_forecast_template_fallback(
 
 
 
+def _reset_new_forecast_month_template(wb):
+    """Clear prior-month entry data from a freshly copied Forecast workbook.
+
+    This is intentionally run ONLY when a new month Forecast file is created.
+    It preserves formulas, formatting, Month Ending Budget / Last Year values,
+    and the workbook structure.
+
+    Cleared from every FCST-WK tab:
+      - As-of date
+      - OTB Rooms Sold
+      - Estimated Pick Up
+      - Est. Group Pick Up
+      - Forecast ADR manual row
+      - ADR OTB
+      - Actual Rooms Sold
+      - Actual Revenue
+      - Old pickup-history numeric snapshots below the main forecast section
+
+    The Hilton updater then fills only fresh OTB Rooms Sold + ADR OTB on the
+    selected week (WK1 for a new month).
+    """
+    for sheet_name in FORECAST_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+        rows = locate_forecast_rows(ws)
+        if not rows:
+            continue
+
+        # Clear prior as-of date.
+        ws.cell(rows["as_of_row"], 1).value = None
+
+        # Resolve date columns from the current template. If they are not
+        # readable yet, fall back to the standard daily area B:AF.
+        col_map = build_forecast_date_col_map(
+            ws,
+            wb,
+            date_row=rows["date_row"],
+        )
+        data_cols = sorted(set(col_map.values())) if col_map else list(range(2, 33))
+
+        # Find the manual entry rows that are not already returned by
+        # locate_forecast_rows.
+        estimated_pickup_row = None
+        group_pickup_row = None
+        forecast_adr_row = None
+
+        for r in range(1, min(ws.max_row, 30) + 1):
+            label = str(ws.cell(r, 1).value or "").strip().lower()
+
+            if label == "estimated pick up":
+                estimated_pickup_row = r
+            elif "group pick" in label:
+                group_pickup_row = r
+            elif (
+                label == "adr"
+                and r < rows["adr_otb_row"]
+                and forecast_adr_row is None
+            ):
+                forecast_adr_row = r
+
+        clear_rows = {
+            rows["otb_rooms_row"],
+            rows["adr_otb_row"],
+            rows["actual_rooms_row"],
+            rows["actual_revenue_row"],
+        }
+        for r in (
+            estimated_pickup_row,
+            group_pickup_row,
+            forecast_adr_row,
+        ):
+            if r:
+                clear_rows.add(r)
+
+        # Only remove literal/manual values. Formula cells are template logic
+        # and must remain untouched.
+        for r in clear_rows:
+            for c in data_cols:
+                cell = ws.cell(r, c)
+                if not is_formula(cell.value):
+                    cell.value = None
+
+        # Clear old pickup-history snapshots below the main Forecast block.
+        # These tables contain numeric OTB snapshots from the copied prior
+        # month. Keep every formula/label intact, but remove literal numeric
+        # or date entries from the daily data columns.
+        for r in range(45, min(ws.max_row, 120) + 1):
+            for c in data_cols:
+                cell = ws.cell(r, c)
+                value = cell.value
+                if is_formula(value) or value is None:
+                    continue
+                if isinstance(value, (int, float, datetime.date, datetime.datetime)):
+                    cell.value = None
+
+    return wb
+
+
+
 def setup_new_forecast_month(
     service,
     hotel_id: str,
@@ -7809,6 +7910,13 @@ def setup_new_forecast_month(
         )
 
         clear_tab_colors(wb, FORECAST_SHEETS)
+
+        # A copied prior-month Forecast can contain old manual inputs on every
+        # week tab. A fresh next-month file must start clean; otherwise the
+        # app appears to "pre-fill" Estimated Pick Up, Forecast ADR, actuals,
+        # and pickup history from the old month.
+        if newly_created:
+            _reset_new_forecast_month_template(wb)
 
         sheet = (
             FORECAST_SHEETS[0]
