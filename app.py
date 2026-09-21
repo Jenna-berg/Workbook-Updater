@@ -24,6 +24,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import math
+import struct
+import calendar
 
 # ── CSV parsing ───────────────────────────────────────────────────────────────
 
@@ -403,6 +405,277 @@ def parse_srp_activity(file_like):
                 b["TOT"][0] += 1;   b["TOT"][1] += per
                 b[kind][0] += 1;    b[kind][1] += per
     return out
+
+
+# ── Hilton MCAT CAL (.xls) ───────────────────────────────────────────────────
+
+def _cfb_extract_workbook_stream(file_bytes):
+    data = bytes(file_bytes)
+    if data[:8] != bytes.fromhex("D0CF11E0A1B11AE1"):
+        raise ValueError("MCAT CAL is not a valid legacy Excel .xls file.")
+
+    header = data[:512]
+    sector_size = 1 << struct.unpack_from("<H", header, 30)[0]
+    mini_sector_size = 1 << struct.unpack_from("<H", header, 32)[0]
+    num_fat = struct.unpack_from("<I", header, 44)[0]
+    first_dir = struct.unpack_from("<I", header, 48)[0]
+    mini_cutoff = struct.unpack_from("<I", header, 56)[0]
+    first_mini_fat = struct.unpack_from("<I", header, 60)[0]
+    num_mini_fat = struct.unpack_from("<I", header, 64)[0]
+    first_difat = struct.unpack_from("<I", header, 68)[0]
+    num_difat = struct.unpack_from("<I", header, 72)[0]
+
+    def sector(n):
+        off = 512 + n * sector_size
+        return data[off:off + sector_size]
+
+    difat = [
+        x for x in struct.unpack_from("<109I", header, 76)
+        if x < 0xFFFFFFFA
+    ]
+    sec = first_difat
+    for _ in range(num_difat):
+        vals = list(struct.unpack(
+            "<%dI" % (sector_size // 4),
+            sector(sec),
+        ))
+        difat.extend(x for x in vals[:-1] if x < 0xFFFFFFFA)
+        sec = vals[-1]
+
+    fat = []
+    for s in difat[:num_fat]:
+        fat.extend(struct.unpack(
+            "<%dI" % (sector_size // 4),
+            sector(s),
+        ))
+
+    def chain(start, table):
+        out, seen = [], set()
+        n = start
+        while n < 0xFFFFFFFA and n not in seen and n < len(table):
+            seen.add(n)
+            out.append(n)
+            n = table[n]
+        return out
+
+    def regular_bytes(start):
+        return b"".join(sector(s) for s in chain(start, fat))
+
+    directory = regular_bytes(first_dir)
+    entries = []
+    for off in range(0, len(directory), 128):
+        e = directory[off:off + 128]
+        if len(e) < 128:
+            break
+        name_len = struct.unpack_from("<H", e, 64)[0]
+        name = (
+            e[:max(0, name_len - 2)].decode("utf-16le", "ignore")
+            if name_len >= 2 else ""
+        )
+        typ = e[66]
+        start = struct.unpack_from("<I", e, 116)[0]
+        size = struct.unpack_from("<Q", e, 120)[0]
+        entries.append((name, typ, start, size))
+
+    root = next((e for e in entries if e[1] == 5), None)
+    if not root:
+        raise ValueError("Could not read MCAT CAL workbook container.")
+
+    mini_fat = []
+    if num_mini_fat and first_mini_fat < 0xFFFFFFFA:
+        mb = regular_bytes(first_mini_fat)
+        mini_fat = list(struct.unpack(
+            "<%dI" % (len(mb) // 4),
+            mb[: (len(mb) // 4) * 4],
+        ))
+    mini_stream = regular_bytes(root[2])[:root[3]]
+
+    def stream(entry):
+        _, typ, start, size = entry
+        if size < mini_cutoff and typ == 2:
+            chunks = []
+            for s in chain(start, mini_fat):
+                off = s * mini_sector_size
+                chunks.append(mini_stream[off:off + mini_sector_size])
+            return b"".join(chunks)[:size]
+        return regular_bytes(start)[:size]
+
+    wb_entry = next(
+        (e for e in entries if e[0].lower() in ("workbook", "book")),
+        None,
+    )
+    if not wb_entry:
+        raise ValueError("Could not find Workbook stream in MCAT CAL.")
+    return stream(wb_entry)
+
+
+def _biff_rk_number(value):
+    scaled = bool(value & 1)
+    is_int = bool(value & 2)
+    if is_int:
+        signed = struct.unpack(
+            "<i",
+            struct.pack("<I", value & 0xFFFFFFFC),
+        )[0]
+        num = signed >> 2
+    else:
+        raw = (value & 0xFFFFFFFC) << 32
+        num = struct.unpack("<d", struct.pack("<Q", raw))[0]
+    return num / 100 if scaled else num
+
+
+def _biff_read_sheets(file_bytes):
+    data = _cfb_extract_workbook_stream(file_bytes)
+    records, pos = [], 0
+    while pos + 4 <= len(data):
+        rid, length = struct.unpack_from("<HH", data, pos)
+        payload = data[pos + 4:pos + 4 + length]
+        records.append((pos, rid, payload))
+        pos += 4 + length
+
+    sheets, sst = [], []
+    i = 0
+    while i < len(records):
+        rec_pos, rid, payload = records[i]
+        if rid == 0x0085:
+            sheet_offset = struct.unpack_from("<I", payload, 0)[0]
+            chars = payload[6]
+            unicode_flag = payload[7] & 1
+            raw = payload[8:8 + chars * (2 if unicode_flag else 1)]
+            name = raw.decode(
+                "utf-16le" if unicode_flag else "latin1",
+                "ignore",
+            )
+            sheets.append((name, sheet_offset))
+        elif rid == 0x00FC:
+            chunks = [payload]
+            j = i + 1
+            while j < len(records) and records[j][1] == 0x003C:
+                chunks.append(records[j][2])
+                j += 1
+            blob = b"".join(chunks)
+            unique = struct.unpack_from("<I", blob, 4)[0] if len(blob) >= 8 else 0
+            p, strings = 8, []
+            try:
+                while len(strings) < unique and p + 3 <= len(blob):
+                    cch = struct.unpack_from("<H", blob, p)[0]
+                    p += 2
+                    opts = blob[p]
+                    p += 1
+                    rich = ext = 0
+                    if opts & 0x08:
+                        rich = struct.unpack_from("<H", blob, p)[0]
+                        p += 2
+                    if opts & 0x04:
+                        ext = struct.unpack_from("<I", blob, p)[0]
+                        p += 4
+                    nbytes = cch * (2 if opts & 1 else 1)
+                    raw = blob[p:p + nbytes]
+                    p += nbytes
+                    strings.append(raw.decode(
+                        "utf-16le" if opts & 1 else "latin1",
+                        "ignore",
+                    ))
+                    p += rich * 4 + ext
+            except Exception:
+                pass
+            sst = strings
+            i = j - 1
+        i += 1
+
+    offset_to_idx = {p: i for i, (p, _, _) in enumerate(records)}
+    out = {}
+    for sheet_name, sheet_offset in sheets:
+        idx = offset_to_idx.get(sheet_offset)
+        if idx is None:
+            idx = min(
+                range(len(records)),
+                key=lambda k: abs(records[k][0] - sheet_offset),
+            )
+        cells = {}
+        for k in range(idx + 1, len(records)):
+            _, rid, payload = records[k]
+            if rid == 0x000A:
+                break
+            try:
+                if rid == 0x0203:
+                    row, col, _ = struct.unpack_from("<HHH", payload, 0)
+                    cells[(row, col)] = struct.unpack_from("<d", payload, 6)[0]
+                elif rid == 0x027E:
+                    row, col, _, value = struct.unpack_from("<HHHI", payload, 0)
+                    cells[(row, col)] = _biff_rk_number(value)
+                elif rid == 0x00BD:
+                    row, first_col = struct.unpack_from("<HH", payload, 0)
+                    last_col = struct.unpack_from("<H", payload, len(payload) - 2)[0]
+                    p = 4
+                    for col in range(first_col, last_col + 1):
+                        _, value = struct.unpack_from("<HI", payload, p)
+                        p += 6
+                        cells[(row, col)] = _biff_rk_number(value)
+                elif rid == 0x00FD:
+                    row, col, _, sst_idx = struct.unpack_from("<HHHI", payload, 0)
+                    if sst_idx < len(sst):
+                        cells[(row, col)] = sst[sst_idx]
+                elif rid == 0x0204:
+                    row, col, _, n = struct.unpack_from("<HHHH", payload, 0)
+                    cells[(row, col)] = payload[8:8 + n].decode("latin1", "ignore")
+                elif rid == 0x0006:
+                    row, col, _ = struct.unpack_from("<HHH", payload, 0)
+                    cached = payload[6:14]
+                    if cached[6:8] != b"\xff\xff":
+                        cells[(row, col)] = struct.unpack("<d", cached)[0]
+            except Exception:
+                continue
+        out[sheet_name] = cells
+    return out
+
+
+def parse_hilton_mcat_cal(file_like):
+    """Read monthly GROUP/PERM SOLD + REVENUE from Hilton MCAT CAL."""
+    file_bytes = file_like.getvalue() if hasattr(file_like, "getvalue") else bytes(file_like)
+    cells = _biff_read_sheets(file_bytes).get("TOTAL")
+    if not cells:
+        raise ValueError("MCAT CAL is missing the TOTAL sheet.")
+
+    month_cols = {}
+    for col in range(3, 40):
+        month_label = str(cells.get((3, col), "") or "").strip()
+        year_value = cells.get((4, col))
+        if not month_label or year_value is None:
+            continue
+        try:
+            month_num = datetime.datetime.strptime(month_label[:3], "%b").month
+            year_num = int(float(year_value))
+        except Exception:
+            continue
+        month_cols[col] = (year_num, month_num)
+
+    row_lookup = {}
+    for row in range(0, 200):
+        mcat = str(cells.get((row, 0), "") or "").strip().upper()
+        stat = str(cells.get((row, 1), "") or "").strip().upper()
+        if mcat in ("GROUP", "PERM") and stat in ("SOLD", "REVENUE"):
+            row_lookup[(mcat, stat)] = row
+
+    out = {}
+    for col, key in month_cols.items():
+        bucket = {}
+        for label, seg in (("GROUP", "GRP"), ("PERM", "PRM")):
+            sr = row_lookup.get((label, "SOLD"))
+            rr = row_lookup.get((label, "REVENUE"))
+            if sr is None and rr is None:
+                continue
+            bucket[seg] = {
+                "pu_rooms": safe_float(cells.get((sr, col))) if sr is not None else 0,
+                "pu_rev": safe_float(cells.get((rr, col))) if rr is not None else 0,
+            }
+        if bucket:
+            out[key] = bucket
+
+    if not out:
+        raise ValueError("Could not find GROUP/PERM monthly totals in MCAT CAL.")
+    return out
+
 
 
 def _wash_bucket():
@@ -1308,6 +1581,7 @@ def build_hilton_rob_plan(
     current_month_total=None,
     tracked_year=None,
     wash_days=None,
+    mcat_months=None,
 ):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
@@ -1446,6 +1720,23 @@ def build_hilton_rob_plan(
                 "av_rev": live_perm["av_rev"],
             }
 
+        # MCAT CAL is authoritative for picked-up Group/Permanent monthly
+        # totals. Keep Wash Available Block for the not-picked-up columns.
+        mcat = (mcat_months or {}).get(key) or {}
+        if mcat:
+            mg = mcat.get("GRP") or {}
+            mp = mcat.get("PRM") or {}
+
+            if mg:
+                g = dict(g)
+                g["pu_rooms"] = _ar_num(mg.get("pu_rooms")) or 0
+                g["pu_rev"] = _ar_num(mg.get("pu_rev")) or 0
+
+            if mp:
+                p = dict(p)
+                p["pu_rooms"] = _ar_num(mp.get("pu_rooms")) or 0
+                p["pu_rev"] = _ar_num(mp.get("pu_rev")) or 0
+
         # Zero is a real ROB value, not "missing data". A month with no rooms
         # on the books must still write 0 to Rooms and Revenue so the workbook
         # does not misleadingly retain blanks/stale values.
@@ -1550,6 +1841,18 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
 
     changes = []
     warns = []
+
+    # Repair row-4 dates so the workbook visibly spans the complete month.
+    for d, col in sorted(col_map.items()):
+        existing_date = parse_any_date(ws.cell(rows["date_row"], col).value)
+        if existing_date != d:
+            changes.append({
+                "label": f"Forecast date {d}",
+                "row": rows["date_row"],
+                "col": col,
+                "new_value": d,
+                "skip_reason": None,
+            })
 
     def put(label, row, col, value):
         changes.append({
@@ -3926,10 +4229,13 @@ def locate_forecast_rows(ws):
 
 
 def build_forecast_date_col_map(ws, wb=None, date_row=4):
-    """Return {date: col_index} from date_row. Falls back to WK1 for formula-only sheets."""
+    """Return {date: col_index} for the complete calendar month.
+
+    Once the month start is known, map every real day through month-end even
+    when the template forgot to prefill the last date cell.
+    """
     month_start = parse_any_date(ws.cell(date_row, 2).value)
 
-    # If this sheet's col B is a formula, find the start date from any WK sheet with a literal
     if month_start is None and wb is not None:
         for sname in wb.sheetnames:
             if "glance" in sname.lower():
@@ -3942,27 +4248,16 @@ def build_forecast_date_col_map(ws, wb=None, date_row=4):
     if month_start is None:
         return {}
 
-    col_map = {}
-    col = 2
-    while col <= ws.max_column:
-        cell = ws.cell(date_row, col)
-        if isinstance(cell.value, str) and "total" in cell.value.lower():
-            break
-        if cell.value is None and col > 2:
-            break
-        d = month_start + datetime.timedelta(days=col - 2)
-        # One workbook covers one month. The templates carry 31 date columns
-        # and most chain them straight through (=prev+1), so in a 30-day month
-        # the last one computes to the 1st of the *next* month — confirmed on a
-        # real June file, where the map ran to 1 Jul. Some hotels blank that
-        # cell by hand and some don't, so the month end is what decides, not
-        # how many columns the sheet happens to have. Left in, a foreign day
-        # lands inside this month's Totals column.
-        if (d.year, d.month) != (month_start.year, month_start.month):
-            break
-        col_map[d] = col
-        col += 1
-    return col_map
+    month_start = month_start.replace(day=1)
+    days_in_month = calendar.monthrange(
+        month_start.year,
+        month_start.month,
+    )[1]
+
+    return {
+        datetime.date(month_start.year, month_start.month, day): day + 1
+        for day in range(1, days_in_month + 1)
+    }
 
 
 def row_is_filled(ws, r):
@@ -12722,13 +13017,27 @@ def render_hilton_update(hotels):
             type=["xlsx"], key="hil_srp")
 
         wash_files = {}
+        mcat_files = {}
         if selected:
-            st.markdown("**Group Wash report — one per property**")
+            st.markdown("**Hilton Group sources — one set per property**")
+            st.caption(
+                "MCAT CAL supplies picked-up Group/Permanent monthly totals. "
+                "Group Wash supplies the not-picked-up block."
+            )
             wcols = st.columns(2)
             for i, (name, fid) in enumerate(selected):
                 with wcols[i % 2]:
+                    st.markdown(f"**{name}**")
+                    mcat_files[name] = st.file_uploader(
+                        "MCAT CAL",
+                        type=["xls"],
+                        key=f"hil_mcat_{fid}",
+                    )
                     wash_files[name] = st.file_uploader(
-                        name, type=["xlsx"], key=f"hil_wash_{fid}")
+                        "Group Wash",
+                        type=["xlsx"],
+                        key=f"hil_wash_{fid}",
+                    )
 
         hilton_manual_mtd = {}
         if selected and "ROB" in wb_sels:
@@ -12917,6 +13226,16 @@ def render_hilton_update(hotels):
                 problems.append(f"{name}: could not read the Group Wash report — {e}")
                 continue
 
+            mcat = {}
+            if mcat_files.get(name):
+                try:
+                    mcat = parse_hilton_mcat_cal(mcat_files[name])
+                except Exception as e:
+                    problems.append(
+                        f"{name}: could not read MCAT CAL — {e}. "
+                        f"Using the legacy Group calculation instead."
+                    )
+
             inn = codes.get(name)
             if not inn:
                 continue          # already reported above, before the button
@@ -13043,10 +13362,13 @@ def render_hilton_update(hotels):
                         else hilton_as_of.year
                     ),
                     wash_days=wash.get("days"),
+                    mcat_months=mcat,
                 )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
                 note = f"  ·  InnCode {inn}"
+                if mcat:
+                    note += "  ·  Group/Perm picked-up from MCAT CAL"
                 if current_month_total is not None:
                     note += (
                         f"  ·  current month = Manual actuals through T-2 "
