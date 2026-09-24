@@ -1,7 +1,13 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.chart import PieChart, BarChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.axis import ChartLines
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.formula.translate import Translator
 import io
 import csv
 import re
@@ -11,10 +17,14 @@ import datetime
 import hashlib
 import json
 import bcrypt
+from pathlib import Path
+from copy import copy, deepcopy
 from xml.sax.saxutils import escape
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+import math
+import calendar
 
 # ── CSV parsing ───────────────────────────────────────────────────────────────
 
@@ -343,13 +353,6 @@ def srp_filter_warnings(filters):
             f"absent and every on-the-books total will read low. Re-run it with "
             f"Booked Date set to the day you run it.")
 
-    dep = filters.get("departure_from")
-    if dep and dep.day > 1:
-        out.append(
-            f"**Completed days will read far too low.** Its 'Departure Date' "
-            f"filter starts {dep.day} {dep:%b}, so guests who checked out before "
-            f"then are excluded — {dep:%B} 1–{dep.day - 1} are missing most of "
-            f"their stays. Set Departure Date to start on the 1st to capture them.")
     return out
 
 
@@ -403,13 +406,14 @@ def parse_srp_activity(file_like):
     return out
 
 
+
 def _wash_bucket():
     return collections.defaultdict(
         lambda: collections.defaultdict(
             lambda: {"pu_rooms": 0.0, "pu_rev": 0.0, "av_rooms": 0.0, "av_rev": 0.0}))
 
 
-def parse_group_wash(file_like):
+def parse_group_wash(file_like, hotel_name=None):
     """Individual Group Wash export → {"months": ..., "days": ...}
 
     'months' is {(year, month): {seg: {...}}} and 'days' the same keyed by
@@ -417,7 +421,7 @@ def parse_group_wash(file_like):
     builds both: the ROB reads months, the Forecast reads days, and they must
     describe the same blocks.
 
-    seg is 'GRP' (Market Segment != PERM) or 'PRM' (== PERM); each holds
+    seg is 'GRP' or 'PRM'; Northbrook also treats Market Segment MEPS as PRM; each holds
     pu_rooms / pu_rev / av_rooms / av_rev.
 
     'Pick Up' is what has actually been reserved out of the block and belongs
@@ -439,7 +443,21 @@ def parse_group_wash(file_like):
         pu = safe_float(rec.get("Pick Up")) or 0.0
         av = safe_float(rec.get("Available Block")) or 0.0
         rate = safe_float(rec.get("Rate")) or 0.0
-        seg = "PRM" if str(rec.get("Market Segment", "")).strip().upper() == WASH_PERM_SEGMENT else "GRP"
+        market_segment = str(
+            rec.get("Market Segment", "")
+        ).strip().upper()
+
+        is_northbrook = "northbrook" in str(
+            hotel_name or ""
+        ).strip().lower()
+
+        # Northbrook's permanent-room business is coded as MEPS in the
+        # Group Wash export. Other Hilton hotels keep the standard PERM rule.
+        is_perm = (
+            market_segment == WASH_PERM_SEGMENT
+            or (is_northbrook and market_segment == "MEPS")
+        )
+        seg = "PRM" if is_perm else "GRP"
         day = occ.date() if isinstance(occ, datetime.datetime) else occ
         for view, key in ((months, (occ.year, occ.month)), (days, day)):
             b = view[key][seg]
@@ -783,7 +801,7 @@ def parse_ihg_business_on_books(file_like):
     return {"report_date": report_date, "months": months}
 
 
-def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
+def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None, tracked_year=None):
     """ROB changes for one IHG hotel from the two IHG PDFs.
 
     History and Forecast covers the current month end to end and supplies it;
@@ -795,6 +813,7 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
     formula.
     """
     as_of = as_of or parsed.get("report_date") or datetime.date.today()
+    tracked_year = tracked_year or as_of.year
     blocks = rob_month_blocks(ws)
     changes = [{"row": 4, "col": 5, "label": "As-of date", "month": None,
                 "new_value": as_of, "skip_reason": None}]
@@ -832,19 +851,22 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None):
         put(labels.get("group rm rev"), 7, "Group NPU rev",
             round(npu * m.get("blk_avg", 0.0), 2), month, "BoB")
 
-    cur = blocks.get(as_of.month - 1)
-    if cur:
-        t = parsed["total"]
-        emit(cur, as_of.month, t["total_occ"], t["total_rev"],
-             t["blk_rms"], t["blk_rev"], "H&F")
-        if bob:
-            m = bob["months"].get((as_of.year, as_of.month))
-            if m:
-                emit_npu(cur, as_of.month, m)
+    if tracked_year == as_of.year:
+        cur = blocks.get(as_of.month - 1)
+        if cur:
+            t = parsed["total"]
+            emit(cur, as_of.month, t["total_occ"], t["total_rev"],
+                 t["blk_rms"], t["blk_rev"], "H&F")
+            if bob:
+                m = bob["months"].get((as_of.year, as_of.month))
+                if m:
+                    emit_npu(cur, as_of.month, m)
 
     if bob:
         for (year, month), m in sorted(bob["months"].items()):
-            if year != as_of.year or month <= as_of.month:
+            if year != tracked_year:
+                continue
+            if tracked_year == as_of.year and month <= as_of.month:
                 continue          # current month comes from H&F; past is closed
             labels = blocks.get(month - 1)
             if not labels:
@@ -1120,7 +1142,175 @@ def _srp_seg(srp_period, seg):
     return rooms, rev
 
 
-def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
+def extract_hilton_mtd_actuals_from_forecast(raw_bytes, as_of):
+    """Return completed current-month actual rooms/revenue through as_of - 2 days.
+
+    Hilton's daily workflow intentionally overlaps by one day:
+      * Forecast actuals are populated through yesterday.
+      * ROB current-month total uses actuals only through the day before yesterday.
+      * SRP contributes yesterday through month-end.
+
+    The one-day overlap lets the SRP export supply the freshest value for
+    yesterday, while the Forecast provides the already-actualized beginning
+    of the month.
+
+    Returns {"rooms", "revenue", "sheet", "through"} or None.
+    """
+    if not as_of:
+        return None
+
+    cutoff = as_of - datetime.timedelta(days=2)
+    if cutoff.month != as_of.month or cutoff.year != as_of.year:
+        # On the first/second day of a month there may be no current-month
+        # actualized portion yet.
+        return {
+            "rooms": 0,
+            "revenue": 0.0,
+            "sheet": None,
+            "through": cutoff,
+        }
+
+    wb_formulas = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False)
+    wb_values = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+
+    candidates = []
+
+    for sname in FORECAST_SHEETS:
+        if sname not in wb_formulas.sheetnames or sname not in wb_values.sheetnames:
+            continue
+
+        wsf = wb_formulas[sname]
+        wsv = wb_values[sname]
+        rows = locate_forecast_rows(wsf)
+        if not rows:
+            continue
+
+        sheet_as_of = (
+            parse_any_date(wsv.cell(rows["as_of_row"], 1).value)
+            or parse_any_date(wsf.cell(rows["as_of_row"], 1).value)
+        )
+        if sheet_as_of is None or sheet_as_of > as_of:
+            continue
+
+        col_map = build_forecast_date_col_map(
+            wsv, wb_values, date_row=rows["date_row"]
+        )
+        if not col_map:
+            continue
+
+        # Only consider tabs that contain at least one completed actual value.
+        has_actual = any(
+            d.year == as_of.year
+            and d.month == as_of.month
+            and d <= cutoff
+            and (
+                safe_float(wsv.cell(rows["actual_rooms_row"], col).value)
+                or safe_float(wsv.cell(rows["actual_revenue_row"], col).value)
+            )
+            for d, col in col_map.items()
+        )
+        if has_actual:
+            candidates.append((sheet_as_of, sname, rows, col_map))
+
+    if not candidates:
+        return None
+
+    # The most recent filled Forecast snapshot is the trusted source.
+    _, sname, rows, col_map = max(candidates, key=lambda x: x[0])
+    ws = wb_values[sname]
+
+    rooms = 0.0
+    revenue = 0.0
+    for d, col in col_map.items():
+        if (
+            d.year == as_of.year
+            and d.month == as_of.month
+            and d <= cutoff
+        ):
+            rooms += safe_float(ws.cell(rows["actual_rooms_row"], col).value) or 0.0
+            revenue += safe_float(ws.cell(rows["actual_revenue_row"], col).value) or 0.0
+
+    return {
+        "rooms": rooms,
+        "revenue": revenue,
+        "sheet": sname,
+        "through": cutoff,
+    }
+
+
+def hilton_current_month_total(srp_days, forecast_actuals, as_of):
+    """Combine Forecast actuals + live SRP tail for the Hilton current-month ROB.
+
+    Correct Hilton ROB workflow:
+      Forecast actuals: month start through as_of - 2
+      SRP live OTB:     as_of - 1 through month end
+
+    The Hilton Forecast daily mapping already produces the correct occupancy /
+    ADR from the SRP activity data. The ROB should use the same live tail, but
+    the corrected Hilton ROBs round that SRP *monthly revenue component* to the
+    nearest whole dollar before combining it with the Forecast actual revenue.
+
+    Example from the corrected Ann Arbor SEP2026 ROB:
+      SRP Sep 13–30:      2,391 rooms / $471,434.829... -> $471,435
+      Forecast Sep 1–12:  1,566 rooms / $402,148.78
+      ROB current month:  3,957 rooms / $873,583.78
+
+    Keeping the two components separately also lets build_hilton_rob_plan write
+    an auditable Excel formula instead of an opaque hard-coded total.
+    """
+    if not as_of:
+        return None
+    if forecast_actuals is None:
+        return None
+
+    month_end = (
+        (as_of.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        - datetime.timedelta(days=1)
+    )
+    srp_start = as_of - datetime.timedelta(days=1)
+
+    srp_rooms = 0.0
+    srp_revenue_raw = 0.0
+
+    d = srp_start
+    while d <= month_end:
+        rooms, rev = _srp_seg(srp_days.get(d), "TOT")
+        srp_rooms += rooms
+        srp_revenue_raw += rev
+        d += datetime.timedelta(days=1)
+
+    # Hilton ROB convention: current-month live SRP revenue is rounded to the
+    # nearest whole dollar before adding the already-actualized Forecast MTD.
+    # All source values are positive room revenue, so floor(x + .5) is a stable
+    # half-up whole-dollar rounding rule.
+    srp_revenue = int(math.floor(srp_revenue_raw + 0.5))
+
+    actual_rooms = forecast_actuals["rooms"]
+    actual_revenue = forecast_actuals["revenue"]
+
+    return {
+        "rooms": actual_rooms + srp_rooms,
+        "revenue": actual_revenue + srp_revenue,
+        "actual_rooms": actual_rooms,
+        "actual_revenue": actual_revenue,
+        "srp_rooms": srp_rooms,
+        "srp_revenue": srp_revenue,
+        "srp_revenue_raw": srp_revenue_raw,
+        "actual_through": forecast_actuals["through"],
+        "srp_from": srp_start,
+        "forecast_sheet": forecast_actuals["sheet"],
+    }
+
+
+def build_hilton_rob_plan(
+    srp_months,
+    wash_months,
+    ws,
+    as_of=None,
+    current_month_total=None,
+    tracked_year=None,
+    wash_days=None,
+):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
     srp_months  — parse_srp_activity()[inncode]["months"]
@@ -1147,6 +1337,7 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
     row on a real workbook.
     """
     as_of = as_of or datetime.date.today()
+    tracked_year = tracked_year or as_of.year
     blocks = rob_month_blocks(ws)
     changes, warns = [], []
 
@@ -1166,17 +1357,103 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
 
     for mi, labels in sorted(blocks.items()):
         month = mi + 1
-        if month < as_of.month:
+        if tracked_year == as_of.year and month < as_of.month:
             continue                      # never rewrite a closed month
-        key = (as_of.year, month)
+        key = (tracked_year, month)
         srp = srp_months.get(key) or {}
         wash = wash_months.get(key) or {}
         tot_rooms, tot_rev = _srp_seg(srp, "TOT")
+
+        # The current month is different from future months. The daily SRP
+        # export does not contain a reliable full-month history once completed
+        # stays have fallen outside its Departure Date filter. For the current
+        # month, use the established Hilton workflow:
+        #   actuals through day-before-yesterday + SRP yesterday through EOM.
+        current_month_reconciled = (
+            tracked_year == as_of.year
+            and month == as_of.month
+            and current_month_total is not None
+        )
+
+        if current_month_reconciled:
+            tot_rooms = current_month_total["rooms"]
+            tot_rev = current_month_total["revenue"]
+
         g = wash.get("GRP") or {}
         p = wash.get("PRM") or {}
 
-        if not tot_rooms:
-            continue                      # nothing on the books for this month
+        if current_month_reconciled and wash_days is not None:
+            # Current-month Group/Permanent use the same cutoff as Total:
+            # manual actuals through T-2 + live Wash data from T-1 to EOM.
+            month_end = (
+                (as_of.replace(day=28) + datetime.timedelta(days=4))
+                .replace(day=1)
+                - datetime.timedelta(days=1)
+            )
+            live_start = as_of - datetime.timedelta(days=1)
+
+            live_group = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
+            live_perm = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
+
+            d = live_start
+            while d <= month_end:
+                day_bucket = wash_days.get(d) or {}
+                for src, dest in (
+                    (day_bucket.get("GRP") or {}, live_group),
+                    (day_bucket.get("PRM") or {}, live_perm),
+                ):
+                    for metric in (
+                        "pu_rooms",
+                        "pu_rev",
+                        "av_rooms",
+                        "av_rev",
+                    ):
+                        dest[metric] += _ar_num(src.get(metric)) or 0
+                d += datetime.timedelta(days=1)
+
+            g = {
+                "pu_rooms": (
+                    (_ar_num(current_month_total.get("actual_group_rooms")) or 0)
+                    + live_group["pu_rooms"]
+                ),
+                "pu_rev": (
+                    (_ar_num(current_month_total.get("actual_group_revenue")) or 0)
+                    + live_group["pu_rev"]
+                ),
+                # Not-picked-up is a live future block measure, so only the
+                # T-1-to-EOM remainder belongs in the current ROB.
+                "av_rooms": live_group["av_rooms"],
+                "av_rev": live_group["av_rev"],
+            }
+            p = {
+                "pu_rooms": (
+                    (_ar_num(current_month_total.get("actual_perm_rooms")) or 0)
+                    + live_perm["pu_rooms"]
+                ),
+                "pu_rev": (
+                    (_ar_num(current_month_total.get("actual_perm_revenue")) or 0)
+                    + live_perm["pu_rev"]
+                ),
+                "av_rooms": live_perm["av_rooms"],
+                "av_rev": live_perm["av_rev"],
+            }
+
+        # Zero is a real ROB value, not "missing data". A month with no rooms
+        # on the books must still write 0 to Rooms and Revenue so the workbook
+        # does not misleadingly retain blanks/stale values.
+        #
+        # _srp_seg() returns (0, 0.0) for a genuinely empty month, so do not
+        # skip merely because tot_rooms is zero.
 
         # The two reports have to describe the same hotel. Pick-up is a subset
         # of what is on the books, so it cannot exceed it — when it does, one
@@ -1193,8 +1470,36 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
                 f"same dates and the same property.")
 
         L = labels.get
-        put(L("revenue"),        5, "Revenue",        round(tot_rev, 2), month)
-        put(L("room nights"),    5, "Room Nights",    int(round(tot_rooms)), month)
+
+        if current_month_reconciled:
+            # Match the corrected Hilton ROB layout: show the live SRP tail and
+            # Forecast actual MTD as the two visible formula components.
+            srp_rooms_formula = int(round(current_month_total["srp_rooms"]))
+            actual_rooms_formula = int(round(current_month_total["actual_rooms"]))
+            srp_revenue_formula = current_month_total["srp_revenue"]
+            actual_revenue_formula = round(
+                current_month_total["actual_revenue"], 2
+            )
+
+            def _formula_num(value):
+                value = float(value or 0)
+                if abs(value - round(value)) < 1e-9:
+                    return str(int(round(value)))
+                return f"{value:.2f}"
+
+            revenue_write = (
+                f"={_formula_num(srp_revenue_formula)} + "
+                f"{_formula_num(actual_revenue_formula)}"
+            )
+            rooms_write = (
+                f"={srp_rooms_formula} + {actual_rooms_formula}"
+            )
+        else:
+            revenue_write = round(tot_rev, 2)
+            rooms_write = int(round(tot_rooms))
+
+        put(L("revenue"),        5, "Revenue",        revenue_write, month)
+        put(L("room nights"),    5, "Room Nights",    rooms_write, month)
         put(L("group rms sold"), 5, "Group Rms sold", int(round(g.get("pu_rooms", 0.0))), month)
         put(L("group rm rev"),   5, "Group Rm Rev",   round(g.get("pu_rev", 0.0), 2), month)
         put(L("group rms sold"), 7, "Group not p/u rms", int(round(g.get("av_rooms", 0.0))), month)
@@ -1208,83 +1513,128 @@ def build_hilton_rob_plan(srp_months, wash_months, ws, as_of=None):
 
 
 def build_hilton_forecast_plan(srp_days, ws, as_of=None):
-    """Forecast changes for one Hilton hotel from the SRP export.
+    """Write Hilton Forecast OTB inputs only.
 
-    The Hilton Forecast is the same shape as every other Forecast the app
-    writes — dates running across row 4, with OTB rooms, OTB ADR, actual rooms
-    and actual revenue each on their own titled row — so it is located with the
-    shared helpers rather than a second Hilton-specific set.
+    Validated against completed Nashua files:
+      - OTB Rooms Sold -> the first "Rooms Sold" row above "ADR OTB"
+        (row 6 in Nashua)
+      - OTB ADR -> "ADR OTB" row (row 14 in Nashua)
 
-    The rule, confirmed with the user: this fills today to month end and
-    nothing else. Days that have actualised are entered by hand.
+    Do NOT write:
+      - Forecast Rooms Sold / Forecast ADR
+      - Estimated Pick Up / Est. Group Pick Up
+      - Actual Rooms / Actual Revenue
+      - As-of date
+      - Pick-up tracking chart
 
-    That matches what the export can actually support. SRP Activity lists
-    reservations that are still live, so a completed day's rooms decay as it
-    recedes: on a 17 Aug export one hotel's 1 Aug read 4 rooms against a real
-    245, 8 Aug read 11, 13 Aug read 83, and only 14–16 Aug came back right.
-    Writing those into the actuals row is worse than leaving it empty — the day
-    looks filled and reads twenty times low, which is how this was found.
-
-    'Estimated Pick Up' and the forecast ADR are likewise never written: they
-    are the revenue manager's judgement, not anything the export knows.
+    Current-month cutoff:
+      T-1 remains manual/blank; T through month-end comes from SRP.
+    Future-month Forecast:
+      every date in that workbook month comes from SRP.
     """
     as_of = as_of or datetime.date.today()
+    if isinstance(as_of, datetime.datetime):
+        as_of = as_of.date()
+
     rows = locate_forecast_rows(ws)
     if not rows:
-        return [], ["could not read its row titles (As-of date / Rooms Sold / "
-                    "ADR OTB / Revenue)."]
-    col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
+        return [], [
+            "could not locate the Forecast Rooms Sold / ADR OTB rows."
+        ]
+
+    col_map = build_forecast_date_col_map(
+        ws,
+        ws.parent,
+        date_row=rows["date_row"],
+    )
     if not col_map:
         return [], ["could not read its date row."]
 
-    changes, warns = [], []
+    changes = []
+    warns = []
+
+    # Repair row-4 dates so the workbook visibly spans the complete month.
+    for d, col in sorted(col_map.items()):
+        existing_date = parse_any_date(ws.cell(rows["date_row"], col).value)
+        if existing_date != d:
+            changes.append({
+                "label": f"Forecast date {d}",
+                "row": rows["date_row"],
+                "col": col,
+                "new_value": d,
+                "skip_reason": None,
+            })
 
     def put(label, row, col, value):
         changes.append({
-            "label": label, "row": row, "col": col, "new_value": value,
-            "skip_reason": "formula" if is_formula(ws.cell(row, col).value) else None,
+            "label": label,
+            "row": row,
+            "col": col,
+            "new_value": value,
+            "skip_reason": (
+                "formula"
+                if is_formula(ws.cell(row, col).value)
+                else None
+            ),
         })
 
-    put("As-of date", rows["as_of_row"], 1, as_of)
+    workbook_month = min(col_map).replace(day=1)
+    as_of_month = as_of.replace(day=1)
+    is_future_month = workbook_month > as_of_month
 
-    dated, past = 0, 0
+    written = 0
+    skipped_past = 0
+
     for d, col in sorted(col_map.items()):
-        if d < as_of:
-            past += 1
+        # Current-month workflow leaves yesterday (T-1) and all earlier
+        # dates alone. For a future-month Forecast, populate the full month.
+        if not is_future_month and d < as_of:
+            skipped_past += 1
             continue
-        rooms, rev = _srp_seg(srp_days.get(d), "TOT")
-        if not rooms:
-            continue
-        dated += 1
-        put(f"Rooms Sold (OTB) {d}", rows["otb_rooms_row"], col, int(round(rooms)))
-        put(f"ADR OTB {d}", rows["adr_otb_row"], col, round(rev / rooms, 2))
 
-    if not dated:
-        return [], [f"none of its dates ({min(col_map):%b %Y}) carry any rooms still "
-                    f"on the books. Is this the right month's workbook?"]
-    if past:
-        warns.append(f"filled {dated} day(s) from {as_of:%b %d} to month end. The "
-                     f"{past} day(s) before that have actualised and are left for "
-                     f"you to enter by hand, as agreed.")
+        rooms, revenue = _srp_seg(srp_days.get(d), "TOT")
+        rooms_value = int(round(rooms or 0))
+        adr_value = (
+            round(revenue / rooms, 2)
+            if rooms
+            else 0
+        )
 
-    # Pick-up tracking chart: this week's on-the-books rooms written under the
-    # previous weeks', which is what makes the week-on-week build visible. Same
-    # cutoff — a completed day's figure here would be as wrong as it is above.
-    track = find_next_pickup_data_row(ws)
-    if track:
-        put("Pickup tracking: date", track, 1, as_of)
-        for d, col in sorted(col_map.items()):
-            if d < as_of:
-                continue
-            rooms, _ = _srp_seg(srp_days.get(d), "TOT")
-            put(f"Pickup tracking: Rooms Sold {d}", track, col, int(round(rooms)))
-    else:
-        warns.append("no free row left in its pick-up tracking chart.")
+        put(
+            f"Rooms Sold (OTB) {d}",
+            rows["otb_rooms_row"],
+            col,
+            rooms_value,
+        )
+        put(
+            f"ADR OTB {d}",
+            rows["adr_otb_row"],
+            col,
+            adr_value,
+        )
+        written += 1
+
+    if not written:
+        return [], [
+            f"none of the Forecast dates in {workbook_month:%b %Y} "
+            f"could be populated."
+        ]
+
+    if is_future_month:
+        warns.append(
+            f"filled Rooms Sold and ADR OTB for all {written} day(s) "
+            f"in {workbook_month:%b %Y}."
+        )
+    elif skipped_past:
+        warns.append(
+            f"filled Rooms Sold and ADR OTB for {written} day(s) from "
+            f"{as_of:%b %d} to month end. T-1 and earlier were left alone."
+        )
 
     return changes, warns
 
 
-def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
+def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None, tracked_year=None):
     """grp_npu_rev_override: optional {(year, month): dollar_value} — when
     present for a given month, writes that literal value into the 'Group Not
     P/U rev' secondary-column cell instead of the standard count*ADR formula.
@@ -1295,6 +1645,7 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
     today = datetime.date.today()
     current_month = today.month
     current_year = today.year
+    tracked_year = tracked_year or current_year
     changes = []
     # Rows per month block, read off this sheet rather than assumed — hotels
     # with a Permanent-rooms section use 11-row blocks, not 8, and every row
@@ -1317,18 +1668,32 @@ def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
         if kind != "monthly":
             continue
         year, month = info
-        prev_month = current_month - 1 if current_month > 1 else 12
-        prev_year  = current_year if current_month > 1 else current_year - 1
-        if year == prev_year and month == prev_month:
-            pass  # allow previous month (final numbers come in on the 1st)
-        elif year != current_year or month < current_month:
-            continue
+        if tracked_year > current_year:
+            # Next-year ROB: every month in the tracked future year is writable.
+            if year != tracked_year:
+                continue
+        else:
+            prev_month = current_month - 1 if current_month > 1 else 12
+            prev_year  = current_year if current_month > 1 else current_year - 1
+            if year == prev_year and month == prev_month:
+                pass  # allow previous month (final numbers come in on the 1st)
+            elif year != tracked_year or month < current_month:
+                continue
 
         month_index = month - 1
         block_start = 4 + block_step * month_index
 
-        rev     = safe_float(row[5])
-        rms     = safe_float(row[1])
+        rev_raw = row[5]
+        rms_raw = row[1]
+        rev     = safe_float(rev_raw)
+        rms     = safe_float(rms_raw)
+
+        # Preserve an explicit 0 from the source as a literal zero in Excel.
+        # Only truly blank/unparseable source cells remain None.
+        if rev is None and str(rev_raw).strip() in {"0", "0.0", "0.00", "$0", "$0.00"}:
+            rev = 0.0
+        if rms is None and str(rms_raw).strip() in {"0", "0.0", "0.00"}:
+            rms = 0.0
         grp_pu  = safe_float(row[7])
         grp_npu = safe_float(row[8])
         grp_rvn = safe_float(row[9])
@@ -1872,6 +2237,22 @@ def detect_strategy_columns(ws):
         else:
             col_map[field] = None  # will surface as a warning, not a crash
 
+    # Casino Ballroom is a special two-column section on Ashworth/Hampton.
+    casino_cols = []
+    for c, (r3v, r4v) in headers.items():
+        combined = f"{r3v} {r4v}".upper()
+        if "CASINO" in combined and "BALLROOM" in combined:
+            casino_cols.append(c)
+
+    if casino_cols:
+        casino_cols = sorted(set(casino_cols))
+        col_map["casino_ballroom"] = casino_cols[0]
+        if len(casino_cols) >= 2:
+            col_map["casino_ballroom_ly"] = casino_cols[1]
+        else:
+            next_col = casino_cols[0] + 1
+            col_map["casino_ballroom_ly"] = next_col if next_col <= max_col else None
+
     return col_map
 
 
@@ -2258,122 +2639,96 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
 
 
 def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
-    """Read all LY source fields + comp set TY col from an in-memory workbook.
-    Returns {this_year_date: {field: value}} (dates shifted to match TY sheet's year).
+    """Read prior-year Strategy values and align them to TY by weekday.
 
-    Robust to year mismatches in LY file (e.g., AUG2025 file has 2024 dates due to
-    copy/paste error). Detects target year from TY sheet and shifts LY dates accordingly.
+    Portfolio-wide STLY rule: a TY date receives the value from the nearest
+    date in the prior calendar year that falls on the SAME weekday.
+    Example: Tue 09/01/2026 <- Tue 09/02/2025.
     """
     if sheet_name not in ly_wb.sheetnames:
         return {}
 
-    # Detect target year from TY sheet if provided, otherwise infer from LY year + 1
-    # For fiscal year files (Aug-Jul), use the LAST date to get the correct year,
-    # not the first date (e.g., AUG2026 starts 2026-08-01 but ends 2027-07-31, so target_year=2027)
-    target_year = None
+    ly_ws = ly_wb[sheet_name]
+    ly_col_map = detect_strategy_columns(ly_ws)
+    ly_date_map = build_date_row_map(
+        ly_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
+    )
+    if not ly_date_map:
+        return {}
+
+    ty_date_map = {}
     if ty_wb and sheet_name in ty_wb.sheetnames:
-        ty_ws = ty_wb[sheet_name]
-        ty_date_col = detect_date_column(ty_ws, wb=ty_wb)
-        # Scan to find last date in column
-        last_date_year = None
-        for r in range(ty_ws.max_row, 4, -1):
-            v = ty_ws.cell(r, ty_date_col).value
-            if isinstance(v, datetime.datetime):
-                last_date_year = v.year
-                break
-            elif isinstance(v, datetime.date):
-                last_date_year = v.year
-                break
-        if last_date_year and last_date_year >= 2025:
-            target_year = last_date_year
+        ty_date_map = build_date_row_map(
+            ty_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
+        )
 
-    # If target_year not detected, infer from LY source file's max year
-    if not target_year:
-        ws = ly_wb[sheet_name]
-        max_year = None
-        for col in range(1, ws.max_column + 1):
-            for row in range(5, min(50, ws.max_row + 1)):
-                v = ws.cell(row, col).value
-                if isinstance(v, datetime.datetime):
-                    if max_year is None or v.year > max_year:
-                        max_year = v.year
-                elif isinstance(v, datetime.date):
-                    if max_year is None or v.year > max_year:
-                        max_year = v.year
-        if max_year:
-            target_year = max_year + 1
-
-    ws = ly_wb[sheet_name]
-    col_map  = detect_strategy_columns(ws)
-
-    # For LY extraction in multi-year files, use the HIGHEST year-labeled date column.
-    # AUG2025 has: col 1 labeled "2024" (old), col 3 labeled "2025" (current)
-    # We want the "2025" dates (col 3) for extraction.
-    # Find the highest year label in row 4 and use its date column.
-    date_col = detect_date_column(ws, wb=ly_wb)  # Default: column 3 (2025 TY)
-
-    # Look for year labels in row 4 and find the highest year
-    max_year_in_file = None
-    max_year_col = None
-    for col in range(1, ws.max_column + 1):
-        cell_val = ws.cell(4, col).value
-        if isinstance(cell_val, (int, float)):
-            year_val = int(cell_val)
-            if year_val >= 2020 and (max_year_in_file is None or year_val > max_year_in_file):
-                max_year_in_file = year_val
-                max_year_col = col
-
-    # If we found a year label, use the date column for that year
-    if max_year_col:
-        for test_col in [max_year_col, max_year_col + 1]:  # Year label might be in col, date in col+1
-            if test_col <= ws.max_column:
-                test_val = ws.cell(5, test_col).value
-                if isinstance(test_val, (datetime.datetime, datetime.date)):
-                    date_col = test_col
+    if not ty_date_map:
+        # Defensive fallback for callers without TY workbook context.
+        for src_date in ly_date_map:
+            try:
+                nominal = datetime.date(src_date.year + 1, src_date.month, src_date.day)
+            except ValueError:
+                nominal = datetime.date(src_date.year + 1, 2, 28)
+            for offset in range(-3, 4):
+                candidate = nominal + datetime.timedelta(days=offset)
+                if candidate.weekday() == src_date.weekday():
+                    ty_date_map[candidate] = None
                     break
 
-    comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
-
+    comp_ty_col, _ = detect_comp_set_columns(ly_ws, ly_col_map)
+    source_dates = sorted(ly_date_map.keys())
     out = {}
-    for r in range(5, ws.max_row + 1):
-        v = ws.cell(r, date_col).value
-        if isinstance(v, datetime.datetime): d = v.date()
-        elif isinstance(v, datetime.date):   d = v
-        else: continue
 
-        # Shift to target year, applying DOW adjustment (-1 day for non-leap year).
-        # CRITICAL: Only subtract the -1 day if it doesn't cross a month boundary.
-        # At year/month boundaries (e.g., Jan 1), -1 day crosses to previous month/year
-        # and breaks the date matching. In those cases, use the date as-is.
+    for ty_date in sorted(ty_date_map.keys()):
+        prior_year = ty_date.year - 1
         try:
-            # Shift to target year and apply -1 day for DOW alignment.
-            # This matches day-of-week across years (Mon 2025 → Mon 2026).
-            # Example: 2025-08-02 (Fri) → 2026-08-01 (Fri)
-            base_date = datetime.date(d.year + 1, d.month, d.day)
-            this_year = base_date - datetime.timedelta(days=1)
+            nominal = datetime.date(prior_year, ty_date.month, ty_date.day)
         except ValueError:
-            # Feb 29 in non-leap year: use Feb 28 instead
-            if d.month == 2 and d.day == 29:
-                base_date = datetime.date(d.year + 1, 2, 28)
-                this_year = base_date - datetime.timedelta(days=1)
-            else:
-                # Other date error: skip this row
-                continue
+            nominal = datetime.date(prior_year, 2, 28)
 
+        candidates = [
+            d for d in source_dates
+            if d.year == prior_year
+            and d.weekday() == ty_date.weekday()
+            and abs((d - nominal).days) <= 7
+        ]
+        if candidates:
+            src_date = min(candidates, key=lambda d: (abs((d - nominal).days), d))
+        else:
+            # If the source workbook has a bad printed year, preserve weekday
+            # alignment and choose the nearest month/day as a fallback.
+            candidates = [d for d in source_dates if d.weekday() == ty_date.weekday()]
+            if not candidates:
+                continue
+            src_date = min(
+                candidates,
+                key=lambda d: (
+                    abs(d.month - nominal.month) * 31 + abs(d.day - nominal.day),
+                    abs(d.year - prior_year),
+                ),
+            )
+
+        src_row = ly_date_map[src_date]
         row_data = {}
-        # Read from TY columns — for SR LY extraction, this year's TY becomes next year's LY
         for ly_dest, ty_src in LY_FROM_TY.items():
-            src_col = col_map.get(ty_src)
-            if src_col:
-                val = ws.cell(r, src_col).value
-                if val is not None and not is_formula(val):
-                    row_data[ly_dest] = safe_float(val)
-        if comp_ty_col:
-            val = ws.cell(r, comp_ty_col).value
+            src_col = ly_col_map.get(ty_src)
+            if not src_col:
+                continue
+            val = ly_ws.cell(src_row, src_col).value
             if val is not None and not is_formula(val):
-                row_data["comp_set_ly"] = val  # preserve text values like "Sold out", "LOS2"
+                if ly_dest == "casino_ballroom_ly":
+                    row_data[ly_dest] = val
+                else:
+                    row_data[ly_dest] = safe_float(val)
+
+        if comp_ty_col:
+            val = ly_ws.cell(src_row, comp_ty_col).value
+            if val is not None and not is_formula(val):
+                row_data["comp_set_ly"] = val
+
         if row_data:
-            out[this_year] = row_data
+            out[ty_date] = row_data
+
     return out
 
 
@@ -2425,10 +2780,31 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
         if src_sheet:
             prev_otb_map = _extract_otb_trans_by_date(prev_month_wb, src_sheet, scope_start)
 
-    # LY data — every week, from last year's same month/week tab (already in memory)
+    # LY data — every week, aligned by weekday rather than calendar date.
     ly_data = {}
     if ly_wb:
         ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=wb)
+
+    # Ashworth Casino Ballroom TY/current events carry forward week-over-week.
+    # Prior-year Casino events are sourced separately from ly_wb above.
+    casino_prev_map = {}
+    is_ashworth_sheet = "ASHWORTH" in _strategy_norm(ws["A1"].value)
+    if is_ashworth_sheet and sheet_name in STRATEGY_SHEETS:
+        sheet_idx = STRATEGY_SHEETS.index(sheet_name)
+        if sheet_idx > 0:
+            prev_sheet_name = STRATEGY_SHEETS[sheet_idx - 1]
+            if prev_sheet_name in wb.sheetnames:
+                prev_ws_same_month = wb[prev_sheet_name]
+                prev_cols = detect_strategy_columns(prev_ws_same_month)
+                prev_casino_col = prev_cols.get("casino_ballroom")
+                if prev_casino_col:
+                    prev_date_rows = build_date_row_map(
+                        wb, prefer_sheet=prev_sheet_name, fallback_to_wkone=False
+                    )
+                    for prev_date, prev_row in prev_date_rows.items():
+                        val = prev_ws_same_month.cell(prev_row, prev_casino_col).value
+                        if val is not None and not is_formula(val):
+                            casino_prev_map[prev_date] = val
 
     changes = []
 
@@ -2511,7 +2887,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             })
 
     # ── Drive-sourced columns (run every time, no CSV needed) ─────────────────
-    all_dates = set(date_row_map.keys()) & (set(prev_otb_map) | set(ly_data))
+    all_dates = set(date_row_map.keys()) & (set(prev_otb_map) | set(ly_data) | set(casino_prev_map))
     for d in sorted(all_dates):
         if d < scope_start or d > scope_end:
             continue
@@ -2526,6 +2902,15 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 "label": "OTB Lst Wek", "new_value": prev_otb_map[d], "skip_reason": skip,
             })
 
+        # Ashworth Casino Ballroom TY/current event from the prior week tab.
+        casino_ty_col = col_map.get("casino_ballroom")
+        if casino_ty_col and d in casino_prev_map:
+            changes.append({
+                "date": d, "row": excel_row, "col": casino_ty_col,
+                "label": "Casino Ballroom TY (week-over-week)",
+                "new_value": casino_prev_map[d], "skip_reason": None,
+            })
+
         # LY columns
         if d in ly_data:
             row_ly = ly_data[d]
@@ -2536,6 +2921,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 ("trans_rev_ly",   "LY Trans Rev"),
                 ("grp_rev_ly",     "GRP LY Rev"),
                 ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+                ("casino_ballroom_ly", "Casino Ballroom LY"),
             ]:
                 dest_col = col_map.get(ly_field)
                 if dest_col and ly_field in row_ly:
@@ -2563,6 +2949,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             ("trans_rev_ly",   "LY Trans Rev"),
             ("grp_rev_ly",     "GRP LY Rev"),
             ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+            ("casino_ballroom_ly", "Casino Ballroom LY"),
         ]
         for d, excel_row in date_row_map.items():
             if d < scope_start or d > scope_end:
@@ -2601,9 +2988,135 @@ def apply_strategy_changes(wb, sheet_name, changes):
 
 
 def parse_rate_csv(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8-sig")
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    """Parse StayNTouch Rates & Restrictions from CSV or XLSX.
+
+    Handles title/metadata rows above the real header, variable-width metadata,
+    and common CSV delimiters. The true header is detected before pandas reads
+    the table, preventing metadata rows from hiding the Date/Rate columns.
+    """
+    if not file_bytes:
+        return pd.DataFrame()
+
+    def norm(v):
+        return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
+
+    def looks_like_header(values):
+        vals = [norm(v) for v in values if str(v or "").strip()]
+        if not vals:
+            return False
+
+        has_date = any(
+            v in {"date", "staydate", "businessdate", "arrivaldate"}
+            or v.endswith("date")
+            for v in vals
+        )
+        has_rate_or_restriction = any(
+            (
+                v in {
+                    "double", "doublerate", "doubleoccupancy",
+                    "doubleoccupancyrate", "rate", "roomrate",
+                    "bar", "barrate", "baserate", "sellrate",
+                    "2guests", "2guestrate",
+                    "mlos", "minlos", "minstay", "minimumstay",
+                    "minlengthofstay", "minimumlengthofstay",
+                }
+                or ("double" in v and ("rate" in v or "occupancy" in v))
+                or ("lengthofstay" in v)
+            )
+            for v in vals
+        )
+        return has_date and has_rate_or_restriction
+
+    def clean_df(df):
+        df.columns = [
+            re.sub(r"\s+", " ", str(c or "")).strip()
+            for c in df.columns
+        ]
+        keep_cols = [
+            c for c in df.columns
+            if c and not str(c).lower().startswith("unnamed:")
+        ]
+        df = df.loc[:, keep_cols]
+        return df.dropna(how="all").reset_index(drop=True)
+
+    # XLSX export
+    if file_bytes[:4] == b"PK\x03\x04":
+        raw = pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=object)
+        header_idx = None
+        for i in range(min(len(raw), 30)):
+            if looks_like_header(raw.iloc[i].tolist()):
+                header_idx = i
+                break
+        if header_idx is None:
+            raise ValueError(
+                "Could not locate the Date / Rate header row in the "
+                "Rates & Restrictions workbook."
+            )
+        df = pd.read_excel(
+            io.BytesIO(file_bytes),
+            header=header_idx,
+            dtype=object,
+        )
+        return clean_df(df)
+
+    # CSV/text export
+    decoded = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            decoded = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        decoded = file_bytes.decode("utf-8", errors="replace")
+
+    lines = decoded.splitlines()
+    best = None
+
+    # Use Python's csv reader for header detection so variable-width metadata
+    # rows do not interfere with finding the real table header.
+    for sep in (",", "\t", ";", "|"):
+        header_idx = None
+        for i, line in enumerate(lines[:30]):
+            try:
+                row = next(csv.reader([line], delimiter=sep))
+            except Exception:
+                continue
+            if looks_like_header(row):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        table_text = "\n".join(lines[header_idx:])
+        try:
+            parsed = pd.read_csv(
+                io.StringIO(table_text),
+                header=0,
+                dtype=str,
+                sep=sep,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        except Exception:
+            continue
+
+        score = len([
+            c for c in parsed.columns
+            if str(c or "").strip()
+            and not str(c).lower().startswith("unnamed:")
+        ])
+        if best is None or score > best[0]:
+            best = (score, parsed)
+
+    if best is None:
+        raise ValueError(
+            "Could not locate the Date / Rate header row in the "
+            "Rates & Restrictions CSV."
+        )
+
+    return clean_df(best[1])
 
 
 def find_header_col(ws, keyword, header_rows=(2, 3, 4)):
@@ -2643,7 +3156,604 @@ def find_restrictions_col(ws, upto_col=None):
     return None
 
 
-def build_rates_change_plan(rate_df, wb, sheet_name):
+def _strategy_norm(v):
+    return re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
+
+
+def _strategy_hotel_aliases(hotel_name):
+    """Return safe aliases for the selected Strategy hotel."""
+    base = _strategy_norm(hotel_name)
+    aliases = {base}
+
+    for _portfolio, members in PORTFOLIO_HOTELS.items():
+        for label, keywords in members.items():
+            label_norm = _strategy_norm(label)
+            keyword_norms = {_strategy_norm(k) for k in keywords}
+
+            # The UI label may be shorter than the workbook header, e.g.
+            # "Middletown" vs "Inn at Middletown". Match the portfolio entry
+            # by containment as well as exact label equality.
+            belongs = (
+                label == hotel_name
+                or (base and (base in label_norm or label_norm in base))
+                or any(base and (base in k or k in base) for k in keyword_norms)
+            )
+            if belongs:
+                aliases.add(label_norm)
+                aliases.update(keyword_norms)
+
+    return {a for a in aliases if len(a) >= 4}
+
+
+
+def _strategy_resolve_header_value(ws, row, col, depth=0):
+    """Resolve simple Strategy header cross-sheet references.
+
+    Later week tabs frequently mirror WKONE's hotel headers with formulas such
+    as =WKONE!Z3. Header matching must use the referenced text, not the literal
+    formula string, or current hotel/competitor columns are misidentified.
+    """
+    if depth > 10:
+        return ws.cell(row, col).value
+
+    value = ws.cell(row, col).value
+    if not isinstance(value, str) or not value.strip().startswith("="):
+        return value
+
+    formula = value.strip()
+    m = re.fullmatch(
+        r"=(?:'([^']+)'|([A-Za-z0-9_]+))!\$?([A-Z]+)\$?(\d+)",
+        formula,
+    )
+    if not m:
+        return value
+
+    sheet_name = m.group(1) or m.group(2)
+    if sheet_name not in ws.parent.sheetnames:
+        return value
+
+    ref_col = column_index_from_string(m.group(3))
+    ref_row = int(m.group(4))
+    return _strategy_resolve_header_value(
+        ws.parent[sheet_name],
+        ref_row,
+        ref_col,
+        depth + 1,
+    )
+
+
+def _strategy_header_text(ws, col, header_rows=range(1, 5)):
+    parts = []
+    for r in header_rows:
+        value = _strategy_resolve_header_value(ws, r, col)
+        if value not in (None, ""):
+            parts.append(str(value).strip())
+    return " ".join(parts).strip()
+
+
+def find_strategy_hotel_rate_restriction_cols(ws, hotel_name):
+    """Find current SNT Rate + Restrictions columns.
+
+    Real Strategy layout rule:
+      Restrictions -> current hotel's own rate -> competitor rate columns ->
+      prior-year/current comparison columns.
+
+    Confirmed:
+      Plymouth WKONE   Y -> Z
+      Plymouth WKTHREE Z -> AA
+      Middletown       X -> Y
+      Crowne Pointe    Z -> AA
+
+    Later week tabs often mirror WKONE headers through formulas, so using
+    literal hotel-name text alone is unreliable. The own-rate column is the
+    cell immediately to the right of Restrictions.
+
+    Ashworth remains a special layout: its own rate is the explicit ASH column.
+    """
+    header_max_row = min(4, ws.max_row)
+
+    # Ashworth/Hampton special layout.
+    sheet_title = _strategy_norm(
+        _strategy_resolve_header_value(ws, 1, 1)
+    )
+    requested = _strategy_norm(hotel_name)
+    is_ashworth = (
+        "ASHWORTH" in sheet_title
+        or "ASHWORTH" in requested
+        or "HAMPTON" in requested
+    )
+    if is_ashworth:
+        rate_col = None
+        for c in range(1, ws.max_column + 1):
+            if _strategy_norm(_strategy_header_text(ws, c)) == "ASH":
+                rate_col = c
+                break
+
+        restric_col = _find_restrictions_col(ws)
+        if rate_col:
+            return rate_col, restric_col, (
+                f"Matched Ashworth Strategy rate to ASH column "
+                f"(rate col {rate_col}, restrictions col {restric_col})"
+            )
+
+    restric_col = _find_restrictions_col(ws)
+    if not restric_col:
+        restric_col = find_restrictions_col(ws)
+
+    if not restric_col:
+        return None, None, (
+            f"Could not locate Restrictions for '{hotel_name}'."
+        )
+
+    rate_col = restric_col + 1
+    if rate_col > ws.max_column:
+        return None, restric_col, (
+            f"Restrictions found in col {restric_col}, but there is no "
+            f"column to its right for '{hotel_name}' rate."
+        )
+
+    resolved_header = _strategy_header_text(ws, rate_col)
+    return rate_col, restric_col, (
+        f"Strategy structural mapping for '{hotel_name}': "
+        f"restrictions col {restric_col}, own rate col {rate_col} "
+        f"('{resolved_header}')"
+    )
+
+
+def parse_lighthouse_rates_xlsx(file_bytes):
+    """Parse a Lighthouse rate-shopping workbook."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "Rates" not in wb.sheetnames:
+        raise ValueError("Lighthouse workbook does not contain a 'Rates' tab.")
+
+    ws = wb["Rates"]
+    header_row = None
+    date_col = None
+    for r in range(1, min(ws.max_row, 20) + 1):
+        row_vals = [str(ws.cell(r, c).value or "").strip().lower()
+                    for c in range(1, ws.max_column + 1)]
+        if "date" in row_vals and "day" in row_vals:
+            header_row = r
+            date_col = row_vals.index("date") + 1
+            break
+
+    if header_row is None or date_col is None:
+        raise ValueError(
+            "Could not locate the hotel/date header row on the Lighthouse 'Rates' tab."
+        )
+
+    hotel_cols = {}
+    for c in range(date_col + 2, ws.max_column + 1):
+        name = str(ws.cell(header_row, c).value or "").strip()
+        if not name:
+            continue
+        if _strategy_norm(name) in {"RATECHANGES", "GUESTS", "UPDATED", "MARKETDEMAND"}:
+            continue
+        hotel_cols[c] = name
+
+    if not hotel_cols:
+        raise ValueError("No hotel rate columns were found on the Lighthouse 'Rates' tab.")
+
+    rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        d = parse_any_date(ws.cell(r, date_col).value)
+        if not d:
+            continue
+        rates = {}
+        for c, hotel in hotel_cols.items():
+            val = ws.cell(r, c).value
+            if val is None or val == "":
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                rates[hotel] = float(val)
+            else:
+                rates[hotel] = str(val).strip()
+        rows.append({"date": d, "rates": rates})
+
+    return {"hotels": list(hotel_cols.values()), "rows": rows}
+
+
+def _strategy_name_tokens(value):
+    raw = re.findall(r"[A-Z0-9]+", str(value or "").upper())
+    stop = {"THE", "HOTEL", "INN", "AND", "BY", "AT", "OF", "SUITES", "RESORT", "SPA"}
+    return {t for t in raw if len(t) >= 3 and t not in stop}
+
+
+def _strategy_names_match(a, b):
+    na = _strategy_norm(a)
+    nb = _strategy_norm(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    ta = _strategy_name_tokens(a)
+    tb = _strategy_name_tokens(b)
+    if not ta or not tb:
+        return False
+    overlap = ta & tb
+    if len(overlap) >= 2:
+        return True
+    if len(ta) == 1 and len(tb) == 1 and ta == tb:
+        return True
+    return False
+
+
+def _strategy_header_candidates(ws):
+    out = []
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= 4 and rng.max_row >= 1:
+            label = str(ws.cell(rng.min_row, rng.min_col).value or "").strip()
+            if label:
+                out.append({"label": label, "start": rng.min_col, "end": rng.max_col})
+    for r in range(1, 5):
+        for c in range(1, ws.max_column + 1):
+            label = str(ws.cell(r, c).value or "").strip()
+            if label:
+                out.append({"label": label, "start": c, "end": c})
+    return out
+
+
+def find_strategy_compset_rate_col(ws, lighthouse_hotel):
+    """Find an existing Strategy competitor rate column by hotel name.
+
+    Only rows 1-4 are considered header rows. Extra Lighthouse competitors
+    that are not already present in the Strategy Report are ignored.
+    """
+    header_max_row = min(4, ws.max_row)
+
+    def combined(col):
+        return _strategy_header_text(
+            ws,
+            col,
+            header_rows=range(1, header_max_row + 1),
+        )
+
+    candidates = []
+    for c in range(1, ws.max_column + 1):
+        header = combined(c)
+        if not header:
+            continue
+        compact = re.sub(r"[^A-Z]", "", header.upper())
+        if compact.startswith("RESTRIC"):
+            continue
+        if _strategy_names_match(lighthouse_hotel, header):
+            candidates.append((c, header))
+
+    if not candidates:
+        return None, None
+
+    return min(candidates, key=lambda x: x[0])
+
+
+
+# Lighthouse competitor destinations that have been validated against a
+# corrected Strategy workbook.
+#
+# Key = selected Strategy property (normalized)
+# Values = (Lighthouse source-name fragment, Strategy header fragment)
+#
+# Properties not listed here continue to use the generic existing-header
+# matcher, so this Plymouth correction does not change other hotels.
+LIGHTHOUSE_VALIDATED_COMPSET_MAP = {
+    "HOTEL1620": [
+        ("FAIRFIELDINNSUITES", "FAIRFIELDINNSUITES"),
+        ("BESTWESTERN", "BESTWESTERN"),
+        ("HOLIDAYINNEXPRESS", "HOLIDAYINN"),
+        ("HAMPTONINN", "HAMPTONINN"),
+        ("HILTONGARDENINN", "HILTONGARDEN"),
+    ],
+}
+
+
+def _find_strategy_header_col_by_fragment(ws, fragment):
+    fragment = _strategy_norm(fragment)
+    header_max_row = min(4, ws.max_row)
+
+    for c in range(1, ws.max_column + 1):
+        header = _strategy_header_text(
+            ws,
+            c,
+            header_rows=range(1, header_max_row + 1),
+        )
+        if not header:
+            continue
+
+        compact = _strategy_norm(header)
+        if compact.startswith("RESTRIC"):
+            continue
+
+        if fragment and fragment in compact:
+            return c, header
+
+    return None, None
+
+
+def _validated_lighthouse_matches(ws, lighthouse_data, hotel_name):
+    """Return explicit Lighthouse->Strategy column matches when configured."""
+    prop = _strategy_norm(hotel_name)
+    rules = LIGHTHOUSE_VALIDATED_COMPSET_MAP.get(prop)
+    if not rules:
+        return None
+
+    matched = {}
+    ignored = []
+
+    selected_aliases = _strategy_hotel_aliases(hotel_name)
+
+    for lh_hotel in lighthouse_data.get("hotels", []):
+        lh_norm = _strategy_norm(lh_hotel)
+
+        # Own rate always comes from SNT Rates & Restrictions, never the
+        # Booking.com/Lighthouse file.
+        if any(
+            alias == lh_norm or alias in lh_norm or lh_norm in alias
+            for alias in selected_aliases
+        ):
+            ignored.append(lh_hotel)
+            continue
+
+        target_fragment = None
+
+        for source_fragment, strategy_fragment in rules:
+            if _strategy_norm(source_fragment) in lh_norm:
+                target_fragment = strategy_fragment
+                break
+
+        if not target_fragment:
+            ignored.append(lh_hotel)
+            continue
+
+        rate_col, strategy_label = _find_strategy_header_col_by_fragment(
+            ws, target_fragment
+        )
+        if not rate_col:
+            ignored.append(lh_hotel)
+            continue
+
+        matched[lh_hotel] = rate_col
+
+    return matched, ignored
+
+def build_lighthouse_compset_change_plan(lighthouse_data, wb, sheet_name, hotel_name):
+    if not lighthouse_data:
+        return [], []
+
+    ws = wb[sheet_name]
+    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
+    if not date_row_map:
+        return [], ["Lighthouse: no Strategy Report date rows could be mapped."]
+
+    selected_aliases = _strategy_hotel_aliases(hotel_name)
+    changes = []
+    warnings = []
+
+    validated = _validated_lighthouse_matches(
+        ws, lighthouse_data, hotel_name
+    )
+
+    if validated is not None:
+        # For validated properties, use only the explicitly approved
+        # Lighthouse destinations from the corrected Strategy workbook.
+        matched, ignored = validated
+    else:
+        matched = {}
+        ignored = []
+
+        for lh_hotel in lighthouse_data.get("hotels", []):
+            lh_norm = _strategy_norm(lh_hotel)
+            if any(
+                alias == lh_norm or alias in lh_norm or lh_norm in alias
+                for alias in selected_aliases
+            ):
+                # Selected hotel's own rate belongs to SNT, never Lighthouse.
+                continue
+
+            rate_col, strategy_label = find_strategy_compset_rate_col(
+                ws, lh_hotel
+            )
+            if not rate_col:
+                ignored.append(lh_hotel)
+                continue
+            if rate_col in matched.values():
+                ignored.append(lh_hotel)
+                continue
+            matched[lh_hotel] = rate_col
+
+    for entry in lighthouse_data.get("rows", []):
+        d = entry.get("date")
+        if d not in date_row_map:
+            continue
+        excel_row = date_row_map[d]
+
+        for lh_hotel, value in entry.get("rates", {}).items():
+            rate_col = matched.get(lh_hotel)
+            if not rate_col:
+                continue
+            skip = "formula" if is_formula(ws.cell(excel_row, rate_col).value) else None
+            changes.append({
+                "date": d,
+                "row": excel_row,
+                "col": rate_col,
+                "label": f"Lighthouse Rate — {lh_hotel}",
+                "new_value": value,
+                "skip_reason": skip,
+            })
+
+    if matched:
+        prefix = (
+            "Lighthouse validated compset matched: "
+            if _validated_lighthouse_matches(ws, lighthouse_data, hotel_name) is not None
+            else "Lighthouse compset matched: "
+        )
+        warnings.append(prefix + ", ".join(matched.keys()))
+    else:
+        warnings.append(
+            "Lighthouse compset: none of the competitor hotel names matched existing Strategy Report headers."
+        )
+    if ignored:
+        warnings.append(
+            "Lighthouse compset ignored (not already in Strategy Report or ambiguous): " + ", ".join(ignored)
+        )
+    return changes, warnings
+
+
+def _snt_rate_numeric(value):
+    """Parse SNT numeric fields, including currency-formatted rates."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        return float(value)
+
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "n/a", "na", "-", "--"}:
+        return None
+
+    negative = s.startswith("(") and s.endswith(")")
+    s = (
+        s.replace("$", "")
+         .replace(",", "")
+         .replace("%", "")
+         .replace("(", "")
+         .replace(")", "")
+         .strip()
+    )
+    try:
+        val = float(s)
+        return -val if negative else val
+    except ValueError:
+        return None
+
+
+def _snt_rate_and_mlos_from_row(row):
+    """Read selected-hotel rate + MLOS from StayNTouch R&R exports."""
+    def norm_header(v):
+        return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
+
+    rate = None
+    mlos = None
+
+    rate_exact = (
+        "Double",
+        "Double Rate",
+        "Double Occupancy",
+        "Double Occupancy Rate",
+        "Rate",
+        "Room Rate",
+        "BAR",
+        "BAR Rate",
+        "Base Rate",
+        "Sell Rate",
+        "2 Guests",
+        "2 Guest Rate",
+    )
+    mlos_exact = (
+        "Min Length of Stay",
+        "Minimum Length of Stay",
+        "Minimum Stay",
+        "Min Stay",
+        "MLOS",
+        "Min LOS",
+    )
+
+    for key in rate_exact:
+        if key in row.index:
+            v = _snt_rate_numeric(row.get(key))
+            if v is not None:
+                rate = v
+                break
+
+    for key in mlos_exact:
+        if key in row.index:
+            v = _snt_rate_numeric(row.get(key))
+            if v is not None:
+                mlos = v
+                break
+
+    if rate is None or mlos is None:
+        for col in row.index:
+            nh = norm_header(col)
+            val = row.get(col)
+
+            if rate is None:
+                is_rate = (
+                    nh in {
+                        "double", "doublerate", "doubleoccupancy",
+                        "doubleoccupancyrate", "rate", "roomrate",
+                        "bar", "barrate", "baserate", "sellrate",
+                        "2guests", "2guest", "2guestrate",
+                    }
+                    or ("double" in nh and ("rate" in nh or "occupancy" in nh))
+                )
+                if (
+                    is_rate
+                    and "change" not in nh
+                    and "average" not in nh
+                    and "avg" not in nh
+                ):
+                    v = _snt_rate_numeric(val)
+                    if v is not None:
+                        rate = v
+
+            if mlos is None:
+                is_mlos = (
+                    "minlengthofstay" in nh
+                    or "minimumlengthofstay" in nh
+                    or "minimumstay" in nh
+                    or "minstay" in nh
+                    or nh == "mlos"
+                    or "minlos" in nh
+                )
+                if is_mlos:
+                    v = _snt_rate_numeric(val)
+                    if v is not None:
+                        mlos = v
+
+    return rate, mlos
+
+
+def _find_restrictions_col(ws):
+    """Find the Strategy Restrictions destination column from rows 1-4.
+
+    This avoids assuming a fixed column and supports Ashworth, where the
+    Casino Ballroom section can shift Restrictions to a different position.
+    """
+    if ws is None:
+        return None
+
+    for r in range(1, min(ws.max_row, 4) + 1):
+        for c in range(1, min(ws.max_column, 60) + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            label = re.sub(r"\s+", " ", str(value).strip()).lower()
+            if label in {
+                "restrictions",
+                "restriction",
+                "restrictions / mlos",
+                "restriction / mlos",
+                "mlos / restrictions",
+                "mlos/restrictions",
+            }:
+                return c
+
+    for r in range(1, min(ws.max_row, 4) + 1):
+        for c in range(1, min(ws.max_column, 60) + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            label = re.sub(r"\s+", " ", str(value).strip()).lower()
+            if "restrict" in label:
+                return c
+
+    return None
+
+
+def build_rates_change_plan(rate_df, wb, sheet_name, hotel_name=None):
     today = datetime.date.today()
     # include previous month — final numbers arrive on the 1st of the following month
     prev_month_start = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
@@ -2658,37 +3768,46 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     scope_end = max(date_row_map.keys()) if date_row_map else datetime.date(today.year, 12, 31)
     ws = wb[sheet_name]
 
-    restric_col = find_restrictions_col(ws)
-
-    # Find hotel rate column by scanning right from Restrictions looking for "hotel" or "rate"
-    # Don't assume it's restric_col+1 — there may be intermediate columns (e.g. casino ballroom).
-    # Always read actual column headers, never assume positions.
-    hotel_col = None
-    if restric_col:
-        for c in range(restric_col + 1, min(restric_col + 10, ws.max_column + 1)):
-            hdr3 = str(ws.cell(3, c).value or "").upper()
-            hdr4 = str(ws.cell(4, c).value or "").upper()
-            combined = hdr3 + " " + hdr4
-            if ("HOTEL" in combined or "RATE" in combined) and "BALLROOM" not in combined:
-                hotel_col = c
-                break
-
     changes = []
     warnings = []
+
+    # Standalone mode may not pass hotel_name; infer it from the workbook title.
+    effective_hotel_name = hotel_name or str(ws["A1"].value or "").strip()
+
+    hotel_col = restric_col = None
+    if effective_hotel_name:
+        hotel_col, restric_col, diag = find_strategy_hotel_rate_restriction_cols(
+            ws,
+            effective_hotel_name,
+        )
+        warnings.append(diag)
+    else:
+        warnings.append(
+            "Could not identify the selected hotel for Rates & Restrictions mapping."
+        )
+    if not hotel_col:
+        warnings.append(f"Could not locate the Rate column for selected hotel '{effective_hotel_name or 'Unknown'}'; rates will not be changed.")
     if not restric_col:
-        warnings.append("Could not find Restrictions column in sheet headers.")
-    if not hotel_col and restric_col:
-        warnings.append("Could not find Hotel Rate column after Restrictions.")
+        warnings.append(f"Could not locate the Restrictions column for selected hotel '{effective_hotel_name or 'Unknown'}'; restrictions will not be changed.")
+
+    usable_date_rows = 0
+    usable_rate_rows = 0
+    usable_restriction_rows = 0
 
     for _, row in rate_df.iterrows():
-        date_str = str(row.get("Date", "")).strip()
-        d = None
-        for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
+        # SNT exports can represent Date as M/D/YYYY, ISO text, an Excel
+        # date, or a pandas/datetime value depending on how the CSV was saved.
+        # Use the app-wide parser instead of accepting only three string formats.
+        raw_date = row.get("Date", "")
+        d = parse_any_date(raw_date)
+        if d is None:
+            # pandas may stringify Timestamp values with a time suffix.
             try:
-                d = datetime.datetime.strptime(date_str, fmt).date()
-                break
-            except ValueError:
-                continue
+                parsed = pd.to_datetime(raw_date, errors="coerce")
+                if not pd.isna(parsed):
+                    d = parsed.date()
+            except Exception:
+                d = None
         if d is None:
             continue
         if d < scope_start or d > scope_end:
@@ -2697,17 +3816,52 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
             continue
 
         excel_row  = date_row_map[d]
-        double_val = safe_float(row.get("Double", ""))
-        mlos_val   = safe_float(row.get("Min Length of Stay", ""))
+        usable_date_rows += 1
+        double_val, mlos_val = _snt_rate_and_mlos_from_row(row)
 
-        if hotel_col:
-            skip = "formula" if is_formula(ws.cell(excel_row, hotel_col).value) else None
-            changes.append({"date": d, "row": excel_row, "col": hotel_col,
-                            "label": "Hotel Rate", "new_value": double_val, "skip_reason": skip})
-        if restric_col:
+        if double_val is not None:
+            usable_rate_rows += 1
+        if mlos_val is not None:
+            usable_restriction_rows += 1
+
+        if hotel_col and double_val is not None:
+            existing = ws.cell(excel_row, hotel_col).value
+            skip = (
+                "formula"
+                if is_formula(existing) and "!" not in str(existing)
+                else None
+            )
+            changes.append({
+                "date": d, "row": excel_row, "col": hotel_col,
+                "label": "Hotel Rate (SNT)", "new_value": double_val,
+                "skip_reason": skip
+            })
+        if restric_col and mlos_val is not None:
             skip = "formula" if is_formula(ws.cell(excel_row, restric_col).value) else None
-            changes.append({"date": d, "row": excel_row, "col": restric_col,
-                            "label": "Restrictions (MLOS)", "new_value": mlos_val, "skip_reason": skip})
+            changes.append({
+                "date": d, "row": excel_row, "col": restric_col,
+                "label": "Restrictions (MLOS)", "new_value": mlos_val,
+                "skip_reason": skip
+            })
+
+    if rate_df is not None and len(rate_df):
+        warnings.append(
+            "Rates & Restrictions parsed: "
+            f"{len(rate_df)} source rows · "
+            f"{usable_date_rows} dates matched this Strategy tab · "
+            f"{usable_rate_rows} usable rates · "
+            f"{usable_restriction_rows} usable restrictions."
+        )
+        if usable_date_rows == 0:
+            warnings.append(
+                "Rates & Restrictions: none of the source dates matched "
+                "the dates on this Strategy tab."
+            )
+        elif usable_rate_rows == 0:
+            warnings.append(
+                "Rates & Restrictions: dates matched, but no usable rate "
+                "values were found in the source."
+            )
 
     return changes, warnings
 
@@ -2786,10 +3940,13 @@ def locate_forecast_rows(ws):
 
 
 def build_forecast_date_col_map(ws, wb=None, date_row=4):
-    """Return {date: col_index} from date_row. Falls back to WK1 for formula-only sheets."""
+    """Return {date: col_index} for the complete calendar month.
+
+    Once the month start is known, map every real day through month-end even
+    when the template forgot to prefill the last date cell.
+    """
     month_start = parse_any_date(ws.cell(date_row, 2).value)
 
-    # If this sheet's col B is a formula, find the start date from any WK sheet with a literal
     if month_start is None and wb is not None:
         for sname in wb.sheetnames:
             if "glance" in sname.lower():
@@ -2802,27 +3959,16 @@ def build_forecast_date_col_map(ws, wb=None, date_row=4):
     if month_start is None:
         return {}
 
-    col_map = {}
-    col = 2
-    while col <= ws.max_column:
-        cell = ws.cell(date_row, col)
-        if isinstance(cell.value, str) and "total" in cell.value.lower():
-            break
-        if cell.value is None and col > 2:
-            break
-        d = month_start + datetime.timedelta(days=col - 2)
-        # One workbook covers one month. The templates carry 31 date columns
-        # and most chain them straight through (=prev+1), so in a 30-day month
-        # the last one computes to the 1st of the *next* month — confirmed on a
-        # real June file, where the map ran to 1 Jul. Some hotels blank that
-        # cell by hand and some don't, so the month end is what decides, not
-        # how many columns the sheet happens to have. Left in, a foreign day
-        # lands inside this month's Totals column.
-        if (d.year, d.month) != (month_start.year, month_start.month):
-            break
-        col_map[d] = col
-        col += 1
-    return col_map
+    month_start = month_start.replace(day=1)
+    days_in_month = calendar.monthrange(
+        month_start.year,
+        month_start.month,
+    )[1]
+
+    return {
+        datetime.date(month_start.year, month_start.month, day): day + 1
+        for day in range(1, days_in_month + 1)
+    }
 
 
 def row_is_filled(ws, r):
@@ -3227,20 +4373,16 @@ def _extract_hotel_name_from_rev_folder(name):
 
 @st.cache_data(ttl=300)
 def get_hotels_from_drive():
-    """Return list of (display_name, folder_id) for every top-level folder
-    that contains a 'REVENUE REPORTS' subfolder — i.e. each hotel folder.
-    Cached for 5 minutes so it doesn't hit Drive on every rerender.
+    """Return one Drive target per known hotel.
 
-    Some hotels are shared with the service account directly at the REVENUE
-    REPORTS folder level, not its parent — this happens on Shared Drives
-    where the person granting access can only share folders they themselves
-    have permission on, and Drive permissions don't propagate upward to a
-    parent. Some of those hotels additionally have a SEPARATE REVENUE
-    REPORTS folder per year (confirmed real case: Hyannis Anchor In), each
-    shared individually since there's no common parent to share instead —
-    those get grouped into a single hotel entry by name, with folder_id set
-    to 'MULTI:<id>,<id>,...' listing every year's folder. resolve_drive_workbook
-    and _find_rev_reports_folder_for_year both know how to unpack this.
+    Drive discovery is intentionally done in two cheap stages:
+      1. Fetch all visible folders in paginated batches, including parent IDs.
+      2. Examine only folders whose names are Revenue Reports folders.
+
+    Revenue-report folders are grouped directly to the canonical hotel labels
+    already declared in PORTFOLIO_HOTELS. This keeps every year's folder ID
+    available for prior-month / prior-year lookups without scanning thousands
+    of unrelated folders or making one API request per folder.
     """
     try:
         svc = get_drive_service()
@@ -3248,78 +4390,85 @@ def get_hotels_from_drive():
 
         folders = []
         page_token = None
+
         while True:
             result = svc.files().list(
                 q=q,
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken, files(id, name, parents)",
                 pageSize=1000,
                 pageToken=page_token,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             ).execute()
+
             folders.extend(result.get("files", []))
             page_token = result.get("nextPageToken")
             if not page_token:
                 break
 
-        hotels = []
-        known_groups = {}
-        rev_groups = []
+        # Parent names let us identify a generic folder named only
+        # "REVENUE REPORTS" from the hotel folder it lives under.
+        folder_by_id = {f["id"]: f for f in folders}
+
+        # Canonical hotel label -> every Revenue Reports folder ID visible
+        # for that hotel, across all years/months.
+        grouped = {}
 
         for folder in folders:
-            name = folder["name"]
+            name = str(folder.get("name", "") or "")
             name_upper = name.upper()
 
             if "ANCILLARY" in name_upper:
                 continue
-
-            known_match = next((hn for hn, kws in KNOWN_MULTI_FOLDER_HOTELS.items()
-                                 if any(kw in name_upper for kw in kws)), None)
-            if known_match:
-                known_groups.setdefault(known_match, []).append(folder["id"])
+            if not _is_rev_reports_name(name):
                 continue
 
-            if _is_rev_reports_name(name):
-                extracted = _extract_hotel_name_from_rev_folder(name)
-                if not extracted:
-                    continue
-                norm = extracted.upper()
-                match = next((g for g in rev_groups
-                              if norm in g["display"].upper() or g["display"].upper() in norm), None)
-                if match:
-                    match["ids"].append(folder["id"])
-                    if len(extracted) > len(match["display"]):
-                        match["display"] = extracted
-                else:
-                    rev_groups.append({"display": extracted, "ids": [folder["id"]]})
+            extracted = _extract_hotel_name_from_rev_folder(name)
+
+            parent_names = []
+            for parent_id in folder.get("parents", []):
+                parent = folder_by_id.get(parent_id)
+                if parent:
+                    parent_names.append(str(parent.get("name", "") or ""))
+
+            # Search the folder name, extracted hotel name, and visible parent
+            # name against the app's existing portfolio hotel aliases.
+            haystack = " ".join(
+                [name, extracted] + parent_names
+            ).upper()
+
+            canonical = None
+            for _portfolio, members in PORTFOLIO_HOTELS.items():
+                for hotel_label, keywords in members.items():
+                    if any(keyword.upper() in haystack for keyword in keywords):
+                        canonical = hotel_label
+                        break
+                if canonical:
+                    break
+
+            if not canonical:
                 continue
 
-            if re.search(r'\b20\d{2}\b', name):
-                continue
+            grouped.setdefault(canonical, []).append(folder["id"])
 
-            child_q = ("'%s' in parents and trashed = false and "
-                       "mimeType = 'application/vnd.google-apps.folder'") % folder["id"]
-            children = svc.files().list(
-                q=child_q, fields="files(name)", pageSize=20,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute()
-            has_rev = any(_is_rev_reports_name(c["name"]) for c in children.get("files", []))
-            if has_rev:
-                hotels.append((_strip_dedup_suffix(name), folder["id"]))
+        hotels = []
+        for hotel_label, ids in grouped.items():
+            # De-duplicate IDs while preserving Drive discovery order.
+            ids = list(dict.fromkeys(ids))
+            folder_id = (
+                ids[0]
+                if len(ids) == 1
+                else MULTI_ID_PREFIX + ",".join(ids)
+            )
+            hotels.append((hotel_label, folder_id))
 
-        for hotel_name, ids in known_groups.items():
-            hotels.append((_strip_dedup_suffix(hotel_name),
-                           ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
-
-        for info in rev_groups:
-            display = _strip_dedup_suffix(info["display"])
-            if len(info["ids"]) == 1:
-                hotels.append((display, info["ids"][0]))
-            else:
-                hotels.append((display, MULTI_ID_PREFIX + ",".join(info["ids"])))
-
-        hotels = [(name, fid) for name, fid in hotels if not _is_test_folder(name)]
+        hotels = [
+            (name, fid)
+            for name, fid in hotels
+            if not _is_test_folder(name)
+        ]
         return sorted(hotels, key=lambda x: x[0])
+
     except Exception:
         return []
 
@@ -3339,6 +4488,21 @@ def _is_test_folder(name: str) -> bool:
 
 
 WORKBOOK_TYPES = ["ROB", "Strategy Report", "Forecast"]
+NEXT_YEAR_ROB_TYPE = "Next-Year ROB"
+
+
+def next_year_rob_enabled(today=None):
+    """The portfolio starts next-year ROB tracking in October."""
+    today = today or datetime.date.today()
+    return today.month >= 10
+
+
+def portfolio_workbook_options(portfolio):
+    options = list(PORTFOLIO_WORKBOOKS[portfolio])
+    if next_year_rob_enabled():
+        options.insert(1, NEXT_YEAR_ROB_TYPE)
+    return options
+
 
 # ── Portfolios ───────────────────────────────────────────────────────────────
 # Hotels are discovered from Drive folder names, which carry no notion of
@@ -3362,7 +4526,7 @@ PORTFOLIO_HOTELS = {
         "Brass Key":      ["BRASS"],
         "Long Beach":     ["LONG BEACH", "ALLEGRIA"],
         "Westerly":       ["WESTERLY", "PLEASANT VIEW"],
-        "Crown Point":    ["CROWN", "CROWNE"],
+        "Crowne Pointe":  ["CROWN", "CROWNE"],
         "Ashworth":       ["ASHWORTH", "HAMPTON BEACH"],
         "Anchor Inn":     ["ANCHOR"],
         "Surfside":       ["SURFSIDE"],
@@ -3609,12 +4773,13 @@ def service_account_email():
 # declared hotel and reports a sharing problem when one is actually run.
 
 
-def drive_find_folder_by_keyword(service, keyword, parent_id=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def drive_find_folder_by_keyword(_service, keyword, parent_id=None):
     """Return the first folder whose name contains keyword (case-insensitive)."""
     q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += " and '%s' in parents" % parent_id
-    result = service.files().list(
+    result = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
@@ -3624,8 +4789,12 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     return None, None
 
 def _explicit_folder_year(name):
-    """Return an explicit 20xx year found in a folder name, or None."""
-    match = re.search(r"\b(20\d{2})\b", str(name or ""))
+    """Return an explicit 20xx year found in a folder name, or None.
+
+    Works for both spaced names like "2026 REVENUE REPORTS" and compact
+    month/year names like "JUL2027 REVENUE REPORTS".
+    """
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", str(name or ""))
     return int(match.group(1)) if match else None
 def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     """Rank REVENUE REPORTS folder candidates for a target month/year.
@@ -3702,7 +4871,8 @@ def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
 
     return None
 
-def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def _find_rev_reports_folder_for_year(_service, hotel_id, year_kw, month_kw=None):
     """Find the REVENUE REPORTS folder to use for a given year (and,
     preferably, the specific target month — see _pick_rev_reports_candidate
     for the ranking; the old first-year-substring-match behavior silently
@@ -3719,7 +4889,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
         candidates = []
         for cid in candidate_ids:
             try:
-                info = service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
+                info = _service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
                 candidates.append({"id": cid, "name": info["name"]})
             except Exception:
                 continue
@@ -3730,7 +4900,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
 
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
          "and '%s' in parents") % hotel_id
-    children = service.files().list(
+    children = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
@@ -3746,7 +4916,7 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
     # IS that folder already in that case, not its parent, so there's no
     # child to find. Check hotel_id's own name before giving up.
     try:
-        self_info = service.files().get(
+        self_info = _service.files().get(
             fileId=hotel_id, fields="name", supportsAllDrives=True
         ).execute()
         if "revenue reports" in self_info.get("name", "").lower():
@@ -3757,7 +4927,8 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw=None)
     return None, None
 
 
-def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name):
+@st.cache_data(ttl=600, show_spinner=False)
+def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_month, hotel_name):
     """Locate the month folder for a new-month setup, handling both layouts:
     month folders directly inside the REVENUE REPORTS folder (common when
     there's one REVENUE REPORTS folder per year), or nested under a year
@@ -3778,7 +4949,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
     # names the target month — it IS the month folder; there is no month
     # subfolder inside it to find.
     try:
-        rev_info = service.files().get(fileId=rev_id, fields="name", supportsAllDrives=True).execute()
+        rev_info = _service.files().get(fileId=rev_id, fields="name", supportsAllDrives=True).execute()
         rev_name = rev_info.get("name", "")
         month_kw_2digit = month_kw[:3] + month_kw[-2:]
         if month_kw in rev_name.upper() or month_kw_2digit in rev_name.upper():
@@ -3786,13 +4957,13 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
     except Exception:
         pass
 
-    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=rev_id)
+    month_id, month_name = drive_find_folder_by_keyword(_service, month_kw, parent_id=rev_id)
     if month_id:
         return month_id, month_name
 
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
          "and '%s' in parents") % rev_id
-    siblings = service.files().list(
+    siblings = _service.files().list(
         q=q, fields="files(id, name)", pageSize=100,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute().get("files", [])
@@ -3803,7 +4974,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
             year_id = f["id"]
             break
     if year_id:
-        return drive_find_month_folder(service, year_id, month_kw)
+        return drive_find_month_folder(_service, year_id, month_kw)
 
     # Fallback: search recursively through nested folders (handles deep nesting like SALEM)
     # Some hotels have multiple intermediate folders before reaching the month folder
@@ -3813,7 +4984,7 @@ def _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_mont
         try:
             q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
                  "and '%s' in parents") % parent_id
-            children = service.files().list(
+            children = _service.files().list(
                 q=q, fields="files(id, name)", pageSize=100,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute().get("files", [])
@@ -3869,14 +5040,23 @@ def drive_find_file(service, keyword, parent_id):
     return None, None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _drive_mime_type(_service, file_id):
+    return _service.files().get(
+        fileId=file_id,
+        fields="mimeType",
+        supportsAllDrives=True,
+    ).execute().get("mimeType")
+
+
 def drive_download(service, file_id) -> bytes:
     """Download a file's bytes. Native Google Sheets (created directly in
     Drive rather than uploaded as .xlsx — confirmed real case: Hotel 1620's
     Forecast workbook) can't be read via get_media like a normal blob file;
     they must be exported to xlsx format instead."""
-    meta = service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+    mime_type = _drive_mime_type(service, file_id)
     buf = io.BytesIO()
-    if meta.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+    if mime_type == "application/vnd.google-apps.spreadsheet":
         req = service.files().export_media(
             fileId=file_id,
             mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3909,6 +5089,307 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     # every workbook type, despite the same file_id having just been read
     # successfully moments earlier.
     service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+
+
+def _ancillary_normalize_drive_name(value):
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
+def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
+    """Find the hotel's existing Canary/SNT ancillary workbook in Drive.
+
+    Important folder rule:
+      The Ancillary Revenue folder is NOT inside the monthly Revenue Reports
+      folder. It is a separate sibling/descendant under the hotel's Drive tree,
+      e.g.:
+          G: JUL2026 REVENUE REPORTS WOLFEBORO
+          M: ANCILLARY REVENUE REPORTS WOLFEBORO
+
+    Therefore, search from the HOTEL folder tree itself, not from the selected
+    month's Revenue Reports folder.
+
+    Folder match:
+      - ANCILLARY REVENUE REPORTS
+      - ANCILLARY REVENUE FILES
+
+    Workbook match inside that folder:
+      - filename contains REPORT
+      - and contains CANARY or SNT (or both)
+
+    Matching is case/punctuation insensitive. If multiple valid workbooks exist,
+    use the most recently modified one.
+    """
+
+    # Keep the Revenue Reports folder only as a helpful diagnostic so the UI can
+    # still show which year/month tree the hotel resolver sees.
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b").upper()
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
+
+    # Search from every known hotel-scope folder, not from rev_id.
+    scope_ids = _hotel_search_scope_ids(service, hotel_id)
+    if not scope_ids:
+        scope_ids = [hotel_id]
+
+    ancillary_folders = []
+    seen = set()
+    frontier = [(sid, 0) for sid in scope_ids]
+    max_depth = 4
+
+    while frontier:
+        parent_id, depth = frontier.pop(0)
+        if not parent_id or parent_id in seen:
+            continue
+        seen.add(parent_id)
+
+        if depth >= max_depth:
+            continue
+
+        q = (
+            "mimeType='application/vnd.google-apps.folder' and trashed=false "
+            f"and '{parent_id}' in parents"
+        )
+
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=q,
+                fields="nextPageToken,files(id,name,modifiedTime,parents)",
+                pageSize=200,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            for f in resp.get("files", []):
+                fid = f.get("id")
+                if not fid:
+                    continue
+
+                n = _ancillary_normalize_drive_name(f.get("name"))
+                if (
+                    "ANCILLARY REVENUE REPORTS" in n
+                    or "ANCILLARY REVENUE FILES" in n
+                ):
+                    ancillary_folders.append({
+                        **f,
+                        "_depth": depth + 1,
+                    })
+                else:
+                    frontier.append((fid, depth + 1))
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    if not ancillary_folders:
+        return None, (
+            f"No folder containing 'Ancillary Revenue Reports' or "
+            f"'Ancillary Revenue Files' was found in {hotel_name}'s Drive tree."
+        )
+
+    # Prefer the shallowest match; if tied, prefer most recently modified.
+    ancillary_folders.sort(
+        key=lambda f: (
+            f.get("_depth", 99),
+            str(f.get("modifiedTime", "")),
+        )
+    )
+    min_depth = ancillary_folders[0].get("_depth", 99)
+    same_depth = [
+        f for f in ancillary_folders
+        if f.get("_depth", 99) == min_depth
+    ]
+    same_depth.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    anc_folder = same_depth[0]
+
+    # Find the report workbook directly inside the ancillary folder.
+    q = f"trashed=false and '{anc_folder['id']}' in parents"
+    files = service.files().list(
+        q=q,
+        fields="files(id,name,mimeType,modifiedTime)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    candidates = []
+    for f in files:
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            continue
+
+        n = _ancillary_normalize_drive_name(f.get("name"))
+        if "REPORT" not in n:
+            continue
+        if "CANARY" not in n and "SNT" not in n:
+            continue
+        candidates.append(f)
+
+    if not candidates:
+        return None, (
+            f"{anc_folder['name']}: no report workbook containing "
+            f"'Canary' or 'SNT' was found."
+        )
+
+    candidates.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    target = candidates[0]
+
+    return {
+        "file_id": target["id"],
+        "file_name": target["name"],
+        "mime_type": target.get("mimeType", ""),
+        "folder_id": anc_folder["id"],
+        "folder_name": anc_folder["name"],
+        "revenue_folder_id": rev_id,
+        "revenue_folder_name": rev_name or f"{report_month.year} Revenue Reports",
+    }, None
+
+
+def _ancillary_month_sheet_name(wb, report_month):
+    """Return the existing month sheet name or the standard new name."""
+    abbr = report_month.strftime("%b").upper()
+    year = str(report_month.year)
+
+    # Exact month abbreviation is the portfolio standard.
+    if abbr in wb.sheetnames:
+        return abbr
+
+    # Reuse an existing month-specific variant such as "AUG 2026" or
+    # "AUGUST" instead of creating a duplicate month tab.
+    for name in wb.sheetnames:
+        norm = _ancillary_normalize_drive_name(name)
+        if not norm.startswith(abbr):
+            continue
+        if (
+            "PIVOT" in norm
+            or "RAW" in norm
+            or "TEMPLATE" in norm
+            or "CONTROL" in norm
+        ):
+            continue
+        if year in norm or norm in {abbr, report_month.strftime("%B").upper()}:
+            return name
+
+    return abbr
+
+
+def _ancillary_copy_generated_sheet(src_ws, dst_ws):
+    """Copy a generated Report sheet into an existing monthly workbook."""
+    from copy import copy as _copy
+
+    # Column dimensions
+    for key, dim in src_ws.column_dimensions.items():
+        d = dst_ws.column_dimensions[key]
+        d.width = dim.width
+        d.hidden = dim.hidden
+        d.bestFit = dim.bestFit
+        d.outlineLevel = dim.outlineLevel
+
+    # Row dimensions
+    for idx, dim in src_ws.row_dimensions.items():
+        d = dst_ws.row_dimensions[idx]
+        d.height = dim.height
+        d.hidden = dim.hidden
+        d.outlineLevel = dim.outlineLevel
+
+    # Cells/styles
+    for row in src_ws.iter_rows():
+        for src_cell in row:
+            dst_cell = dst_ws[src_cell.coordinate]
+            dst_cell.value = src_cell.value
+            if src_cell.has_style:
+                dst_cell._style = _copy(src_cell._style)
+            if src_cell.number_format:
+                dst_cell.number_format = src_cell.number_format
+            dst_cell.font = _copy(src_cell.font)
+            dst_cell.fill = _copy(src_cell.fill)
+            dst_cell.border = _copy(src_cell.border)
+            dst_cell.alignment = _copy(src_cell.alignment)
+            dst_cell.protection = _copy(src_cell.protection)
+            if src_cell.hyperlink:
+                dst_cell._hyperlink = _copy(src_cell.hyperlink)
+            if src_cell.comment:
+                dst_cell.comment = _copy(src_cell.comment)
+
+    # Merges
+    for merged in src_ws.merged_cells.ranges:
+        dst_ws.merge_cells(str(merged))
+
+    # Sheet-level settings
+    dst_ws.freeze_panes = src_ws.freeze_panes
+    dst_ws.sheet_view.showGridLines = src_ws.sheet_view.showGridLines
+    dst_ws.sheet_format.defaultColWidth = src_ws.sheet_format.defaultColWidth
+    dst_ws.sheet_format.defaultRowHeight = src_ws.sheet_format.defaultRowHeight
+    dst_ws.page_margins = _copy(src_ws.page_margins)
+    dst_ws.page_setup = _copy(src_ws.page_setup)
+    dst_ws.print_options = _copy(src_ws.print_options)
+    dst_ws.sheet_properties = _copy(src_ws.sheet_properties)
+
+    # Conditional formatting
+    for cf_obj, rules in src_ws.conditional_formatting._cf_rules.items():
+        for rule in rules:
+            dst_ws.conditional_formatting.add(
+                _copy(cf_obj),
+                _copy(rule),
+            )
+
+
+def ancillary_insert_report_sheet(
+    destination_bytes,
+    generated_bytes,
+    report_month,
+    destination_name="",
+):
+    """Replace/create the monthly sheet inside the existing Canary/SNT report."""
+    keep_vba = str(destination_name or "").lower().endswith(".xlsm")
+
+    dest_wb = openpyxl.load_workbook(
+        io.BytesIO(destination_bytes),
+        data_only=False,
+        keep_vba=keep_vba,
+    )
+    generated_wb = openpyxl.load_workbook(
+        io.BytesIO(generated_bytes),
+        data_only=False,
+    )
+
+    if "Report" not in generated_wb.sheetnames:
+        raise ValueError("Generated ancillary workbook has no Report sheet.")
+
+    sheet_name = _ancillary_month_sheet_name(dest_wb, report_month)
+
+    # Replace only this month's sheet; preserve every other month and pivot tab.
+    if sheet_name in dest_wb.sheetnames:
+        old_idx = dest_wb.sheetnames.index(sheet_name)
+        del dest_wb[sheet_name]
+    else:
+        pivot_idx = next(
+            (
+                i
+                for i, name in enumerate(dest_wb.sheetnames)
+                if "PIVOT" in name.upper()
+            ),
+            len(dest_wb.sheetnames),
+        )
+        old_idx = pivot_idx
+
+    dst_ws = dest_wb.create_sheet(sheet_name, old_idx)
+    _ancillary_copy_generated_sheet(generated_wb["Report"], dst_ws)
+
+    out = io.BytesIO()
+    dest_wb.save(out)
+    return out.getvalue(), sheet_name
 
 
 def drive_find_month_folder(service, parent_id: str, month_kw: str):
@@ -3944,7 +5425,8 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
     return copied["id"], copied["name"]
 
 
-def _hotel_search_scope_ids(service, hotel_id):
+@st.cache_data(ttl=600, show_spinner=False)
+def _hotel_search_scope_ids(_service, hotel_id):
     """Return every folder id that could plausibly hold a hotel's MASTER
     template files: each of the hotel's own root candidate folder(s)
     (unwrapping a MULTI:<id>,<id>,... group) plus their direct children.
@@ -3965,7 +5447,7 @@ def _hotel_search_scope_ids(service, hotel_id):
         q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
              "and '%s' in parents") % rid
         try:
-            children = service.files().list(
+            children = _service.files().list(
                 q=q, fields="files(id)", pageSize=100,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute().get("files", [])
@@ -3975,23 +5457,83 @@ def _hotel_search_scope_ids(service, hotel_id):
     return scope_ids
 
 
-def find_rob_master(service, hotel_id: str):
-    """Search the hotel's own Drive tree for the ROB master file."""
+def find_rob_master(service, hotel_id: str, target_year=None):
+    """Search the hotel's own Drive tree for the correct ROB master.
+
+    If target_year is supplied, prefer a master explicitly associated with
+    that year by either its filename or its parent-folder name. A master that
+    is explicitly associated with a different year is never selected.
+    """
     scope_ids = _hotel_search_scope_ids(service, hotel_id)
     if not scope_ids:
         return None, "Could not resolve hotel folder to search."
+
     parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
-    q = ("trashed=false and (%s) "
-         "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-         "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
-         "and name contains 'MASTER' and name contains 'ROB'") % parent_clause
+    q = (
+        "trashed=false and (%s) "
+        "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
+        "and name contains 'MASTER' and name contains 'ROB'"
+    ) % parent_clause
+
     result = service.files().list(
-        q=q, fields="files(id,name,parents)", pageSize=50,
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        q=q,
+        fields="files(id,name,parents,modifiedTime)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
-    for f in result.get("files", []):
-        return f["id"], f["name"]
-    return None, "No ROB master file found in Drive."
+
+    candidates = result.get("files", [])
+    if not candidates:
+        return None, "No ROB master file found in Drive."
+
+    def explicit_year(value):
+        m = re.search(r"(?<!\\d)(20\\d{2})(?!\\d)", str(value or ""))
+        return int(m.group(1)) if m else None
+
+    parent_name_cache = {}
+
+    def candidate_years(file_obj):
+        years = set()
+        fy = explicit_year(file_obj.get("name"))
+        if fy:
+            years.add(fy)
+        for pid in file_obj.get("parents", []) or []:
+            if pid not in parent_name_cache:
+                try:
+                    info = service.files().get(
+                        fileId=pid,
+                        fields="name",
+                        supportsAllDrives=True,
+                    ).execute()
+                    parent_name_cache[pid] = info.get("name", "")
+                except Exception:
+                    parent_name_cache[pid] = ""
+            py = explicit_year(parent_name_cache[pid])
+            if py:
+                years.add(py)
+        return years
+
+    eligible = []
+    for f in candidates:
+        years = candidate_years(f)
+
+        # Explicitly wrong-year masters are not eligible.
+        if target_year is not None and years and target_year not in years:
+            continue
+
+        score = 2 if (target_year is not None and target_year in years) else 1
+        eligible.append((score, str(f.get("modifiedTime", "")), f))
+
+    if not eligible:
+        if target_year is not None:
+            return None, f"No ROB master for {target_year} was found in this hotel's Drive folders."
+        return None, "No eligible ROB master file found in Drive."
+
+    eligible.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = eligible[0][2]
+    return best["id"], best["name"]
 
 
 def _is_rob_month_blank(ws, block_start):
@@ -4049,300 +5591,933 @@ def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
     return None
 
 
-def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
-    """Fill the 'Week 1 Previous Sheet - CALCULATION ONLY' table in wk1.
-    Scans dynamically for header, year columns, and month rows.
-    Pulls Revenue from last completed week tab of prev ROB."""
+def _rob_cell_is_writable(ws, row, col):
+    """True when a ROB setup cell can safely receive a value.
 
-    month_abbrs = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+    Northbrook's ROB master contains vertically merged cells inside monthly
+    blocks (for example H5:H7). openpyxl represents every merged cell except
+    the top-left anchor as MergedCell, whose .value is read-only.
+
+    Setup should preserve those merged sections, so non-anchor merged cells are
+    skipped instead of being assigned.
+    """
+    cell = ws.cell(row, col)
+    if cell.__class__.__name__ == "MergedCell":
+        return False
+
+    # Defensive check for regular Cell objects that belong to a merge range.
+    for rng in ws.merged_cells.ranges:
+        if (
+            rng.min_row <= row <= rng.max_row
+            and rng.min_col <= col <= rng.max_col
+        ):
+            return row == rng.min_row and col == rng.min_col
+
+    return True
+
+
+def _rob_set_value(ws, row, col, value, number_format=None):
+    """Merged-cell-safe ROB setup write. Returns True when written."""
+    if not _rob_cell_is_writable(ws, row, col):
+        return False
+    cell = ws.cell(row, col)
+    cell.value = value
+    if number_format is not None:
+        cell.number_format = number_format
+    return True
+
+
+
+def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracked_year=None):
+    """Fill Week 1 Previous Sheet from one prior-month completed week.
+
+    Source rule:
+      1. Look at the previous month's ROB workbook.
+      2. Starting with the latest week tab, find the last week where the
+         PREVIOUS MONTH's current-year Revenue / Room Nights cells are
+         actually populated in the data-only workbook.
+      3. Once that week is selected, copy ONLY each month's Revenue row from
+         that one sheet into the Week 1 Previous table.
+
+    This table must never use Pickup WoW rows or mix source weeks.
+    """
+    month_abbrs = [
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec"
+    ]
 
     def _as_year(v):
-        """Try to extract a 4-digit year from a cell value (int, float, str, date)."""
         if isinstance(v, (datetime.datetime, datetime.date)):
             return v.year
         if isinstance(v, (int, float)):
             iv = int(v)
             if 2000 <= iv <= 2100:
                 return iv
-            # Excel date serial — convert
             if 40000 <= iv <= 60000:
                 try:
-                    d = datetime.date(1899, 12, 30) + datetime.timedelta(days=iv)
-                    return d.year
+                    return (
+                        datetime.date(1899, 12, 30)
+                        + datetime.timedelta(days=iv)
+                    ).year
                 except Exception:
                     pass
         if isinstance(v, str):
-            s = v.strip()
-            if s.isdigit() and 2000 <= int(s) <= 2100:
-                return int(s)
+            m = re.search(r"\b(20\d{2})\b", v)
+            if m:
+                return int(m.group(1))
         return None
 
-    # ── 1. Find header cell ───────────────────────────────────────────────────
+    # ----- Locate Week 1 Previous table -----
     hdr_row = hdr_col = None
-    for r in range(1, min(wk1_ws.max_row + 1, 60)):
+    for r in range(1, min(wk1_ws.max_row + 1, 80)):
         for c in range(1, wk1_ws.max_column + 1):
             val = str(wk1_ws.cell(r, c).value or "").strip().lower()
-            if "week 1 previous" in val or ("calculation only" in val and "week" in val):
+            if (
+                "week 1 previous" in val
+                or ("calculation only" in val and "week" in val)
+            ):
                 hdr_row, hdr_col = r, c
                 break
         if hdr_row:
             break
+
     if not hdr_row:
         return "Week 1 Previous Sheet table not found in wk one"
 
-    years_in_order = [target_month.year - 3, target_month.year - 2,
-                      target_month.year - 1, target_month.year]
-
-    # ── 2. Find month label column first (Jan/Feb… to the LEFT of year cols) ─
+    # ----- Destination month rows -----
     month_label_col = None
-    for r in range(hdr_row + 1, hdr_row + 35):
-        for c in range(max(1, hdr_col - 5), hdr_col + 5):
-            v = str(wk1_ws.cell(r, c).value or "").strip().lower()
-            if v in month_abbrs:
+    for r in range(hdr_row + 1, min(wk1_ws.max_row + 1, hdr_row + 40)):
+        for c in range(
+            max(1, hdr_col - 5),
+            min(wk1_ws.max_column + 1, hdr_col + 8)
+        ):
+            if str(wk1_ws.cell(r, c).value or "").strip().lower() in month_abbrs:
                 month_label_col = c
                 break
         if month_label_col:
             break
+
     if not month_label_col:
         return "Could not find month label column in Week 1 Previous Sheet table"
 
-    # ── 3. Collect all month rows using that exact column ─────────────────────
-    dest_month_row = {}  # month_idx (0-based) → row
-    for r in range(hdr_row + 1, hdr_row + 35):
+    dest_month_row = {}
+    for r in range(hdr_row + 1, min(wk1_ws.max_row + 1, hdr_row + 40)):
         v = str(wk1_ws.cell(r, month_label_col).value or "").strip().lower()
         if v in month_abbrs:
             dest_month_row[month_abbrs.index(v)] = r
-    if not dest_month_row:
-        return "Could not find month rows in Week 1 Previous Sheet table"
 
-    # ── 4. Find year columns — scan to the RIGHT of month label col ───────────
-    year_start_col = month_label_col + 1
-    dest_year_col = {}  # year (int) → col in new wk1
+    # ----- Destination year columns -----
+    tracked_year = tracked_year or target_month.year
+    expected_years = [
+        tracked_year - 3,
+        tracked_year - 2,
+        tracked_year - 1,
+        tracked_year,
+    ]
 
-    for dr in range(1, 8):
-        # Try parsing actual year values
-        parsed = {}
-        for c in range(year_start_col, year_start_col + 20):
-            yr = _as_year(wk1_ws.cell(hdr_row + dr, c).value)
-            if yr:
-                parsed[yr] = c
-        if parsed:
-            dest_year_col = parsed
+    # The Week 1 Previous table is always four consecutive year columns
+    # immediately to the right of the month labels. Do NOT trust the literal
+    # year headers already printed in the master — some masters still carry
+    # the prior year's header stack (e.g. 2022–2025 when building a 2026 ROB).
+    #
+    # Actively rewrite the headers to the tracked-year stack:
+    #   2026 ROB -> 2023 / 2024 / 2025 / 2026
+    #   2027 ROB -> 2024 / 2025 / 2026 / 2027
+    year_cols = list(
+        range(month_label_col + 1, month_label_col + 5)
+    )
+    dest_year_col = dict(zip(expected_years, year_cols))
+
+    # Find the row that contains the existing year headers. It is normally the
+    # row directly below the title and immediately above Jan.
+    first_month_row = min(dest_month_row.values()) if dest_month_row else None
+    year_header_row = (
+        first_month_row - 1
+        if first_month_row and first_month_row > hdr_row
+        else hdr_row + 1
+    )
+
+    for year, col in dest_year_col.items():
+        _rob_set_value(
+            wk1_ws,
+            year_header_row,
+            col,
+            year,
+        )
+
+    # ----- Select ONE last completed week from previous month's ROB -----
+    prev_month = (
+        target_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+    prev_month_idx = prev_month.month - 1
+
+    source_sheet = None
+
+    for candidate in reversed(ROB_SHEETS):
+        if candidate not in prev_wb.sheetnames:
+            continue
+
+        src_ws = prev_wb[candidate]  # data_only=True workbook
+        labels = rob_month_blocks(src_ws).get(prev_month_idx, {})
+        rev_row = labels.get("revenue")
+        rms_row = (
+            labels.get("room nights")
+            or labels.get("rms sold")
+            or labels.get("rooms sold")
+        )
+
+        if not rev_row:
+            continue
+
+        # Current-year is column E in the ROB structure.
+        rev_val = src_ws.cell(rev_row, 5).value
+        rms_val = src_ws.cell(rms_row, 5).value if rms_row else None
+
+        # "Completed/used" means the cells are populated, even if the real
+        # numeric value happens to be zero. Blank cells indicate that week
+        # was not used for that month.
+        if rev_val is not None or rms_val is not None:
+            source_sheet = candidate
             break
-        # Fallback: find non-empty cells positionally (formulas count as non-empty)
-        non_empty = []
-        for c in range(year_start_col, year_start_col + 20):
-            v = wk1_ws.cell(hdr_row + dr, c).value
-            if v is not None and str(v).strip():
-                non_empty.append(c)
-        if len(non_empty) >= 2:
-            for i, c in enumerate(non_empty[:4]):
-                dest_year_col[years_in_order[i]] = c
-            break
 
-    if not dest_year_col:
-        return "Could not find year columns in Week 1 Previous Sheet table"
+    if source_sheet is None:
+        return (
+            f"Could not identify the last completed week in the "
+            f"{prev_month:%b %Y} ROB."
+        )
 
-    # ── 4. Build ordered list of week sheet names (most recent first) ────────
-    wk_order = ["wk six", "wk five", "wk four", "wk three", "wk two", "wk one"]
-    wk_sheet_names = []  # sheet names in prev ROB, most-recent first
-    for wk_try in wk_order:
-        matches = [s for s in prev_wb.sheetnames if wk_try in s.lower()]
-        if matches:
-            wk_sheet_names.append(matches[0])
-    if not wk_sheet_names:
-        return "No week tabs found in previous ROB"
+    # ----- Copy literal Revenue values from that one sheet -----
+    src_ws = prev_wb[source_sheet]  # data_only=True
+    source_blocks = rob_month_blocks(src_ws)
 
-    # ── 5. Year → source col: scan wk one row 4 for dates/years ─────────────
-    base_year = target_month.year
-    src_year_col = {base_year - 3: 2, base_year - 2: 3, base_year - 1: 4, base_year: 5}
+    # ROB year columns are B:E. Row 4 may contain date headers instead of
+    # literal year labels, so preserve the standard chronological mapping.
+    src_year_col = {
+        tracked_year - 3: 2,
+        tracked_year - 2: 3,
+        tracked_year - 1: 4,
+        tracked_year: 5,
+    }
 
-    wk1_sheet_name = wk_sheet_names[-1]  # wk one is last in most-recent-first list
-    ref_ws = prev_wb[wk1_sheet_name]
-    detected = {}
-    for c in range(1, min(ref_ws.max_column + 1, 20)):
-        yr = _as_year(ref_ws.cell(4, c).value)
-        if yr and 2000 <= yr <= 2100:
-            detected[yr] = c
-    if len(detected) >= 3:
-        src_year_col = detected
-
-    # ── 6. Write Revenue values — check each cell individually ───────────────
-    # For each (month, year) cell: walk week tabs most-recent→oldest.
-    # Each cell is checked on its own — some are hardcoded numbers, some are
-    # formulas pointing elsewhere. _resolve_cell handles both cases.
     for month_idx, dest_row in dest_month_row.items():
-        rev_row = 4 + 8 * month_idx + 1
+        rev_row = source_blocks.get(month_idx, {}).get("revenue")
+        if not rev_row:
+            continue
+
         for year, dest_col in dest_year_col.items():
             src_col = src_year_col.get(year)
             if not src_col:
                 continue
-            v = None
-            for sheet_name in wk_sheet_names:
-                v = _resolve_cell(prev_wb, prev_wb_formulas, sheet_name, rev_row, src_col)
-                if v is not None and not is_formula(str(v)):
-                    break  # found a real value in this tab — use it
-                v = None   # reset if None or formula string slipped through
-            if v is not None:
-                wk1_ws.cell(dest_row, dest_col).value = v
+
+            # IMPORTANT: read only the cached/literal Revenue value from the
+            # data-only workbook. Do not resolve formulas through Pickup WoW
+            # or another row/sheet.
+            value = src_ws.cell(rev_row, src_col).value
+
+            if value is not None:
+                _rob_set_value(wk1_ws, dest_row, dest_col, value)
 
     return None
 
 
-def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name):
-    """Fill one ROB sheet tab with historical data.
-    Preserves formulas from master template — only overwrites cells with values.
+
+def _rob_valid_date(value):
+    """Return a real ROB as-of date or None."""
+    if isinstance(value, datetime.datetime):
+        value = value.date()
+    if isinstance(value, datetime.date) and value.year >= 2000:
+        return value
+    return None
+
+
+def _rob_last_completed_week(prev_wb, target_month):
+    """Return the previous ROB's last actually-used week sheet.
+
+    Completion is based on the previous month block's current-year Revenue /
+    Rooms Sold cells, matching the existing Week 1 Previous logic.
     """
-    from openpyxl.utils import get_column_letter
+    if prev_wb is None:
+        return None
 
-    target_idx  = target_month.month - 1   # 0-based (Jul = 6)
-    prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
-    # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
-    ly_to_new    = {3: 2, 4: 3, 5: 4}
-    # Rows per month block, read off each sheet rather than assumed (8 for most
-    # hotels, 11 where there's a Permanent-rooms section). Last year's workbook
-    # is measured separately so a template change between years can't shift the
-    # rows we read from.
-    step         = rob_block_step(new_ws)
-    ly_step      = rob_block_step(ly_ws) if ly_ws is not None else step
-    data_offsets = list(range(1, step))    # offset 0 (date header) handled separately
+    prev_month = (
+        target_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+    prev_month_idx = prev_month.month - 1
 
-    # ── As-of dates for this week tab ──────────────────────────────────────
-    # Taken from row 4 of THIS sheet's counterpart in last year's ROB, so
-    # AUG2026 'wk two' gets its 2023/2024/2025 reporting dates from AUG2025
-    # 'wk two'. Each week was reported roughly seven days apart, so these must
-    # never be shared between tabs.
-    #
-    # Row 4 specifically: it holds the literal dates, while every month block
-    # below it chains upward (=B4, =B52, ...). Reading a lower block instead
-    # picks up the chain formula itself on most sheets — and on some it picks
-    # up whatever else is parked in that cell (one real file has a revenue
-    # figure sitting in the Aug block's date position on 'wk two'). Requiring
-    # a real date type keeps that kind of stray number out of the header.
-    #
-    # Col 5 (current year) is a placeholder; the weekly update stamps the real
-    # as-of date when it runs.
+    for candidate in reversed(ROB_SHEETS):
+        if candidate not in prev_wb.sheetnames:
+            continue
+        ws = prev_wb[candidate]
+        labels = rob_month_blocks(ws).get(prev_month_idx, {})
+        rev_row = labels.get("revenue")
+        rms_row = (
+            labels.get("room nights")
+            or labels.get("rms sold")
+            or labels.get("rooms sold")
+        )
+        if not rev_row:
+            continue
+
+        rev_val = ws.cell(rev_row, 5).value
+        rms_val = ws.cell(rms_row, 5).value if rms_row else None
+        if rev_val is not None or rms_val is not None:
+            return candidate
+
+    return None
+
+
+def _rob_previous_stly_anchor_date(prev_wb, target_month):
+    """Historical as-of date already consumed by the prior month's last week.
+
+    For a 2026 ROB, column D is the 2025 snapshot date. If AUG2026 wk five
+    already used 09/03/2025, SEP2026 must start with the next STLY snapshot,
+    not restart at SEP2025 wk one.
+    """
+    sheet_name = _rob_last_completed_week(prev_wb, target_month)
+    if not sheet_name:
+        return None, None
+
+    ws = prev_wb[sheet_name]
+    # Current ROB year columns B:E = TY-3, TY-2, TY-1, TY.
+    anchor = _rob_valid_date(ws.cell(4, 4).value)
+    return anchor, sheet_name
+
+
+def _rob_collect_stly_snapshots(source_workbooks):
+    """Build one chronological pool of STLY weekly snapshots.
+
+    source_workbooks: iterable of (label, workbook), typically the comparable
+    prior-year month plus the following prior-year month. Using a pool allows
+    4-week and 5-week months to cross month-file boundaries naturally.
+    """
+    snapshots = []
+    seen = set()
+
+    for wb_label, wb in source_workbooks:
+        if wb is None:
+            continue
+        for sheet_name in ROB_SHEETS:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+
+            # In the prior-year ROB, column E is that workbook's current year.
+            source_date = _rob_valid_date(ws.cell(4, 5).value)
+            if source_date is None:
+                continue
+
+            key = (source_date, wb_label, sheet_name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            snapshots.append({
+                "date": source_date,
+                "sheet_name": sheet_name,
+                "worksheet": ws,
+                "workbook_label": wb_label,
+            })
+
+    snapshots.sort(
+        key=lambda x: (
+            x["date"],
+            ROB_SHEETS.index(x["sheet_name"])
+            if x["sheet_name"] in ROB_SHEETS else 999,
+        )
+    )
+    return snapshots
+
+
+def _rob_build_date_first_stly_map(
+    new_wb,
+    prev_wb,
+    target_month,
+    source_workbooks,
+):
+    """Map ROB weeks by reporting dates with a portfolio minimum of 4 weeks.
+
+    Rules:
+      - every new ROB month should populate at least 4 destination weeks
+      - source week selection is chronological/date-driven, never tab-driven
+      - a matching historical snapshot may come from the next STLY month file
+      - after wk4, additional weeks are populated only while the reporting
+        cadence still falls inside the target month
+    """
+    snapshots = _rob_collect_stly_snapshots(source_workbooks)
+    if not snapshots:
+        return {}, ["No dated STLY ROB week snapshots were found."]
+
+    consumed_hist_date, consumed_hist_sheet = _rob_previous_stly_anchor_date(
+        prev_wb,
+        target_month,
+    )
+
+    prev_completed_sheet = _rob_last_completed_week(prev_wb, target_month)
+    prev_ty_date = None
+    if (
+        prev_wb is not None
+        and prev_completed_sheet
+        and prev_completed_sheet in prev_wb.sheetnames
+    ):
+        prev_ty_date = _rob_valid_date(
+            prev_wb[prev_completed_sheet].cell(4, 5).value
+        )
+
+    if prev_ty_date is None:
+        prev_ty_date = target_month - datetime.timedelta(days=1)
+
+    mapping = {}
+    diagnostics = []
+
+    if consumed_hist_date is not None:
+        diagnostics.append(
+            f"Previously consumed STLY snapshot: "
+            f"{consumed_hist_date:%m/%d/%Y} "
+            f"({consumed_hist_sheet})"
+        )
+
+    diagnostics.append(
+        f"Previous current-year reporting date: "
+        f"{prev_ty_date:%m/%d/%Y}"
+    )
+
+    used_source_dates = set()
+    last_source_date = consumed_hist_date
+
+    dest_sheets = [
+        s for s in ROB_SHEETS
+        if s in new_wb.sheetnames
+    ]
+
+    for week_index, dest_sheet in enumerate(dest_sheets, start=1):
+        expected_ty_date = prev_ty_date + datetime.timedelta(
+            days=7 * week_index
+        )
+
+        inside_target_month = (
+            expected_ty_date.year == target_month.year
+            and expected_ty_date.month == target_month.month
+        )
+
+        must_fill = week_index <= 4
+
+        if (not must_fill) and (not inside_target_month):
+            diagnostics.append(
+                f"{dest_sheet}: left untouched after minimum four weeks; "
+                f"reporting date {expected_ty_date:%m/%d/%Y} is outside "
+                f"{target_month:%b %Y}"
+            )
+            continue
+
+        comparable_stly_date = expected_ty_date - datetime.timedelta(days=364)
+
+        eligible = []
+        for snap in snapshots:
+            src_date = snap["date"]
+
+            if src_date in used_source_dates:
+                continue
+            if last_source_date is not None and src_date <= last_source_date:
+                continue
+
+            distance = abs((src_date - comparable_stly_date).days)
+            eligible.append((distance, src_date, snap))
+
+        if not eligible:
+            diagnostics.append(
+                f"{dest_sheet}: no later STLY snapshots available; "
+                f"left untouched"
+            )
+            continue
+
+        eligible.sort(key=lambda x: (x[0], x[1]))
+        close = [item for item in eligible if item[0] <= 4]
+
+        if close:
+            distance, src_date, snap = close[0]
+            match_note = "date match"
+        elif must_fill:
+            # Minimum-four fallback: take the next chronological snapshot even
+            # if that snapshot is filed in the following STLY month.
+            chronological = sorted(eligible, key=lambda x: x[1])
+            distance, src_date, snap = chronological[0]
+            match_note = "minimum-4 chronological carry"
+        else:
+            diagnostics.append(
+                f"{dest_sheet}: no STLY snapshot close enough to "
+                f"{comparable_stly_date:%m/%d/%Y}; left untouched"
+            )
+            continue
+
+        mapping[dest_sheet] = snap
+        used_source_dates.add(src_date)
+        last_source_date = src_date
+
+        diagnostics.append(
+            f"{dest_sheet} ({expected_ty_date:%m/%d/%Y}) <- "
+            f"{snap['workbook_label']} / {snap['sheet_name']} "
+            f"({src_date:%m/%d/%Y}); comparable date "
+            f"{comparable_stly_date:%m/%d/%Y}; {match_note}"
+        )
+
+    if len(mapping) < min(4, len(dest_sheets)):
+        diagnostics.append(
+            f"WARNING: only {len(mapping)} destination weeks mapped; "
+            f"portfolio standard is a minimum of 4."
+        )
+
+    return mapping, diagnostics
+
+
+_ROB_BASE_METRIC_LABELS = (
+    "revenue",
+    "room nights",
+    "group rms sold",
+    "group rm rev",
+    "perm rms sold",
+    "perm rm rev",
+)
+
+_ROB_SECONDARY_METRIC_LABELS = (
+    "group rms sold",
+    "group rm rev",
+)
+
+
+def _rob_month_header_rows(ws):
+    """Return {month_index: actual month-header row} from column A."""
+    out = {}
+    for r in range(1, min(ws.max_row, 300) + 1):
+        v = ws.cell(r, 1).value
+        if not isinstance(v, str):
+            continue
+        s = v.strip()
+        key = s[:3].lower()
+        if len(s) <= 12 and key in _MONTH_LABELS:
+            out.setdefault(_MONTH_LABELS[key], r)
+    return out
+
+
+def _rob_copy_month_metrics_by_label(
+    src_ws,
+    dst_ws,
+    month_idx,
+    col_map,
+    labels=_ROB_BASE_METRIC_LABELS,
+    allow_formulas=True,
+):
+    """Copy ROB values by month + metric label, never by physical row."""
+    if src_ws is None or dst_ws is None:
+        return 0
+
+    src_labels = rob_month_blocks(src_ws).get(month_idx, {})
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    if not src_labels or not dst_labels:
+        return 0
+
+    copied = 0
+    for label in labels:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+
+        for src_col, dst_col in col_map.items():
+            value = src_ws.cell(sr, src_col).value
+            if value is None or is_datelike(value):
+                continue
+            if is_formula(str(value)) and not allow_formulas:
+                continue
+            if _rob_set_value(dst_ws, dr, dst_col, value):
+                copied += 1
+
+    return copied
+
+
+def _rob_link_month_metrics_to_wk_one(
+    dst_ws,
+    wk_one_ws,
+    month_idx,
+    labels=_ROB_BASE_METRIC_LABELS,
+):
+    """Link later week tabs to the matching metric row in wk one."""
+    if dst_ws is None or wk_one_ws is None:
+        return 0
+
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    src_labels = rob_month_blocks(wk_one_ws).get(month_idx, {})
+    copied = 0
+
+    for label in labels:
+        dr = dst_labels.get(label)
+        sr = src_labels.get(label)
+        if not dr or not sr:
+            continue
+        for col in (2, 3, 4, 5):
+            L = get_column_letter(col)
+            if _rob_set_value(
+                dst_ws,
+                dr,
+                col,
+                f"='{wk_one_ws.title}'!{L}{sr}",
+            ):
+                copied += 1
+    return copied
+
+
+def _rob_link_group_npu_to_wk_one(dst_ws, wk_one_ws, month_idx):
+    """Link Group NPU rooms/revenue in later weeks back to wk one.
+
+    For the immediately previous month:
+      G = current-year GNPU (blank/formula from wk1)
+      H = STLY GNPU historical comparison
+    Both should mirror wk1 dynamically.
+    """
+    if dst_ws is None or wk_one_ws is None:
+        return 0
+
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    src_labels = rob_month_blocks(wk_one_ws).get(month_idx, {})
+    copied = 0
+
+    for label in _ROB_SECONDARY_METRIC_LABELS:
+        dr = dst_labels.get(label)
+        sr = src_labels.get(label)
+        if not dr or not sr:
+            continue
+
+        for col, letter in ((7, "G"), (8, "H")):
+            if _rob_set_value(
+                dst_ws,
+                dr,
+                col,
+                f"='{wk_one_ws.title}'!{letter}{sr}",
+            ):
+                copied += 1
+
+    return copied
+
+
+def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
+    """Carry STLY Groups Not Picked Up values by month + metric label.
+
+    Historical ROB source:
+      G = that source year's Group NPU rooms/revenue
+
+    Newly-created ROB:
+      H = STLY Group NPU comparison
+
+    This is an explicit G -> H copy for the raw Group NPU inputs only.
+    Group NPU ADR remains the destination workbook's existing formula.
+    """
+    if src_ws is None or dst_ws is None:
+        return 0
+
+    src_labels = rob_month_blocks(src_ws).get(month_idx, {})
+    dst_labels = rob_month_blocks(dst_ws).get(month_idx, {})
+    if not src_labels or not dst_labels:
+        return 0
+
+    copied = 0
+    for label in _ROB_SECONDARY_METRIC_LABELS:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+
+        value = src_ws.cell(sr, 7).value  # G = source-year Group NPU
+        if value is None or is_datelike(value):
+            continue
+
+        if _rob_set_value(dst_ws, dr, 8, value):  # H = STLY Group NPU
+            copied += 1
+
+    return copied
+
+
+
+def _fill_rob_sheet(
+    new_ws,
+    prev_ws,
+    ly_ws,
+    target_month,
+    is_wk_one,
+    wk_one_sheet_name,
+    tracked_year=None,
+    carry_forward_ws=None,
+):
+    """Build a ROB week by date-selected source + month/metric labels."""
+    tracked_year = tracked_year or target_month.year
+    target_idx = target_month.month - 1
+    prev_idx = -1 if tracked_year > target_month.year else target_idx - 1
+    ly_to_new = {3: 2, 4: 3, 5: 4}
+
+    new_headers = _rob_month_header_rows(new_ws)
+
+    # STLY reporting-date headers from the specifically selected historical week.
     as_of_dates = {}
-    if ly_ws:
+    if ly_ws is not None:
         for ly_col, new_col in ly_to_new.items():
-            v = ly_ws.cell(4, ly_col).value
-            # A never-used week tab carries Excel's zero date (1899-12-30),
-            # which is a real datetime and would otherwise be copied across as
-            # though it were a reporting date.
-            if isinstance(v, (datetime.datetime, datetime.date)) and v.year >= 2000:
-                as_of_dates[new_col] = v
-    as_of_dates[5] = datetime.datetime(target_month.year, target_month.month, target_month.day)
+            value = ly_ws.cell(4, ly_col).value
+            if (
+                isinstance(value, (datetime.datetime, datetime.date))
+                and value.year >= 2000
+            ):
+                as_of_dates[new_col] = value
+
+    prev_ty_date = None
+    if prev_ws is not None:
+        value = prev_ws.cell(4, 5).value
+        if (
+            isinstance(value, (datetime.datetime, datetime.date))
+            and value.year >= 2000
+        ):
+            prev_ty_date = value
+
+    as_of_dates[5] = datetime.datetime(
+        target_month.year,
+        target_month.month,
+        target_month.day,
+    )
+
+    wk_one_ws = (
+        new_ws.parent[wk_one_sheet_name]
+        if wk_one_sheet_name in new_ws.parent.sheetnames
+        else None
+    )
 
     for month_idx in range(12):
-        block_start = 4 + step * month_idx
+        header_row = new_headers.get(month_idx)
+        if not header_row:
+            continue
 
-        # ── Date header row (offset 0) ─────────────────────────────────────
-        # Weeks 2+ used to get ='wk one'!<col><row> here, which forced every
-        # week tab to display wk one's reporting dates.
-        #
-        # Row 4 always gets the real date. Month blocks below it keep a
-        # same-sheet chain (=B4, =SUM(B12)) because that correctly carries
-        # THIS tab's date down the sheet — but a cross-sheet reference is
-        # overwritten, since pointing at another week's tab reintroduces the
-        # very problem being fixed (one real template chains its lower blocks
-        # to ='wk one'!B11).
-        for col, date_val in as_of_dates.items():
-            cell = new_ws.cell(block_start, col)
-            cur = str(cell.value) if cell.value is not None else ""
-            same_sheet_chain = is_formula(cur) and "!" not in cur
-            if block_start != 4 and same_sheet_chain:
+        # Date rows: use the actual month-header row for THIS tab.
+        for col, date_value in as_of_dates.items():
+            current = new_ws.cell(header_row, col).value
+            current_text = str(current) if current is not None else ""
+
+            # Preserve normal same-sheet date chains below row 4.
+            if (
+                header_row != 4
+                and is_formula(current_text)
+                and "!" not in current_text
+            ):
                 continue
-            cell.value = date_val
 
-        # ── Data rows (offsets 1–7) ───────────────────────────────────────────
+            # Historical B:D dates are prefilled. Current-year E dates remain
+            # blank from the immediately previous month forward in a newly
+            # created ROB; weekly uploads add them later.
+            if col == 5 and month_idx >= prev_idx:
+                _rob_set_value(
+                    new_ws,
+                    header_row,
+                    col,
+                    None,
+                    number_format="mm/dd/yyyy",
+                )
+                continue
+
+            write_date = date_value
+            if (
+                col == 5
+                and month_idx < prev_idx
+                and prev_ty_date is not None
+            ):
+                write_date = prev_ty_date
+
+            _rob_set_value(
+                new_ws,
+                header_row,
+                col,
+                write_date,
+                number_format="mm/dd/yyyy",
+            )
+
+        # Closed months: wk one gets the completed prior ROB;
+        # subsequent weeks link to wk one by matching metric label.
         if month_idx < prev_idx:
-            # Past months (Jan–May when target=Jul): copy all 4 cols from prev ROB
-            # For new hotels with no historical data (e.g., first year), prev_ws will be None —
-            # just skip and leave those months with master template values (no error).
-            if not _is_rob_month_blank(new_ws, block_start):
-                continue
             if is_wk_one:
-                if prev_ws is None:
-                    continue
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        v = prev_ws.cell(r, c).value
-                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            new_ws.cell(r, c).value = v
+                _rob_copy_month_metrics_by_label(
+                    prev_ws,
+                    new_ws,
+                    month_idx,
+                    {2: 2, 3: 3, 4: 4, 5: 5},
+                    allow_formulas=True,
+                )
             else:
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        col_ltr = get_column_letter(c)
-                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+                _rob_link_month_metrics_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+                _rob_link_group_npu_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+            continue
 
-        elif month_idx == prev_idx:
-            # Prev month (Jun when target=Jul):
-            # Cols 2,3,4 = historical years from LY ROB (same source as Jul+)
-            # Col 5     = actual current-year data from prev ROB (built up weekly)
-            if not _is_rob_month_blank(new_ws, block_start):
-                continue
+        # Immediately previous month:
+        #   - historical B:D comes from the selected STLY snapshot
+        #   - wk one current-year E/H stays blank
+        #   - wk two and later link the previous-month section back to wk one
+        # This makes the behavior dynamic for however many week tabs the month uses.
+        if month_idx == prev_idx:
             if is_wk_one:
-                if ly_ws:
-                    for dr in data_offsets:
-                        r = block_start + dr
-                        for ly_col, new_col in ly_to_new.items():
-                            # Skip if master template has a formula in this cell
-                            if is_formula(str(new_ws.cell(r, new_col).value)):
-                                continue
-                            v = ly_ws.cell(r, ly_col).value
-                            if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                                new_ws.cell(r, new_col).value = v
-                    ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
-                    for dr in [4, 5, 6]:
-                        r = block_start + dr
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, 8).value)):
-                            continue
-                        v = ly_ws.cell(r, ly_sec_col).value
-                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                            new_ws.cell(r, 8).value = v
-            else:
-                for dr in data_offsets:
-                    r = block_start + dr
-                    for c in [2, 3, 4, 5]:
-                        # Skip if master template has a formula in this cell
-                        if is_formula(str(new_ws.cell(r, c).value)):
-                            continue
-                        col_ltr = get_column_letter(c)
-                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+                _rob_copy_month_metrics_by_label(
+                    ly_ws,
+                    new_ws,
+                    month_idx,
+                    ly_to_new,
+                    allow_formulas=True,
+                )
+                _rob_copy_secondary_by_label(
+                    ly_ws,
+                    new_ws,
+                    month_idx,
+                )
 
-        else:
-            # Current month and future months (Jul+): cols 2,3,4 from LY ROB
-            # For new hotels with no historical data (e.g., Foxberry), ly_ws will be None —
-            # just skip and leave those months with master template values (no error).
-            if ly_ws is None:
-                continue
-            for dr in data_offsets:
-                r = block_start + dr
-                for ly_col, new_col in ly_to_new.items():
-                    # Skip if master template has a formula in this cell
-                    if is_formula(str(new_ws.cell(r, new_col).value)):
-                        continue
-                    v = ly_ws.cell(r, ly_col).value
-                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                        new_ws.cell(r, new_col).value = v
-            ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
-            for dr in [4, 5, 6]:
-                r = block_start + dr
-                # Skip if master template has a formula in this cell
-                if is_formula(str(new_ws.cell(r, 8).value)):
-                    continue
-                v = ly_ws.cell(r, ly_sec_col).value
-                if v is not None and not is_formula(str(v)) and not is_datelike(v):
-                    new_ws.cell(r, 8).value = v
+                # wk one starts clean for the immediately previous month.
+                dst_labels = rob_month_blocks(new_ws).get(month_idx, {})
+                for label in _ROB_BASE_METRIC_LABELS:
+                    dr = dst_labels.get(label)
+                    if dr:
+                        _rob_set_value(new_ws, dr, 5, None)
+                # GNPU: G is current-year and must start blank; H is STLY
+                # and was just populated from the mapped historical week.
+                for label in _ROB_SECONDARY_METRIC_LABELS:
+                    dr = dst_labels.get(label)
+                    if dr:
+                        _rob_set_value(new_ws, dr, 7, None)
+            else:
+                # Later weeks inherit the full previous-month block from wk one
+                # by matching metric labels, regardless of physical row layout.
+                _rob_link_month_metrics_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+                _rob_link_group_npu_to_wk_one(
+                    new_ws,
+                    wk_one_ws,
+                    month_idx,
+                )
+            continue
+
+        # Current/future months:
+        # B:D from this destination week's selected historical ROB snapshot.
+        _rob_copy_month_metrics_by_label(
+            ly_ws,
+            new_ws,
+            month_idx,
+            ly_to_new,
+            allow_formulas=True,
+        )
+        _rob_copy_secondary_by_label(
+            ly_ws,
+            new_ws,
+            month_idx,
+        )
+
+        # Current-year values for the target month and all future months must
+        # remain blank when a new ROB month is created. Weekly uploads populate
+        # these later. Historical B:D can be prefilled, but E stays empty.
+        dst_labels = rob_month_blocks(new_ws).get(month_idx, {})
+        for label in _ROB_BASE_METRIC_LABELS:
+            dr = dst_labels.get(label)
+            if dr:
+                _rob_set_value(new_ws, dr, 5, None)
+
+        # GNPU follows the same setup rule:
+        #   G = current-year GNPU -> blank until weekly data is loaded
+        #   H = STLY GNPU -> preserve the historical value copied above
+        for label in _ROB_SECONDARY_METRIC_LABELS:
+            dr = dst_labels.get(label)
+            if dr:
+                _rob_set_value(new_ws, dr, 7, None)
+
+
+def _wk1_previous_table_refs(ws, target_year):
+    months=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec']
+    hdr=None
+    for r in range(1,min(ws.max_row+1,80)):
+        for c in range(1,ws.max_column+1):
+            s=str(ws.cell(r,c).value or '').lower()
+            if 'week 1 previous' in s or ('calculation only' in s and 'week' in s):
+                hdr=(r,c); break
+        if hdr: break
+    if not hdr: return {}
+    hr,hc=hdr; mcol=None
+    for r in range(hr+1,min(ws.max_row+1,hr+40)):
+        for c in range(max(1,hc-5),min(ws.max_column+1,hc+8)):
+            if str(ws.cell(r,c).value or '').strip().lower() in months:
+                mcol=c; break
+        if mcol: break
+    if not mcol: return {}
+    mrows={}
+    for r in range(hr+1,min(ws.max_row+1,hr+40)):
+        s=str(ws.cell(r,mcol).value or '').strip().lower()
+        if s in months: mrows[months.index(s)]=r
+    ycols={}
+    for r in range(hr,min(ws.max_row+1,hr+10)):
+        for c in range(mcol+1,min(ws.max_column+1,mcol+20)):
+            v=ws.cell(r,c).value; y=None
+            if isinstance(v,(int,float)) and 2000<=int(v)<=2100: y=int(v)
+            elif isinstance(v,str):
+                m=re.search(r'\b(20\d{2})\b',v); y=int(m.group(1)) if m else None
+            elif isinstance(v,(datetime.datetime,datetime.date)): y=v.year
+            if y: ycols[y]=c
+        if len(ycols)>=4: break
+    if not ycols:
+        for c,y in zip(range(mcol+1,mcol+5),range(target_year-3,target_year+1)): ycols[y]=c
+    return {(mi,y):ws.cell(r,c).coordinate for mi,r in mrows.items() for y,c in ycols.items()}
+
+
+def apply_rob_pickup_wow_formulas(wb, target_year, allowed_sheets=None):
+    """All months, all year columns: current-week Revenue minus prior-week Revenue."""
+    from openpyxl.utils import get_column_letter
+    weeks=[
+        s for s in ROB_SHEETS
+        if s in wb.sheetnames
+        and (allowed_sheets is None or s in allowed_sheets)
+    ]
+    if not weeks: return ['Pickup WoW formulas: no ROB week tabs found.']
+    wk1=wb[weeks[0]]; refs=_wk1_previous_table_refs(wk1,target_year)
+    year_by_col={}
+    for c in range(2,6):
+        v=wk1.cell(4,c).value; y=None
+        if isinstance(v,(datetime.datetime,datetime.date)): y=v.year
+        elif isinstance(v,(int,float)) and 2000<=int(v)<=2100: y=int(v)
+        elif isinstance(v,str):
+            m=re.search(r'\b(20\d{2})\b',v); y=int(m.group(1)) if m else None
+        year_by_col[c]=y or (target_year-5+c)
+    for wi,sname in enumerate(weeks):
+        ws=wb[sname]
+        for mi,labels in rob_month_blocks(ws).items():
+            rr=labels.get('revenue')
+            pr=next((r for lab,r in labels.items() if 'pickup' in lab and 'wow' in lab.replace(' ','')),None)
+            if not rr or not pr: continue
+            for c in range(2,6):
+                L=get_column_letter(c)
+                if wi==0:
+                    ref=refs.get((mi,year_by_col[c]))
+                    if ref: _rob_set_value(ws, pr, c, f'={L}{rr}-{ref}')
+                else:
+                    prev=weeks[wi-1]
+                    prev_ws = wb[prev]
+                    prev_rr = (
+                        rob_month_blocks(prev_ws)
+                        .get(mi, {})
+                        .get("revenue")
+                    )
+                    if prev_rr:
+                        _rob_set_value(
+                            ws,
+                            pr,
+                            c,
+                            f"={L}{rr}-'{prev}'!{L}{prev_rr}",
+                        )
+    return [] if refs else ['Pickup WoW formulas: WK1 previous table could not be mapped; WK1 formulas left unchanged.']
 
 
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
@@ -4368,25 +6543,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     folder_diagnostic = f"Revenue Reports folder: {rev_name}; Month folder: {month_name}"
 
     # ── Find or copy the file ─────────────────────────────────────────────────
-    # Diagnostic: list every file in month_id whose name contains "ROB" —
-    # confirmed real risk this session (Wolfeboro's duplicate-named folders)
-    # that two files with the same display name could sit in the same
-    # folder, with drive_find_file silently picking one while a human
-    # browsing to the file by name lands on the other.
+    # Fast path: skip extra duplicate-file diagnostic Drive query.
     dup_check_warnings = []
-    try:
-        dup_q = ("'%s' in parents and trashed = false and name contains 'ROB'") % month_id
-        dup_files = service.files().list(
-            q=dup_q, fields="files(id,name)", pageSize=20,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute().get("files", [])
-        if len(dup_files) > 1:
-            dup_check_warnings.append(
-                f"Multiple files matching 'ROB' found in the target month folder: "
-                + ", ".join(f"'{f['name']}' (id: {f['id']})" for f in dup_files)
-            )
-    except Exception:
-        pass
 
     existing_id, existing_name = drive_find_file(service, "ROB", month_id)
     is_fresh_copy = False
@@ -4394,7 +6552,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         new_file_id, new_file_name = existing_id, existing_name
     else:
         is_fresh_copy = True
-        master_id, master_name = find_rob_master(service, hotel_id)
+        master_id, master_name = find_rob_master(service, hotel_id, target_month.year)
         if not master_id:
             return None, master_name, None, None
         hotel_suffix = hotel_name.upper()
@@ -4410,6 +6568,10 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             new_file_id, new_file_name = drive_copy_file(service, master_id, new_file_name, month_id)
         except Exception as e:
             return None, str(e), None, None
+
+    _cache_drive_workbook_resolution(
+        hotel_id, hotel_name, "ROB", target_month, new_file_id, new_file_name
+    )
 
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
@@ -4429,8 +6591,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     ] + dup_check_warnings
 
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
-    prev_result, prev_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                                     month_date=prev_month_dt)
+    prev_result, prev_err = _resolve_drive_workbook_session_cached(
+        service, hotel_id, hotel_name, "ROB", prev_month_dt
+    )
     prev_wb = None
     prev_wb_formulas = None
     if prev_result:
@@ -4445,19 +6608,100 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
 
     ly_month_dt = target_month.replace(year=target_month.year - 1)
-    ly_result, ly_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                                month_date=ly_month_dt)
+    ly_result, ly_err = _resolve_drive_workbook_session_cached(
+        service, hotel_id, hotel_name, "ROB", ly_month_dt
+    )
     ly_wb = None
     if ly_result:
-        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: {ly_result[1]}")
+        warnings.append(
+            f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: "
+            f"{ly_result[1]}"
+        )
         try:
             ly_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, ly_result[0])), data_only=True)
+                io.BytesIO(drive_download(service, ly_result[0])),
+                data_only=True,
+            )
         except Exception as e:
-            warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
+            warnings.append(
+                f"Last year ({ly_month_dt.strftime('%b %Y')}) workbook "
+                f"found but failed to load: {e}"
+            )
     else:
-        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) not found — future months' historical "
-                         f"columns will be blank: {ly_err}")
+        warnings.append(
+            f"Last year ({ly_month_dt.strftime('%b %Y')}) not found: {ly_err}"
+        )
+
+    # Also load the following prior-year month. This is required when the
+    # destination month has more reporting weeks than the comparable STLY
+    # month. Example: SEP2026 can legitimately continue into OCT2025 snapshots.
+    next_ly_month_dt = (
+        ly_month_dt + datetime.timedelta(days=32)
+    ).replace(day=1)
+    next_ly_result, next_ly_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        next_ly_month_dt,
+    )
+    next_ly_wb = None
+    if next_ly_result:
+        warnings.append(
+            f"Following STLY month ({next_ly_month_dt.strftime('%b %Y')}) "
+            f"resolved to: {next_ly_result[1]}"
+        )
+        try:
+            next_ly_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, next_ly_result[0])),
+                data_only=True,
+            )
+        except Exception as e:
+            warnings.append(
+                f"Following STLY month "
+                f"({next_ly_month_dt.strftime('%b %Y')}) failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Following STLY month "
+            f"({next_ly_month_dt.strftime('%b %Y')}) not found: {next_ly_err}"
+        )
+
+    # Safety net for month-overlap cases. The mapper remains date-driven, so
+    # this only broadens the pool of available historical weekly snapshots.
+    next2_ly_month_dt = (
+        next_ly_month_dt + datetime.timedelta(days=32)
+    ).replace(day=1)
+    next2_ly_result, next2_ly_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        next2_ly_month_dt,
+    )
+    next2_ly_wb = None
+    if next2_ly_result:
+        warnings.append(
+            f"Second following STLY month "
+            f"({next2_ly_month_dt.strftime('%b %Y')}) resolved to: "
+            f"{next2_ly_result[1]}"
+        )
+        try:
+            next2_ly_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, next2_ly_result[0])),
+                data_only=True,
+            )
+        except Exception as e:
+            warnings.append(
+                f"Second following STLY month "
+                f"({next2_ly_month_dt.strftime('%b %Y')}) failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Second following STLY month "
+            f"({next2_ly_month_dt.strftime('%b %Y')}) not found: "
+            f"{next2_ly_err}"
+        )
 
     # Sheet lookups below are exact, case-sensitive matches against
     # ROB_SHEETS ("wk one", "wk two", ...) — a workbook can load successfully
@@ -4467,7 +6711,12 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # named "wk one" (so wk one fills fine) while missing/mismatching "wk
     # two" through "wk six" — confirmed real case where wk one populated but
     # wk two silently didn't. Check every ROB_SHEETS name, not just the first.
-    for label, wb_obj in [("Prev month", prev_wb), ("Last year", ly_wb)]:
+    for label, wb_obj in [
+        ("Prev month", prev_wb),
+        ("Last year", ly_wb),
+        ("Following STLY month", next_ly_wb),
+        ("Second following STLY month", next2_ly_wb),
+    ]:
         if wb_obj is None:
             continue
         missing = [s for s in ROB_SHEETS if s not in wb_obj.sheetnames]
@@ -4478,15 +6727,77 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             )
 
     # ── Fill each sheet ───────────────────────────────────────────────────────
+    # STLY source weeks are selected by actual chronological snapshot dates,
+    # not by matching destination/source tab names.
+    stly_week_map, stly_map_diag = _rob_build_date_first_stly_map(
+        new_wb,
+        prev_wb,
+        target_month,
+        [
+            (ly_month_dt.strftime("%b%Y").upper(), ly_wb),
+            (next_ly_month_dt.strftime("%b%Y").upper(), next_ly_wb),
+            (next2_ly_month_dt.strftime("%b%Y").upper(), next2_ly_wb),
+        ],
+    )
+    if stly_map_diag:
+        warnings.append(
+            "Date-first STLY week map — " + " | ".join(stly_map_diag)
+        )
+
+    # Latest completed week in the previous ROB is the current-year OTB
+    # carry-forward baseline for the newly-created month.
+    latest_prev_sheet_name = _rob_last_completed_week(
+        prev_wb,
+        target_month,
+    )
+    carry_forward_ws = (
+        prev_wb[latest_prev_sheet_name]
+        if prev_wb
+        and latest_prev_sheet_name
+        and latest_prev_sheet_name in prev_wb.sheetnames
+        else None
+    )
+    if latest_prev_sheet_name:
+        warnings.append(
+            f"Current-year carry-forward source: {latest_prev_sheet_name}"
+        )
+
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
             continue
         new_ws  = new_wb[sheet_name]
         prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
-        ly_ws   = ly_wb[sheet_name]   if ly_wb   and sheet_name in ly_wb.sheetnames   else None
+        stly_snap = stly_week_map.get(sheet_name)
+        if not stly_snap:
+            warnings.append(
+                f"{sheet_name}: no date-mapped STLY snapshot; tab left untouched"
+            )
+            continue
+
+        ly_ws = stly_snap["worksheet"]
         is_wk_one = (sheet_name == wk_one_name)
-        _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
+        _fill_rob_sheet(
+            new_ws,
+            prev_ws,
+            ly_ws,
+            target_month,
+            is_wk_one,
+            wk_one_name,
+            tracked_year=target_month.year,
+            carry_forward_ws=carry_forward_ws,
+        )
+
+    # Normalize all ROB date headers to MM/DD/YYYY display.
+    for _s in ROB_SHEETS:
+        if _s not in new_wb.sheetnames:
+            continue
+        _ws = new_wb[_s]
+        _step = rob_block_step(_ws)
+        for _mi in range(12):
+            _row = 4 + _step * _mi
+            for _col in range(2, 6):
+                _ws.cell(_row, _col).number_format = "mm/dd/yyyy"
 
     # Direct readback of the target month's own block, right after the fill
     # loop and before save/upload — confirms whether the in-memory write
@@ -4496,7 +6807,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # real case where wk one's fill succeeded but wk two's silently didn't.
     # Also check Jan/Feb/Mar/Dec to verify backward/future months are filled.
     target_idx = target_month.month - 1
-    target_block_start = 4 + 8 * target_idx
+    _diag_step = rob_block_step(new_wb[ROB_SHEETS[0]]) if ROB_SHEETS[0] in new_wb.sheetnames else 8
+    target_block_start = 4 + _diag_step * target_idx
     readback = {
         s: new_wb[s].cell(target_block_start + 1, 2).value
         for s in ROB_SHEETS if s in new_wb.sheetnames
@@ -4506,7 +6818,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ws = new_wb[wk_one_sheet]
         month_check = {}
         for m, mlabel in [(1, "Jan"), (2, "Feb"), (3, "Mar"), (12, "Dec")]:
-            block = 4 + 8 * (m - 1)
+            block = 4 + rob_block_step(ws) * (m - 1)
             month_check[mlabel] = ws.cell(block + 1, 2).value
         warnings.append(
             f"Months check (wk one only) — Jan/Feb/Mar/Dec Revenue (col B): {month_check!r}"
@@ -4518,9 +6830,17 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
     if prev_wb and wk_one_name in new_wb.sheetnames:
-        err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month)
+        err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month, tracked_year=target_month.year)
         if err:
             warnings.append(f"Prev table: {err}")
+
+    warnings.extend(
+        apply_rob_pickup_wow_formulas(
+            new_wb,
+            target_month.year,
+            allowed_sheets=set(stly_week_map.keys()),
+        )
+    )
 
     strip_tables(new_wb)
     out = io.BytesIO()
@@ -4528,6 +6848,615 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     drive_upload(service, new_file_id, out.getvalue(), new_file_name)
     warn_str = "; ".join(warnings) if warnings else None
     return new_file_name, warn_str, new_file_id, new_wb_bytes
+
+
+
+def resolve_next_year_rob_workbook(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month=None,
+    tracked_year=None,
+):
+    """Resolve the separate next-year ROB stored in the report month's folder.
+
+    Example:
+      report_month = Oct 2026
+      tracked_year = 2027
+      filename     = 2027 ROB OCT2026 HOTELNAME.xlsx
+    """
+    report_month = report_month or datetime.date.today().replace(day=1)
+    tracked_year = tracked_year or (report_month.year + 1)
+
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b%Y").upper()
+
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service, hotel_id, year_kw, month_kw
+    )
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder."
+
+    month_id, month_name = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        report_month,
+        hotel_name,
+    )
+    if not month_id:
+        return None, (
+            f"Could not find the {month_kw} folder for {hotel_name}."
+        )
+
+    q = (
+        f"'{month_id}' in parents and trashed=false and "
+        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+    )
+    files = service.files().list(
+        q=q,
+        fields="files(id,name,modifiedTime)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    candidates = []
+    for f in files:
+        n = str(f.get("name", "")).upper()
+        if "MASTER" in n or "ROB" not in n:
+            continue
+        if str(tracked_year) not in n:
+            continue
+        candidates.append(f)
+
+    if not candidates:
+        return None, (
+            f"No {tracked_year} ROB found in '{month_name}'. "
+            f"Expected a name like '{tracked_year} ROB {month_kw} {hotel_name.upper()}'."
+        )
+
+    candidates.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
+        reverse=True,
+    )
+    best = candidates[0]
+    return (best["id"], best["name"]), None
+
+
+def resolve_historical_rob_for_future_year(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+    historical_year,
+):
+    """Find the prior-year historical ROB used to seed a future-year ROB.
+
+    Example:
+      Building: 2027 ROB for OCT2026
+      Historical source wanted: 2026 ROB from the comparable OCT2025 snapshot.
+
+    Hotels may keep that historical ROB in the current Revenue Reports folder
+    alongside the active files, or elsewhere in their hotel Drive tree.
+
+    Ranking preference:
+      1. Historical ROB in the current report-month folder
+      2. Filename contains the comparable prior-year month token (e.g. OCT2025)
+      3. Filename begins with the tracked historical year (e.g. 2026 ROB ...)
+      4. Explicit "HIST"/"HISTORICAL" wording
+
+    The active current-month ROB (e.g. OCT2026 ROB ...) is explicitly excluded
+    so it cannot be mistaken for the dedicated historical 2026 ROB.
+    """
+    report_year_kw = str(report_month.year)
+    report_month_kw = report_month.strftime("%b%Y").upper()
+
+    comparable_month = report_month.replace(year=report_month.year - 1)
+    comparable_kw = comparable_month.strftime("%b%Y").upper()
+
+    rev_id, _ = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        report_year_kw,
+        report_month_kw,
+    )
+
+    month_id = None
+    if rev_id:
+        month_id, _ = _find_month_folder_under_rev(
+            service,
+            rev_id,
+            report_year_kw,
+            report_month_kw,
+            report_month,
+            hotel_name,
+        )
+
+    def list_excel_files(parent_ids):
+        parent_ids = [pid for pid in parent_ids if pid]
+        if not parent_ids:
+            return []
+
+        parent_clause = " or ".join(
+            f"'{pid}' in parents" for pid in parent_ids
+        )
+        q = (
+            f"trashed=false and ({parent_clause}) and "
+            "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+            "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+        )
+        try:
+            return service.files().list(
+                q=q,
+                fields="files(id,name,parents,modifiedTime)",
+                pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
+        except Exception:
+            return []
+
+    def score_candidate(f, in_current_month_folder=False):
+        name = str(f.get("name", ""))
+        n = name.upper()
+
+        if "ROB" not in n or "MASTER" in n:
+            return None
+
+        # Do not accidentally use the active current-month ROB.
+        if report_month_kw in n and not n.strip().startswith(
+            f"{historical_year} ROB"
+        ):
+            return None
+
+        # Candidate must clearly represent the desired historical year.
+        starts_with_year = bool(
+            re.match(
+                rf"^\s*{historical_year}\s+ROB\b",
+                n,
+                flags=re.I,
+            )
+        )
+        has_comparable_month = comparable_kw in n
+        has_hist_word = "HIST" in n or "HISTORICAL" in n
+
+        if not (
+            starts_with_year
+            or has_comparable_month
+            or has_hist_word
+        ):
+            return None
+
+        score = 0
+        if in_current_month_folder:
+            score += 100
+        if has_comparable_month:
+            score += 80
+        if starts_with_year:
+            score += 60
+        if has_hist_word:
+            score += 30
+
+        # Prefer names that explicitly pair the historical year and ROB.
+        if str(historical_year) in n:
+            score += 20
+
+        return (
+            score,
+            str(f.get("modifiedTime", "")),
+            f,
+        )
+
+    # First: current report-month folder, where the user expects the historical
+    # future-year reference ROB to already be stored.
+    scored = []
+    if month_id:
+        for f in list_excel_files([month_id]):
+            s = score_candidate(f, in_current_month_folder=True)
+            if s:
+                scored.append(s)
+
+    # Fallback: search the hotel's own scoped Drive tree.
+    if not scored:
+        scope_ids = _hotel_search_scope_ids(service, hotel_id)
+        for f in list_excel_files(scope_ids):
+            s = score_candidate(f, in_current_month_folder=False)
+            if s:
+                scored.append(s)
+
+    if not scored:
+        return None, (
+            f"Could not find the historical {historical_year} ROB for "
+            f"{hotel_name}. Expected a comparable file such as "
+            f"'{historical_year} ROB {comparable_kw} {hotel_name.upper()}'."
+        )
+
+    scored.sort(
+        key=lambda x: (x[0], x[1]),
+        reverse=True,
+    )
+    best = scored[0][2]
+    return (best["id"], best["name"]), None
+
+
+
+def setup_next_year_rob_month(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+    tracked_year=None,
+):
+    """Create/prepare the separate next-year ROB.
+
+    October bootstrap:
+      - copy the tracked-year ROB master (e.g. 2027 master)
+      - place it in the Oct 2026 Revenue Reports month folder
+      - name it `2027 ROB OCT2026 HOTELNAME`
+      - use the dedicated historical 2026 ROB as the prior-year reference
+      - shift its 2023 / 2024 / 2025 / 2026 stack forward so the new workbook
+        becomes 2024 / 2025 / 2026 / 2027
+
+    Later report months also carry forward from the previous report month's
+    next-year ROB.
+    """
+    tracked_year = tracked_year or (report_month.year + 1)
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b%Y").upper()
+
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service, hotel_id, year_kw, month_kw
+    )
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder.", None, None
+
+    month_id, month_name = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        report_month,
+        hotel_name,
+    )
+    if not month_id:
+        return None, (
+            f"Could not find the {month_kw} folder for {hotel_name}."
+        ), None, None
+
+    existing, _ = resolve_next_year_rob_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month=report_month,
+        tracked_year=tracked_year,
+    )
+    is_fresh_copy = not bool(existing)
+
+    if existing:
+        new_file_id, new_file_name = existing
+    else:
+        master_id, master_name = find_rob_master(
+            service,
+            hotel_id,
+            tracked_year,
+        )
+        if not master_id:
+            return None, master_name, None, None
+
+        hotel_suffix = hotel_name.upper()
+        name_upper = master_name.upper()
+        if "ROB" in name_upper:
+            after = master_name[
+                name_upper.find("ROB") + 3:
+            ].strip()
+            after = (
+                after.replace(".xlsx", "")
+                .replace(".xlsm", "")
+                .replace(".XLSX", "")
+                .replace(".XLSM", "")
+                .strip()
+            )
+            # Strip a leading tracked year if the master name includes it.
+            after = re.sub(
+                rf"^\s*{tracked_year}\s*",
+                "",
+                after,
+                flags=re.I,
+            ).strip()
+            if after:
+                hotel_suffix = after
+
+        ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
+        new_file_name = (
+            f"{tracked_year} ROB {month_kw} {hotel_suffix}{ext}"
+        )
+        try:
+            new_file_id, new_file_name = drive_copy_file(
+                service,
+                master_id,
+                new_file_name,
+                month_id,
+            )
+        except Exception as e:
+            return None, str(e), None, None
+
+    original_bytes = drive_download(service, new_file_id)
+    new_wb = openpyxl.load_workbook(
+        io.BytesIO(original_bytes),
+        data_only=False,
+    )
+    if is_fresh_copy:
+        clear_tab_colors(new_wb, ROB_SHEETS)
+
+    warnings = [
+        f"Tracking year: {tracked_year}",
+        f"Report month folder: {month_name}",
+    ]
+
+    # Previous report month's next-year ROB, when one exists.
+    prev_report_month = (
+        report_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+    prev_result, prev_err = resolve_next_year_rob_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month=prev_report_month,
+        tracked_year=tracked_year,
+    )
+    prev_wb = None
+    prev_wb_formulas = None
+    if prev_result:
+        try:
+            prev_bytes = drive_download(service, prev_result[0])
+            prev_wb = openpyxl.load_workbook(
+                io.BytesIO(prev_bytes),
+                data_only=True,
+            )
+            prev_wb_formulas = openpyxl.load_workbook(
+                io.BytesIO(prev_bytes),
+                data_only=False,
+            )
+            warnings.append(
+                f"Previous {tracked_year} ROB: {prev_result[1]}"
+            )
+        except Exception as e:
+            warnings.append(
+                f"Previous {tracked_year} ROB failed to load: {e}"
+            )
+
+    # Historical reference for a future-year ROB:
+    # use the dedicated tracked-year-minus-one historical ROB, not the active
+    # current-year ROB. Example: a 2027 ROB uses the historical 2026 ROB,
+    # which already carries the 2023/2024/2025/2026 stack; shifting that
+    # forward yields 2024/2025/2026 in the new 2027 ROB.
+    historical_year = tracked_year - 1
+    hist_result, hist_err = resolve_historical_rob_for_future_year(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month,
+        historical_year,
+    )
+
+    hist_wb = None
+    if hist_result:
+        try:
+            hist_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, hist_result[0])),
+                data_only=True,
+            )
+            warnings.append(
+                f"Historical {historical_year} ROB: {hist_result[1]}"
+            )
+        except Exception as e:
+            warnings.append(
+                f"Historical {historical_year} ROB found but failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Historical {historical_year} ROB not found: {hist_err}"
+        )
+
+    wk_one_name = ROB_SHEETS[0]
+    for sheet_name in ROB_SHEETS:
+        if sheet_name not in new_wb.sheetnames:
+            continue
+        new_ws = new_wb[sheet_name]
+        prev_ws = (
+            prev_wb[sheet_name]
+            if prev_wb and sheet_name in prev_wb.sheetnames
+            else None
+        )
+        hist_ws = (
+            hist_wb[sheet_name]
+            if hist_wb and sheet_name in hist_wb.sheetnames
+            else None
+        )
+        _fill_rob_sheet(
+            new_ws,
+            prev_ws,
+            hist_ws,
+            report_month,
+            sheet_name == wk_one_name,
+            wk_one_name,
+            tracked_year=tracked_year,
+            carry_forward_ws=None,
+        )
+
+    # Normalize ROB date displays.
+    for s in ROB_SHEETS:
+        if s not in new_wb.sheetnames or s not in stly_week_map:
+            continue
+        ws = new_wb[s]
+        for row in _rob_month_header_rows(ws).values():
+            for col in range(2, 6):
+                if _rob_cell_is_writable(ws, row, col):
+                    ws.cell(row, col).number_format = "mm/dd/yyyy"
+
+    if prev_wb and wk_one_name in new_wb.sheetnames:
+        err = _fill_rob_prev_table(
+            new_wb[wk_one_name],
+            prev_wb,
+            prev_wb_formulas,
+            report_month,
+            tracked_year=tracked_year,
+        )
+        if err:
+            warnings.append(f"Prev table: {err}")
+
+    warnings.extend(
+        apply_rob_pickup_wow_formulas(new_wb, tracked_year, allowed_sheets=None)
+    )
+
+    strip_tables(new_wb)
+    out = io.BytesIO()
+    new_wb.save(out)
+    drive_upload(
+        service,
+        new_file_id,
+        out.getvalue(),
+        new_file_name,
+    )
+
+    _cache_drive_workbook_resolution(
+        hotel_id,
+        hotel_name,
+        NEXT_YEAR_ROB_TYPE,
+        report_month,
+        new_file_id,
+        new_file_name,
+    )
+
+    return (
+        new_file_name,
+        "; ".join(warnings) if warnings else None,
+        new_file_id,
+        original_bytes,
+    )
+
+
+def render_portfolio_next_year_rob_month_setup(
+    selected_hotels,
+    key_prefix,
+):
+    """Shared next-year ROB setup for SNT, Hilton, and IHG."""
+    if not selected_hotels or not next_year_rob_enabled():
+        return
+
+    toggle = st.checkbox(
+        "Set up next month — Next-Year ROB",
+        key=f"{key_prefix}_next_year_rob_setup_toggle",
+        help=(
+            "Creates/prepares the separate next-year ROB, e.g. "
+            "'2027 ROB OCT2026 HOTELNAME'."
+        ),
+    )
+    if not toggle:
+        return
+
+    today = datetime.date.today()
+    cur_month = today.replace(day=1)
+    next_month = (
+        cur_month + datetime.timedelta(days=32)
+    ).replace(day=1)
+
+    with st.container(border=True):
+        options = {
+            cur_month.strftime("%B %Y"): cur_month,
+            next_month.strftime("%B %Y"): next_month,
+        }
+        labels = list(options.keys())
+        default_dt = next_month if today.day >= 22 else cur_month
+
+        sel = st.selectbox(
+            "Report month for Next-Year ROB",
+            labels,
+            index=labels.index(default_dt.strftime("%B %Y")),
+            key=f"{key_prefix}_next_year_rob_setup_month",
+        )
+        report_month = options[sel]
+        tracked_year = report_month.year + 1
+
+        st.caption(
+            f"This will prepare the **{tracked_year} ROB** stored in "
+            f"the {report_month:%B %Y} Revenue Reports folder."
+        )
+
+        if st.button(
+            f"Set Up {tracked_year} ROB",
+            key=f"{key_prefix}_next_year_rob_setup_btn",
+            type="primary",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            undo_items = []
+            successes = 0
+
+            for hotel_name, hotel_id in selected_hotels:
+                if not hotel_id:
+                    st.error(f"{hotel_name}: no Drive folder found.")
+                    continue
+                try:
+                    with st.spinner(
+                        f"Setting up {hotel_name} {tracked_year} ROB..."
+                    ):
+                        name, err, fid, original = setup_next_year_rob_month(
+                            svc,
+                            hotel_id,
+                            hotel_name,
+                            report_month,
+                            tracked_year=tracked_year,
+                        )
+
+                    if err and not name:
+                        st.error(f"{hotel_name}: {err}")
+                        continue
+                    if err:
+                        st.warning(f"{hotel_name}: {err}")
+
+                    if fid and original is not None:
+                        undo_items.append({
+                            "file_id": fid,
+                            "file_name": name,
+                            "bytes": original,
+                        })
+
+                    st.success(
+                        f"{hotel_name}: **{name}** ready."
+                    )
+                    successes += 1
+                except Exception as e:
+                    st.error(
+                        f"{hotel_name}: next-year ROB setup error — {e}"
+                    )
+
+            if undo_items:
+                st.session_state[
+                    f"{key_prefix}_next_year_rob_undo"
+                ] = undo_items
+
+        undo_key = f"{key_prefix}_next_year_rob_undo"
+        if undo_key in st.session_state:
+            if st.button(
+                "↩ Reset Next-Year ROB setup",
+                key=f"{key_prefix}_next_year_rob_reset",
+                use_container_width=True,
+            ):
+                saved, errors = restore_drive_snapshots(
+                    get_drive_service(),
+                    st.session_state[undo_key],
+                    undo_key,
+                )
+                if saved:
+                    st.success(
+                        "Restored: " + ", ".join(saved)
+                    )
+                for err in errors:
+                    st.error(err)
 
 
 def find_forecast_master(service, hotel_id: str):
@@ -4549,97 +7478,605 @@ def find_forecast_master(service, hotel_id: str):
     return None, "No FORECAST master file found in Drive."
 
 
-def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+
+def _previous_month(d):
+    first = d.replace(day=1)
+    return (first - datetime.timedelta(days=1)).replace(day=1)
+
+
+def _is_ashworth_hotel(hotel_name):
+    n = str(hotel_name or "").strip().lower()
+    return "ashworth" in n or "hampton" in n
+
+
+def _numeric_formula_value(value):
+    """Best-effort numeric evaluation for simple hand-entered ROB formulas."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s.startswith("="):
+        return safe_float(s)
+
+    expr = s[1:].strip()
+    # Only allow simple arithmetic made of numbers, spaces, decimal points,
+    # parentheses and + - * /. No cell refs/functions.
+    if not re.fullmatch(r"[0-9\.\+\-\*/\(\)\s]+", expr):
+        return None
+    try:
+        return float(eval(expr, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
+def _rob_budget_values_for_month(service, hotel_id, hotel_name, target_month):
+    """Return target month total budget values from ROB I/J.
+
+    Mapping:
+      FCST-WK1 C29 <- ROB I Room Nights
+      FCST-WK1 D29 <- ROB I Revenue
+      FCST-WK1 C30 <- ROB J Room Nights
+      FCST-WK1 D30 <- ROB J Revenue
+
+    Only total Revenue / Room Nights are read — Group rows are intentionally
+    excluded.
     """
-    Copy Forecast master → rename for target_month → place in month folder → set B4 date.
-    Returns (new_file_name, error_str).
+    # The current ROB normally already carries future-month budgets, so for a
+    # next-month Forecast setup prefer the prior month's ROB workbook.
+    source_months = [_previous_month(target_month), target_month]
+    seen = set()
+    last_err = None
+
+    for source_month in source_months:
+        key = (source_month.year, source_month.month)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        result, err = resolve_drive_workbook(
+            service,
+            hotel_id,
+            hotel_name,
+            "ROB",
+            month_date=source_month,
+        )
+        if err or not result:
+            last_err = err
+            continue
+
+        file_id, file_name = result
+        try:
+            raw = drive_download(service, file_id)
+
+            # Data-only first so formula-backed budget cells return cached
+            # numeric values when the workbook has been calculated in Excel.
+            wb_values = openpyxl.load_workbook(
+                io.BytesIO(raw),
+                data_only=True,
+            )
+            wb_formulas = openpyxl.load_workbook(
+                io.BytesIO(raw),
+                data_only=False,
+            )
+
+            sheet = next(
+                (s for s in ROB_SHEETS if s in wb_values.sheetnames),
+                wb_values.sheetnames[0],
+            )
+            ws_values = wb_values[sheet]
+            ws_formulas = wb_formulas[sheet]
+
+            blocks = rob_month_blocks(ws_formulas)
+            labels = blocks.get(target_month.month - 1)
+            if not labels:
+                last_err = (
+                    f"{file_name}: could not find the "
+                    f"{target_month:%B} ROB block."
+                )
+                continue
+
+            revenue_row = labels.get("revenue")
+            rooms_row = labels.get("room nights")
+            if not revenue_row or not rooms_row:
+                last_err = (
+                    f"{file_name}: target month is missing Revenue or "
+                    f"Room Nights rows."
+                )
+                continue
+
+            def get_num(row, col):
+                v = ws_values.cell(row, col).value
+                num = safe_float(v)
+                if num is not None:
+                    return num
+
+                # If cached formula result is unavailable, support simple
+                # hand-entered arithmetic formulas such as =37660+836325.37.
+                return _numeric_formula_value(
+                    ws_formulas.cell(row, col).value
+                )
+
+            vals = {
+                "c29": get_num(rooms_row, 9),
+                "d29": get_num(revenue_row, 9),
+                "c30": get_num(rooms_row, 10),
+                "d30": get_num(revenue_row, 10),
+                "source_file": file_name,
+                "source_sheet": sheet,
+            }
+
+            missing = [
+                cell.upper()
+                for cell in ("c29", "d29", "c30", "d30")
+                if vals[cell] is None
+            ]
+            if missing:
+                last_err = (
+                    f"{file_name}: could not read ROB budget value(s) for "
+                    f"{target_month:%B}: {', '.join(missing)}."
+                )
+                continue
+
+            return vals, None
+        except Exception as e:
+            last_err = f"{file_name}: could not read ROB budget — {e}"
+
+    return None, last_err or (
+        f"Could not find a ROB workbook containing the "
+        f"{target_month:%B %Y} budget."
+    )
+
+
+def _write_forecast_budget_block(
+    wb,
+    service,
+    hotel_id,
+    hotel_name,
+    target_month,
+):
+    """Populate FCST-WK1 C29:D30 from the corresponding ROB total budget."""
+    values, err = _rob_budget_values_for_month(
+        service,
+        hotel_id,
+        hotel_name,
+        target_month,
+    )
+    if err or not values:
+        return err
+
+    sheet = (
+        "FCST-WK1"
+        if "FCST-WK1" in wb.sheetnames
+        else next(
+            (s for s in FORECAST_SHEETS if s in wb.sheetnames),
+            None,
+        )
+    )
+    if not sheet:
+        return "Could not find FCST-WK1 in the Forecast workbook."
+
+    ws = wb[sheet]
+    ws["C29"] = int(round(values["c29"]))
+    ws["D29"] = round(values["d29"], 2)
+    ws["C30"] = int(round(values["c30"]))
+    ws["D30"] = round(values["d30"], 2)
+    return None
+
+
+def _prior_month_forecast_template_fallback(
+    service,
+    hotel_id,
+    hotel_name,
+    target_month,
+):
+    """Use the immediately prior month's Forecast when no master exists."""
+    prior_month = _previous_month(target_month)
+    result, err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        "Forecast",
+        month_date=prior_month,
+    )
+    if err or not result:
+        return None, (
+            f"No Forecast master was found, and the prior-month "
+            f"Forecast ({prior_month:%b %Y}) could not be found either."
+        )
+    return result, None
+
+
+
+def _reset_new_forecast_month_template(wb):
+    """Clear prior-month entry data from a freshly copied Forecast workbook.
+
+    This is intentionally run ONLY when a new month Forecast file is created.
+    It preserves formulas, formatting, Month Ending Budget / Last Year values,
+    and the workbook structure.
+
+    Cleared from every FCST-WK tab:
+      - As-of date
+      - OTB Rooms Sold
+      - Estimated Pick Up
+      - Est. Group Pick Up
+      - Forecast ADR manual row
+      - ADR OTB
+      - Actual Rooms Sold
+      - Actual Revenue
+      - Old pickup-history numeric snapshots below the main forecast section
+
+    The Hilton updater then fills only fresh OTB Rooms Sold + ADR OTB on the
+    selected week (WK1 for a new month).
     """
-    year_kw  = str(target_month.year)
+    for sheet_name in FORECAST_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+        rows = locate_forecast_rows(ws)
+        if not rows:
+            continue
+
+        # Clear prior as-of date.
+        ws.cell(rows["as_of_row"], 1).value = None
+
+        # Resolve date columns from the current template. If they are not
+        # readable yet, fall back to the standard daily area B:AF.
+        col_map = build_forecast_date_col_map(
+            ws,
+            wb,
+            date_row=rows["date_row"],
+        )
+        data_cols = sorted(set(col_map.values())) if col_map else list(range(2, 33))
+
+        # Find the manual entry rows that are not already returned by
+        # locate_forecast_rows.
+        estimated_pickup_row = None
+        group_pickup_row = None
+        forecast_adr_row = None
+
+        for r in range(1, min(ws.max_row, 30) + 1):
+            label = str(ws.cell(r, 1).value or "").strip().lower()
+
+            if label == "estimated pick up":
+                estimated_pickup_row = r
+            elif "group pick" in label:
+                group_pickup_row = r
+            elif (
+                label == "adr"
+                and r < rows["adr_otb_row"]
+                and forecast_adr_row is None
+            ):
+                forecast_adr_row = r
+
+        clear_rows = {
+            rows["otb_rooms_row"],
+            rows["adr_otb_row"],
+            rows["actual_rooms_row"],
+            rows["actual_revenue_row"],
+        }
+        for r in (
+            estimated_pickup_row,
+            group_pickup_row,
+            forecast_adr_row,
+        ):
+            if r:
+                clear_rows.add(r)
+
+        # Only remove literal/manual values. Formula cells are template logic
+        # and must remain untouched.
+        for r in clear_rows:
+            for c in data_cols:
+                cell = ws.cell(r, c)
+                if not is_formula(cell.value):
+                    cell.value = None
+
+        # Clear old pickup-history snapshots below the main Forecast block.
+        # These tables contain numeric OTB snapshots from the copied prior
+        # month. Keep every formula/label intact, but remove literal numeric
+        # or date entries from the daily data columns.
+        for r in range(45, min(ws.max_row, 120) + 1):
+            for c in data_cols:
+                cell = ws.cell(r, c)
+                value = cell.value
+                if is_formula(value) or value is None:
+                    continue
+                if isinstance(value, (int, float, datetime.date, datetime.datetime)):
+                    cell.value = None
+
+    return wb
+
+
+
+def setup_new_forecast_month(
+    service,
+    hotel_id: str,
+    hotel_name: str,
+    target_month: datetime.date,
+):
+    """
+    Set up next month's Forecast.
+
+    Normal properties:
+      Forecast master -> target month Forecast.
+
+    Fallback:
+      If no Forecast master exists, copy the immediately prior month's
+      Forecast workbook instead.
+
+    Also populates FCST-WK1 C29:D30 with the target month's TOTAL ROB budget:
+      C29 = ROB I Room Nights
+      D29 = ROB I Revenue
+      C30 = ROB J Room Nights
+      D30 = ROB J Revenue
+    """
+    year_kw = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
+    rev_id, _ = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
 
-    month_id, _ = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, _ = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        target_month,
+        hotel_name,
+    )
     if not month_id:
-        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist."
+        return None, (
+            f"Could not find the {month_kw} folder for {hotel_name} — "
+            f"it should already exist."
+        )
 
-    # Check if Forecast already exists
-    existing_id, existing_name = drive_find_file(service, "FORECAST", month_id)
+    # If the target Forecast already exists, still update its start date/budget
+    # instead of returning immediately. That makes the setup button useful for
+    # repairing a previously-created workbook too.
+    existing_id, existing_name = drive_find_file(
+        service,
+        "FORECAST",
+        month_id,
+    )
+    target_file_id = None
+    target_file_name = None
+    newly_created = False
+
     if existing_id and "master" not in existing_name.lower():
-        return existing_name, None
+        target_file_id = existing_id
+        target_file_name = existing_name
+    else:
+        master_id, master_name = find_forecast_master(
+            service,
+            hotel_id,
+        )
 
-    master_id, master_name = find_forecast_master(service, hotel_id)
-    if not master_id:
-        return None, master_name
+        # If no Forecast master exists for this property, use the prior month's
+        # live Forecast as the template rather than failing setup.
+        if not master_id:
+            fallback, fallback_err = _prior_month_forecast_template_fallback(
+                service,
+                hotel_id,
+                hotel_name,
+                target_month,
+            )
+            if fallback:
+                master_id, master_name = fallback
+            else:
+                return None, fallback_err or master_name
 
-    # Infer hotel suffix from master name
-    hotel_suffix = hotel_name.upper()
-    name_upper = master_name.upper()
-    ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
-    for kw in ("FORECAST",):
-        if kw in name_upper:
-            after = master_name[name_upper.find(kw) + len(kw):].strip()
-            after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+        hotel_suffix = hotel_name.upper()
+        name_upper = master_name.upper()
+        ext = (
+            ".xlsm"
+            if master_name.lower().endswith(".xlsm")
+            else ".xlsx"
+        )
+        if "FORECAST" in name_upper:
+            after = master_name[
+                name_upper.find("FORECAST") + len("FORECAST"):
+            ].strip()
+            after = re.sub(
+                r"(?i)\.(xlsx|xlsm)$",
+                "",
+                after,
+            ).strip()
             if after:
                 hotel_suffix = after
-            break
 
-    new_file_name = f"{month_kw} FORECAST {hotel_suffix}{ext}"
-    try:
-        new_file_id, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
-    except Exception as e:
-        return None, str(e)
+        target_file_name = (
+            f"{month_kw} FORECAST {hotel_suffix}{ext}"
+        )
+        try:
+            target_file_id, target_file_name = drive_copy_file(
+                service,
+                master_id,
+                target_file_name,
+                month_id,
+            )
+            newly_created = True
+        except Exception as e:
+            return None, str(e)
 
-    # Set B4 = first day of target_month in FCST-WK1
     try:
-        wb_bytes  = drive_download(service, new_file_id)
-        wb        = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        wb_bytes = drive_download(service, target_file_id)
+        keep_vba = str(target_file_name).lower().endswith(".xlsm")
+        wb = openpyxl.load_workbook(
+            io.BytesIO(wb_bytes),
+            data_only=False,
+            keep_vba=keep_vba,
+        )
+
         clear_tab_colors(wb, FORECAST_SHEETS)
-        sheet     = FORECAST_SHEETS[0] if FORECAST_SHEETS[0] in wb.sheetnames else wb.sheetnames[1] if len(wb.sheetnames) > 1 else wb.sheetnames[0]
-        ws        = wb[sheet]
-        # Find "Day of Week" cell → one right + one down = start date cell
-        date_cell_row = date_cell_col = None
+
+        # A copied prior-month Forecast can contain old manual inputs on every
+        # week tab. A fresh next-month file must start clean; otherwise the
+        # app appears to "pre-fill" Estimated Pick Up, Forecast ADR, actuals,
+        # and pickup history from the old month.
+        if newly_created:
+            _reset_new_forecast_month_template(wb)
+
+        sheet = (
+            FORECAST_SHEETS[0]
+            if FORECAST_SHEETS[0] in wb.sheetnames
+            else (
+                wb.sheetnames[1]
+                if len(wb.sheetnames) > 1
+                else wb.sheetnames[0]
+            )
+        )
+        ws = wb[sheet]
+
+        # Find Day of Week -> one right + one down = first date.
+        date_cell_row = None
+        date_cell_col = None
         for r in range(1, 15):
             for c in range(1, 10):
-                if "day of week" in str(ws.cell(r, c).value or "").lower():
+                if (
+                    "day of week"
+                    in str(ws.cell(r, c).value or "").lower()
+                ):
                     date_cell_row = r + 1
                     date_cell_col = c + 1
                     break
             if date_cell_row:
                 break
+
         if date_cell_row and date_cell_col:
-            ws.cell(date_cell_row, date_cell_col).value = datetime.datetime(
-                target_month.year, target_month.month, 1)
+            ws.cell(
+                date_cell_row,
+                date_cell_col,
+            ).value = datetime.datetime(
+                target_month.year,
+                target_month.month,
+                1,
+            )
+
+        budget_err = _write_forecast_budget_block(
+            wb,
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
+        )
+
         strip_tables(wb)
         out = io.BytesIO()
         wb.save(out)
-        drive_upload(service, new_file_id, out.getvalue(), created_name)
+        drive_upload(
+            service,
+            target_file_id,
+            out.getvalue(),
+            target_file_name,
+        )
+
+        if budget_err:
+            return (
+                target_file_name,
+                f"Forecast {'created' if newly_created else 'found'} and "
+                f"dated correctly, but budget could not be filled: "
+                f"{budget_err}"
+            )
     except Exception as e:
-        return created_name, f"Copied OK but could not set start date: {e}"
+        return (
+            target_file_name,
+            f"{'Copied' if newly_created else 'Found'} Forecast, but could "
+            f"not finish setup: {e}",
+        )
 
-    return created_name, None
+    return target_file_name, None
 
 
-def find_sr_master(service, hotel_id: str):
-    """Search the hotel's own Drive tree for the SR master file.
-    Returns (file_id, file_name) or (None, error_str).
+def find_sr_master(service, hotel_id: str, target_year=None):
+    """Search the hotel's Drive tree for the correct Strategy master.
+
+    If target_year is supplied:
+      - prefer a master explicitly tied to that year
+      - allow a generic/no-year master
+      - reject masters explicitly tied to another year
+
+    This prevents a 2026 Strategy setup from accidentally copying a 2027
+    master just because Drive returned that file first.
     """
     scope_ids = _hotel_search_scope_ids(service, hotel_id)
     if not scope_ids:
         return None, "Could not resolve hotel folder to search."
+
     parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
-    q = ("trashed=false and (%s) "
-         "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-         "and name contains 'MASTER' and name contains 'STRATEGY'") % parent_clause
+    q = (
+        "trashed=false and (%s) "
+        "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "and name contains 'MASTER' and name contains 'STRATEGY'"
+    ) % parent_clause
+
     result = service.files().list(
-        q=q, fields="files(id,name,parents)", pageSize=50,
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        q=q,
+        fields="files(id,name,parents,modifiedTime)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
-    for f in result.get("files", []):
-        return f["id"], f["name"]
-    return None, "No STRATEGY master file found in Drive."
+
+    candidates = result.get("files", [])
+    if not candidates:
+        return None, "No STRATEGY master file found in Drive."
+
+    def explicit_year(value):
+        m = re.search(r"(?<!\\d)(20\\d{2})(?!\\d)", str(value or ""))
+        return int(m.group(1)) if m else None
+
+    parent_name_cache = {}
+
+    def parent_years(file_obj):
+        years = set()
+        for pid in file_obj.get("parents", []) or []:
+            if pid not in parent_name_cache:
+                try:
+                    info = service.files().get(
+                        fileId=pid,
+                        fields="name",
+                        supportsAllDrives=True,
+                    ).execute()
+                    parent_name_cache[pid] = info.get("name", "")
+                except Exception:
+                    parent_name_cache[pid] = ""
+            y = explicit_year(parent_name_cache[pid])
+            if y:
+                years.add(y)
+        return years
+
+    scored = []
+    for f in candidates:
+        years = set()
+        fy = explicit_year(f.get("name"))
+        if fy:
+            years.add(fy)
+        years.update(parent_years(f))
+
+        if target_year is not None and years and target_year not in years:
+            continue
+
+        score = 2 if (target_year is not None and target_year in years) else 1
+        scored.append((score, str(f.get("modifiedTime", "")), f))
+
+    if not scored:
+        return None, (
+            f"No Strategy master for {target_year} was found in this hotel's Drive folders."
+            if target_year
+            else "No eligible Strategy master file found in Drive."
+        )
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = scored[0][2]
+    return best["id"], best["name"]
 
 
 def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
@@ -4666,10 +8103,14 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     # Check if SR already exists in that folder
     existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
     if existing_id and "master" not in existing_name.lower():
+        _cache_drive_workbook_resolution(
+            hotel_id, hotel_name, "Strategy Report",
+            target_month, existing_id, existing_name
+        )
         return existing_name, None  # already set up
 
     # Find master
-    master_id, master_name = find_sr_master(service, hotel_id)
+    master_id, master_name = find_sr_master(service, hotel_id, target_month.year)
     if not master_id:
         return None, master_name  # error string
 
@@ -4684,9 +8125,16 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
 
     new_file_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
     try:
-        _, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+        created_id, created_name = drive_copy_file(
+            service, master_id, new_file_name, month_id
+        )
     except Exception as e:
         return None, str(e)
+
+    _cache_drive_workbook_resolution(
+        hotel_id, hotel_name, "Strategy Report",
+        target_month, created_id, created_name
+    )
     return created_name, None
 
 
@@ -4977,18 +8425,3368 @@ def restructure_sr_dates(wb, target_month):
                 pass
 
 
+def _resolve_drive_workbook_session_cached(
+    svc, hotel_id, hotel_name, wb_type, month_date, force_refresh=False
+):
+    month_key = (
+        month_date.strftime("%Y-%m")
+        if isinstance(month_date, (datetime.date, datetime.datetime))
+        else str(month_date)
+    )
+    cache_key = (str(hotel_id), str(hotel_name), str(wb_type), month_key)
+    cache = None
+    try:
+        cache = st.session_state.setdefault("_drive_workbook_resolution_cache", {})
+        if not force_refresh and cache_key in cache:
+            item = cache[cache_key]
+            result = tuple(item["result"]) if item.get("result") else None
+            return result, item.get("error")
+    except Exception:
+        pass
+
+    result, err = resolve_drive_workbook(
+        svc, hotel_id, hotel_name, wb_type, month_date=month_date
+    )
+    if cache is not None:
+        cache[cache_key] = {
+            "result": list(result) if result else None,
+            "error": err,
+        }
+    return result, err
+
+
+def _cache_drive_workbook_resolution(
+    hotel_id, hotel_name, wb_type, month_date, file_id, file_name
+):
+    try:
+        cache = st.session_state.setdefault("_drive_workbook_resolution_cache", {})
+        cache_key = (
+            str(hotel_id),
+            str(hotel_name),
+            str(wb_type),
+            month_date.strftime("%Y-%m"),
+        )
+        cache[cache_key] = {
+            "result": [file_id, file_name],
+            "error": None,
+        }
+    except Exception:
+        pass
+
+
 def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_only=True):
     """Download and parse a workbook from Drive. Returns openpyxl.Workbook or None.
     data_only=True (default) returns cached cell values — use for reference workbooks.
     data_only=False preserves formulas — use for workbooks we intend to write back.
     """
-    result, err = resolve_drive_workbook(svc, hotel_id, hotel_name, wb_type, month_date=month_date)
+    result, err = _resolve_drive_workbook_session_cached(
+        svc, hotel_id, hotel_name, wb_type, month_date
+    )
     if err or not result:
         return None
     try:
         return openpyxl.load_workbook(io.BytesIO(drive_download(svc, result[0])), data_only=data_only)
     except Exception:
         return None
+
+
+
+# ── Monthly Ancillary Revenue Report Builder ─────────────────────────────────
+# Ported from the Google Apps Script prototype v11.12. The app version is
+# upload/preview/download first so hotel-specific rules can be validated before
+# any automatic Drive overwrite is enabled.
+ANCILLARY_TEMPLATE_FILENAME = "Ancillary Revenue Report Builder.xlsx"
+
+ANCILLARY_PROPERTY_PROFILES = {
+    'ashworth by the sea': {'display':'Ashworth by the Sea','stlySource':'CANARY','journal':[
+        {'label':'1005 Early Check-In','report':'Early Check In'},
+        {'label':'1006 Late Checkout','report':'Late Checkout'},
+        {'label':'1007 Very Early Check-In','report':'Very Early Check In'},
+        {'label':'1008 Very Late Checkout','report':'Very Late Check Out'}]},
+    'inn at middletown': {'display':'Inn at Middletown','stlySource':'CANARY','journal':[
+        {'label':'6006 Early Check In / Late Checkout','report':'Early Check In / Late Checkout'}]},
+    'crowne pointe inn and spa': {'display':'Crowne Pointe Inn & Spa','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1009 Early Arrival','report':'Early Check In'},
+        {'label':'1008 Late Checkout Fee','report':'Late Checkout'}]},
+    'anchor in': {'display':'Anchor In','stlySource':'CANARY','journal':[
+        {'label':'4222 Early Check In Fee','report':'Early Check In'},
+        {'label':'Late Checkout Fee','report':'Late Checkout'}]},
+    'allegria hotel': {'display':'Allegria Hotel','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1030 Early Check In Fee','report':'Early Check In'},
+        {'label':'1031 Late Check Out Fee','report':'Late Checkout'}]},
+    'the brass key guesthouse': {'display':'The Brass Key Guesthouse','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'112 Early Check In Fee','report':'Early Check In'},
+        {'label':'121 Late Checkout','report':'Late Checkout'}]},
+    'harbor hotel provincetown': {'display':'Harbor Hotel Provincetown','stlySource':'CANARY','journal':[
+        {'label':'4006 Early Checkin/Late Departure Fee','report':'Early Check In / Late Checkout'}]},
+    'hotel 1620': {
+        'display':'Hotel 1620',
+        'stlySource':'SNT',
+        'stlyJournal':True,
+        'journal':[
+            {'label':'Early Check In — Journal Total','report':'Early Check In'},
+            {'label':'Late Checkout — Journal Total','report':'Late Checkout'},
+        ],
+    },
+    'provincetown inn': {'display':'Provincetown Inn','stlySource':'SNT','stlyJournal':True,'journal':[
+        {'label':'1009 Early Arrival','report':'Early Check In'},
+        {'label':'1008 Late Checkout Fee','report':'Late Checkout'}]},
+    'surfside hotel and suites': {'display':'Surfside Hotel & Suites','stlySource':'CANARY','journal':[
+        {'label':'4004 Early Arrival Fee','report':'Early Check In'},
+        {'label':'1004 Late Checkout Fee 12PM $25.00','report':'Late Checkout'},
+        {'label':'1005 Late Checkout 1PM $40.00','report':'Late Checkout'},
+        {'label':'1006 Late Checkout 2PM $60.00','report':'Late Checkout'}]},
+    'hotel tybee': {'display':'Hotel Tybee','stlySource':'CANARY','journal':[
+        {'label':'4011 Early Check-In','report':'Early Check In'},
+        {'label':'4012 Late Checkout','report':'Late Checkout'},
+        {'label':'4013 Very Early Check-In','report':'Very Early Check In'},
+        {'label':'4014 Very Late Checkout','report':'Very Late Check Out'}]},
+    'pleasant view inn': {'display':'Pleasant View Inn','stlySource':'CANARY','journal':[
+        {'label':'4004 Early Check In Fee','report':'Early Check In'},
+        {'label':'4024 Late Check Out Fee','report':'Late Checkout'}]},
+    'the wolfeboro inn': {'display':'The Wolfeboro Inn','stlySource':'CANARY','journal':[
+        {'label':'1005 Early Check-In Fee Before 12:00 PM','report':'Early Check In'},
+        {'label':'1006 Late Check-Out Fee 12:00 PM','report':'Late Checkout'},
+        {'label':'1026 Early Check In Fee Before 1:00 PM','report':'Early Check In'},
+        {'label':'1027 Late Check Out Fee 1:00 PM','report':'Late Checkout'}]},
+}
+
+# Ancillary display/profile name -> canonical hotel label used by the shared
+# Revenue Reports Drive discovery.
+ANCILLARY_DRIVE_HOTEL_MAP = {
+    "ashworth by the sea": "Ashworth",
+    "inn at middletown": "Middletown",
+    "crowne pointe inn and spa": "Crowne Pointe",
+    "anchor in": "Anchor Inn",
+    "allegria hotel": "Long Beach",
+    "the brass key guesthouse": "Brass Key",
+    "harbor hotel provincetown": "Harbor Hotel",
+    "hotel 1620": "1620",
+    "provincetown inn": "Provincetown Inn",
+    "surfside hotel and suites": "Surfside",
+    "hotel tybee": "Tybee",
+    "pleasant view inn": "Westerly",
+    "the wolfeboro inn": "Wolfeboro",
+}
+
+
+ANCILLARY_PROPERTY_ALIASES = {
+    'brass key guesthouse': 'the brass key guesthouse',
+    'harbor hotel': 'harbor hotel provincetown',
+    '1620': 'hotel 1620',
+    'plymouth': 'hotel 1620',
+    'provincetown surfside': 'surfside hotel and suites',
+    'westerly': 'pleasant view inn',
+    'wolfeboro inn': 'the wolfeboro inn',
+}
+
+ANCILLARY_RULES = {
+    'ashworth by the sea': {
+        'operational':['Parking Fee','Resort Fee- $25','Booking.com $25 Resort Fee Non-Taxable',
+                       'Booking.com $20 Resort Fee Non-Taxable','Booking.com Resort Fee ADJUSTMENT -$5',
+                       'Waive Parking Fee','Waive Resort Fee'],
+        'itemized':['1pm Early Check-in','2pm Early Check-in','1pm Late Check Out','2pm Late Check-out'],
+        'exclude':[]},
+    'inn at middletown': {
+        'operational':[],
+        'itemized':['11am Very Early Check-in','1pm Early Check-in','1pm Late Checkout'],
+        'exclude':['Amenity Fee']},
+    'crowne pointe inn and spa': {
+        'operational':[],
+        'itemized':['11am Early Check In','1pm Early Check In','1 PM Late Check Out','2 PM Late Check Out'],
+        'exclude':['Resort Fee Waived','Resort Fee Waived On Season']},
+    'anchor in': {
+        'operational':['Booking.com Resort Fee','Resort Fee - $25','Parking - $10'],
+        'itemized':['Early Check in 12PM','Early check in 1PM'],
+        'exclude':[]},
+    'hotel tybee': {
+        'operational':['Amenity Fee - $20','Group Amenity Fee $10.00','Parking Fee - $10',
+                       '-$10 Parking Fee off season','Waive Amenity Fee'],
+        'itemized':[], 'exclude':[]},
+    'allegria hotel': {
+        'operational':['Waive $55 Resort Fee (Incl Tax)'],
+        'itemized':['Early Check In - 12pm - 3pm','Early Check In - 7am - 12pm',
+                    'Relax & Revel until 1pm','Relax & Revel until 2pm'],
+        'exclude':[]},
+    'pleasant view inn': {
+        'operational': ['$42 Resort Fee', 'Waive Resort Fee'],
+        'itemized': [
+            '1PM Late Check Out - On Season',
+            '2PM Early Check In - On Season',
+            '2PM Early Check In - On Season - Fr, Sat',
+        ],
+        'exclude': [],
+    },
+    'harbor hotel provincetown': {
+        'operational': [],
+        'itemized': [
+            'Priority Morning Check-In (10:00 AM)',
+        ],
+        'exclude': [],
+    },
+
+}
+
+ANCILLARY_YOY_ALIASES = {
+    'ashworth by the sea': [
+        ('Pet Fee','Bring your furry friend'),('Cheese & Cracker Tray','Cheese and Cracker Tray'),
+        ('Cookies & Milk','Cookies and Milk'),('Bottle of Champagne','Bottle of Champagne'),
+        ('Early Check In','Early Check-in'),('Early Check In','Very Early Check-in'),
+        ('Late Checkout','Late Checkout'),('Late Checkout','Very Late Checkout'),
+        ('Very Early Check In','Very Early Check-in'),
+        ('Oceanfront Room Two Queen Beds Balcony','Ocean Front, 2 Queen Beds, Balcony'),
+        ('Oceanfront Room One King Bed Balcony','Ocean Front, 1 King Bed, Balcony'),
+        ('Ashworth Oceanfront Room One King Bed Balcony','Ashworth Ocean Front, 1 King Bed, Balcony')],
+    'inn at middletown': [
+        ('Pet Fee','Pet Accommodation'),
+        ('Early Check In / Late Checkout','Early Check-in'),
+        ('Early Check In / Late Checkout','Very Early Check-in'),
+        ('Early Check In / Late Checkout','Late Checkout'),
+        ('Early Check In / Late Checkout','Very Late Checkout'),
+        ('House Red Wine','Bottle of Red Wine')],
+    'hotel tybee': [
+        ('Pet Fee','Pet Accommodation'),('Rollaway Bed','Extra twin bed $25.00 per day'),
+        ('Very Late Check Out','Very Late Checkout'),('Bottle of Prosecco','Bottle of Sparkling Wine'),
+        ('Bottle or Red Wine','Bottle of Red Wine'),('All American Bucket of Beer','All American Beach Beer Bucket')],
+    'harbor hotel provincetown': [
+        # Combined Journal ECI/LCO line versus the four historical Canary timing products.
+        ('Early Check In / Late Checkout','Early Check-in'),
+        ('Early Check In / Late Checkout','Very Early Check-in'),
+        ('Early Check In / Late Checkout','Late Checkout'),
+        ('Early Check In / Late Checkout','Very Late Checkout'),
+
+        # Renamed products / room-upgrade labels.
+        ('Pet Fee','Pet Accommodation'),
+        ('Premium Bayview 2 Doubles','Premium Bay View Room with Two Double Beds'),
+        ('Courtyard 2 Queens with Patio/Balcony','Courtyard Queen with Patio/Balcony'),
+        ('Courtyard Patio Suite','Courtyard Suite with Patio or Balcony'),
+        ('Bayview 2 Doubles','Bay View with Two Double Beds'),
+        ('Bayview King','Bay View King'),
+    ],
+}
+
+
+def _ar_norm(v):
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(v or '').lower().replace('&','and'))).strip()
+
+
+def ancillary_profile(property_name):
+    n = _ar_norm(property_name)
+    n = ANCILLARY_PROPERTY_ALIASES.get(n, n)
+    if n in ANCILLARY_PROPERTY_PROFILES:
+        return ANCILLARY_PROPERTY_PROFILES[n], n
+    for key, prof in ANCILLARY_PROPERTY_PROFILES.items():
+        if n in key or key in n:
+            return prof, key
+    return ANCILLARY_PROPERTY_PROFILES['ashworth by the sea'], 'ashworth by the sea'
+
+
+def _ar_num(v):
+    if v is None or v == '':
+        return None
+    if isinstance(v, (int,float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip()
+    neg = '(' in s and ')' in s
+    s = re.sub(r'[$,%()\s,]', '', s)
+    if not s:
+        return None
+    try:
+        n = float(s)
+        return -abs(n) if neg else n
+    except Exception:
+        return None
+
+
+def _ar_date(v):
+    if isinstance(v, datetime.datetime): return v
+    if isinstance(v, datetime.date): return datetime.datetime.combine(v, datetime.time())
+    if isinstance(v, (int,float)):
+        try: return datetime.datetime(1899,12,30) + datetime.timedelta(days=float(v))
+        except Exception: return None
+    if not v: return None
+    for fmt in ('%m/%d/%Y','%Y-%m-%d','%m/%d/%y','%b %d, %Y','%B %d, %Y'):
+        try: return datetime.datetime.strptime(str(v).strip(), fmt)
+        except Exception: pass
+    try: return pd.to_datetime(v).to_pydatetime()
+    except Exception: return None
+
+
+def _ar_file_rows(uploaded_file):
+    data = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
+    name = getattr(uploaded_file, 'name', '').lower()
+    if name.endswith('.csv'):
+        txt = data.decode('utf-8-sig', errors='replace')
+        return list(csv.reader(io.StringIO(txt)))
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    ws = wb.worksheets[0]
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+def _ar_header_map(row):
+    return {_ar_norm(v): i for i,v in enumerate(row)}
+
+
+def _ar_col(h, names):
+    for name in names:
+        k = _ar_norm(name)
+        if k in h: return h[k]
+    return -1
+
+
+def ancillary_parse_addon(raw, property_key):
+    rules = ANCILLARY_RULES.get(
+        property_key,
+        {'operational': [], 'itemized': [], 'exclude': []},
+    )
+    operational_set = {_ar_norm(x) for x in rules.get('operational', [])}
+    itemized_set = {_ar_norm(x) for x in rules.get('itemized', [])}
+    exclude_set = {_ar_norm(x) for x in rules.get('exclude', [])}
+
+    header_row = -1
+    for i, row in enumerate(raw[:12]):
+        if (
+            len(row) > 1
+            and not str(row[0] or '').strip()
+            and 'total count' in str(row[1] or '').lower()
+        ):
+            header_row = i
+            break
+    if header_row < 0:
+        header_row = 2
+
+    buckets = {'main': [], 'operational': [], 'itemized': []}
+
+    for r in raw[header_row + 1:]:
+        name = str(r[0] or '').strip() if r else ''
+        if not name:
+            continue
+
+        count = _ar_num(r[1] if len(r) > 1 else None)
+        revenue = _ar_num(r[2] if len(r) > 2 else None)
+        average = _ar_num(r[3] if len(r) > 3 else None)
+        if count is None and revenue is None:
+            continue
+
+        obj = {
+            'name': name,
+            'count': count or 0,
+            'revenue': revenue or 0,
+            'average': average or 0,
+        }
+
+        n = _ar_norm(name)
+        if n in exclude_set:
+            continue
+
+        # Portfolio-wide operational/non-ancillary fee rules.
+        is_operational = bool(re.search(
+            r'\bwaiv(?:e|ed)\b'
+            r'|\bresort\s+fee\b'
+            r'|\bamenity\s+fee\b'
+            r'|\bparking\s+fee\b'
+            r'|\bdestination\s+fee\b'
+            r'|\bgroup\s+destination\s+fee\b'
+            r'|^parking\s*-?\s*\$'
+            r'|booking\.com.*(?:resort|amenity|parking|destination)',
+            name,
+            re.I,
+        ))
+
+        # Detailed ECI/LCO timing products belong only in the itemized section.
+        is_timing = bool(re.search(
+            r'\bearly\s+(?:check\s*-?\s*in|arrival)\b'
+            r'|\blate\s+(?:check\s*-?\s*out|checkout|departure)\b'
+            r'|\bvery\s+early\s+check\s*-?\s*in\b'
+            r'|\bvery\s+late\s+check\s*-?\s*out\b'
+            r'|\bpriority\b.*\bcheck\s*-?\s*in\b'
+            r'|\bmorning\b.*\bcheck\s*-?\s*in\b',
+            name,
+            re.I,
+        ))
+
+        # Main-table ECI/LCO revenue is Journal-only.
+        # Raw generic Early Check In / Late Checkout rows are not retained.
+        is_journal_equivalent = _ar_is_journal_equivalent(name)
+
+        if n in operational_set or is_operational:
+            buckets['operational'].append(obj)
+        elif n in itemized_set or (is_timing and not is_journal_equivalent):
+            buckets['itemized'].append(obj)
+        elif is_journal_equivalent:
+            continue
+        else:
+            buckets['main'].append(obj)
+
+    def combine(rows):
+        grouped = {}
+        for r in rows:
+            key = _ar_norm(r['name'])
+            if key not in grouped:
+                grouped[key] = {
+                    'name': r['name'],
+                    'count': 0,
+                    'revenue': 0,
+                    'average': 0,
+                }
+            grouped[key]['count'] += _ar_num(r['count']) or 0
+            grouped[key]['revenue'] += _ar_num(r['revenue']) or 0
+
+        for r in grouped.values():
+            r['average'] = r['revenue'] / r['count'] if r['count'] else 0
+
+        return sorted(
+            grouped.values(),
+            key=lambda x: x['revenue'],
+            reverse=True,
+        )
+
+    return {k: combine(v) for k, v in buckets.items()}
+
+
+def ancillary_parse_upsell(raw):
+    if not raw: return {'byRoomType':[],'byStaff':[],'byLevel':[]}
+    h=_ar_header_map(raw[0])
+    user_c=_ar_col(h,['user']); channel_c=_ar_col(h,['channel']); from_c=_ar_col(h,['from level'])
+    room_c=_ar_col(h,['to room type']); to_c=_ar_col(h,['to level']); nights_c=_ar_col(h,['nights']); total_c=_ar_col(h,['total amount'])
+    if room_c<0 or total_c<0:
+        raise ValueError('SNT Upsell file is missing To Room Type or Total Amount.')
+    room={}; staff={}; level={}
+    for r in raw[1:]:
+        def rv(c): return r[c] if c>=0 and c<len(r) else None
+        revenue=_ar_num(rv(total_c)) or 0
+        producing=1 if revenue != 0 else 0
+        nights=_ar_num(rv(nights_c)) or 0
+        from_level=_ar_num(rv(from_c)) or 0; to_level=_ar_num(rv(to_c)) or 0
+        lvl=int(to_level-from_level) if (to_level-from_level)>0 else 0
+        room_name=str(rv(room_c) or '').strip(); channel=str(rv(channel_c) or '').strip(); user=str(rv(user_c) or '').strip()
+        if not user and channel.upper() in ('URL','WEB'): user='WEB'
+        if not user: user='Unknown'
+        if room_name:
+            z=room.setdefault(room_name,{'name':room_name,'count':0,'revenue':0,'actualNights':0})
+            z['count']+=producing; z['revenue']+=revenue; z['actualNights']+=producing*nights
+        z=staff.setdefault(user,{'name':user,'count':0,'revenue':0}); z['count']+=1; z['revenue']+=revenue
+        if lvl>0: level['+'+str(lvl)] = level.get('+'+str(lvl),0)+1
+    by_room=[]
+    for x in room.values():
+        if x['revenue'] or x['actualNights']:
+            by_room.append({'name':x['name'],'count':x['actualNights'],'revenue':x['revenue'],'average':x['revenue']/x['actualNights'] if x['actualNights'] else 0})
+    by_room.sort(key=lambda x:x['revenue'], reverse=True)
+    by_staff=sorted(staff.values(), key=lambda x:(0 if x['name']=='WEB' else 1, x['name'].lower()))
+    by_level=[{'level':k,'count':level[k]} for k in sorted(level,key=lambda z:int(z[1:]))]
+    return {'byRoomType':by_room,'byStaff':by_staff,'byLevel':by_level}
+
+
+def ancillary_parse_canary_history(raw, stly_month):
+    if not raw: raise ValueError('Historical Canary file is empty.')
+    h=_ar_header_map(raw[0]); ac=_ar_col(h,['arrival date']); sc=_ar_col(h,['status']); ic=_ar_col(h,['item']); rc=_ar_col(h,['revenue'])
+    if min(ac,sc,ic,rc)<0: raise ValueError('Historical Canary file is missing Arrival Date, Status, Item, or Revenue.')
+    agg={}
+    for r in raw[1:]:
+        dt=_ar_date(r[ac] if ac<len(r) else None)
+        if not dt or dt.month!=stly_month.month or dt.year!=stly_month.year: continue
+        name=str(r[ic] or '').strip(); status=str(r[sc] or '').strip().lower(); revenue=_ar_num(r[rc]) or 0
+        if not name: continue
+        z=agg.setdefault(name,{'name':name,'approved':0,'denied':0,'expired':0})
+        if status=='approved': z['approved']+=revenue
+        elif status=='denied': z['denied']+=revenue
+        elif status=='expired': z['expired']+=revenue
+    rows=[]
+    for x in agg.values():
+        x=dict(x); x['requested']=x['approved']+x['denied']+x['expired']; rows.append(x)
+    rows.sort(key=lambda x:(-x['approved'],-x['requested']))
+    totals={k:sum(x[k] for x in rows) for k in ('requested','approved','denied','expired')}
+    return {'sourceType':'CANARY','rows':rows,'totals':totals,'byItem':{_ar_norm(x['name']):x for x in rows},'itemizedRows':[]}
+
+
+def ancillary_parse_snt_history(addon_raw, upsell_raw, property_key):
+    addon=ancillary_parse_addon(addon_raw, property_key); ups=ancillary_parse_upsell(upsell_raw)
+    rows=sorted(addon['main']+ups['byRoomType'], key=lambda x:x['revenue'], reverse=True)
+    out=[]; by={}
+    for r in rows:
+        x=dict(r,approved=r['revenue'],requested=r['revenue'],denied=0,expired=0); out.append(x); by[_ar_norm(x['name'])]=x
+    totals={'count':sum(_ar_num(x.get('count')) or 0 for x in out),'revenue':sum(x['revenue'] for x in out)}
+    totals.update({'requested':totals['revenue'],'approved':totals['revenue'],'denied':0,'expired':0})
+    return {'sourceType':'SNT','rows':out,'totals':totals,'byItem':by,'itemizedRows':[dict(x) for x in addon['itemized']]}
+
+
+def ancillary_apply_stly_journal(stly, journal_rows):
+    remove={_ar_norm(x) for x in ['11am Early Check In','1pm Early Check In','11am Early Check-in','1pm Early Check-in','1 PM Late Check Out','2 PM Late Check Out','1pm Late Checkout','2pm Late Checkout']}
+    rows=[dict(r) for r in stly.get('rows',[]) if _ar_norm(r['name']) not in remove]
+    for j in journal_rows:
+        if j.get('revenue') is None: continue
+        rev=_ar_num(j['revenue']) or 0
+        rows.append({'name':j['name'],'count':None,'revenue':rev,'average':None,'approved':rev,'requested':rev,'denied':0,'expired':0})
+    rows.sort(key=lambda x:_ar_num(x.get('revenue')) or 0, reverse=True)
+    by={_ar_norm(x['name']):x for x in rows}
+    total_rev=sum(_ar_num(x.get('revenue')) or 0 for x in rows); total_count=sum(_ar_num(x.get('count')) or 0 for x in rows if x.get('count') is not None)
+    return {'sourceType':'SNT','rows':rows,'totals':{'count':total_count,'revenue':total_rev,'requested':total_rev,'approved':total_rev,'denied':0,'expired':0},'byItem':by,'itemizedRows':stly.get('itemizedRows',[])}
+
+
+def ancillary_property_corrections(stly, property_key):
+    if property_key=='allegria hotel':
+        for r in stly.get('rows',[]):
+            if _ar_norm(r.get('name'))==_ar_norm('Rollaway Bed'):
+                r['revenue']=r['approved']=r['requested']=800
+                r['average']=800/(_ar_num(r.get('count')) or 1) if (_ar_num(r.get('count')) or 0) else None
+        stly['rows'].sort(key=lambda x:_ar_num(x.get('revenue')) or 0, reverse=True)
+        stly['byItem']={_ar_norm(x['name']):x for x in stly['rows']}
+        rev=sum(_ar_num(x.get('revenue')) or 0 for x in stly['rows']); cnt=sum(_ar_num(x.get('count')) or 0 for x in stly['rows'] if x.get('count') is not None)
+        stly['totals'].update({'count':cnt,'revenue':rev,'requested':rev,'approved':rev,'denied':0,'expired':0})
+    return stly
+
+
+def ancillary_parse_staff(raw):
+    if not raw: return []
+    h=_ar_header_map(raw[0]); nc=_ar_col(h,['staff name']); mc=_ar_col(h,['messages'])
+    if nc<0 or mc<0: return []
+    rows=[{'name':str(r[nc] or '').strip(),'messages':_ar_num(r[mc]) or 0} for r in raw[1:] if nc<len(r) and str(r[nc] or '').strip()]
+    return sorted(rows,key=lambda x:x['messages'], reverse=True)
+
+
+def ancillary_alias_map(property_key):
+    out={}
+    for cur,prev in ANCILLARY_YOY_ALIASES.get(property_key,[]): out.setdefault(_ar_norm(cur),[]).append(prev)
+    return out
+
+
+def ancillary_variance(current_rows, stly_by_item, property_key):
+    aliases=ancillary_alias_map(property_key); is_ash='ashworth' in property_key; out=[]; matched={}; cur_by={_ar_norm(r['name']):r for r in current_rows}
+    suppressed=set(); rollups={}
+    if is_ash:
+        early=_ar_norm('Early Check In'); very=_ar_norm('Very Early Check In'); rollups[early]=[early,very]; suppressed.add(very)
+    for r in current_rows:
+        n=_ar_norm(r['name'])
+        if n in suppressed: continue
+        current=sum(_ar_num(cur_by[x].get('revenue')) or 0 for x in rollups.get(n,[n]) if x in cur_by)
+        candidates=aliases.get(n,[]) or [r['name']]; prev=0
+        for name in candidates:
+            sn=_ar_norm(name)
+            if sn in matched: continue
+            x=stly_by_item.get(sn)
+            if x: prev+=_ar_num(x.get('approved')) or 0; matched[sn]=True
+        if n not in aliases:
+            x=stly_by_item.get(n)
+            if x and n not in matched: prev+=_ar_num(x.get('approved')) or 0; matched[n]=True
+        out.append({'name':r['name'],'current':current,'stly':prev,'variance':current-prev})
+    for n,x in stly_by_item.items():
+        if n in matched: continue
+        prev=_ar_num(x.get('approved')) or 0
+        if prev: out.append({'name':x['name'],'current':0,'stly':prev,'variance':-prev})
+    return out
+
+
+def _ar_is_journal_equivalent(name):
+    n=_ar_norm(name)
+    vals=['early check in','early check-in','late checkout','late check out','very early check in','very early check-in','very late checkout','very late check out','early check in / late checkout','early check in late checkout']
+    return any(n==_ar_norm(x) for x in vals)
+
+
+def _ar_copy_style_row(src_ws, src_row, dst_ws, dst_row, start_col=1, num_cols=5):
+    for c in range(start_col,start_col+num_cols):
+        s=src_ws.cell(src_row,c); d=dst_ws.cell(dst_row,c)
+        if s.has_style:
+            d._style=copy(s._style)
+        d.number_format=s.number_format
+        d.font=copy(s.font); d.fill=copy(s.fill); d.border=copy(s.border); d.alignment=copy(s.alignment); d.protection=copy(s.protection)
+    dst_ws.row_dimensions[dst_row].height=src_ws.row_dimensions[src_row].height
+
+
+def _ar_copy_style_shifted(src_ws, src_row, src_col, dst_ws, dst_row, dst_col, num_cols):
+    """Copy a styled template row to a different column position."""
+    for offset in range(num_cols):
+        s = src_ws.cell(src_row, src_col + offset)
+        d = dst_ws.cell(dst_row, dst_col + offset)
+        if s.has_style:
+            d._style = copy(s._style)
+        d.number_format = s.number_format
+        d.font = copy(s.font)
+        d.fill = copy(s.fill)
+        d.border = copy(s.border)
+        d.alignment = copy(s.alignment)
+        d.protection = copy(s.protection)
+    dst_ws.row_dimensions[dst_row].height = src_ws.row_dimensions[src_row].height
+
+
+def _ar_merge_name(ws,row,start_col=1,num_cols=5):
+    try: ws.merge_cells(start_row=row,start_column=start_col,end_row=row,end_column=start_col+num_cols-1)
+    except Exception: pass
+
+
+def _ar_clear_output_sheet(ws, max_row=260, max_col=17):
+    # Clear values and merges while retaining column widths. Styles will be
+    # copied from Report Template section prototypes as sections are rendered.
+    for rng in list(ws.merged_cells.ranges):
+        try: ws.unmerge_cells(str(rng))
+        except Exception: pass
+    for row in ws.iter_rows(min_row=1,max_row=max_row,min_col=1,max_col=max_col):
+        for cell in row:
+            cell.value=None
+            cell._style=copy(openpyxl.styles.Style()) if False else cell._style
+    ws._charts=[]
+
+
+def ancillary_render_report(
+    template_bytes,
+    property_name,
+    property_key,
+    report_month,
+    main_rows,
+    operational_rows,
+    itemized_rows,
+    upgrades,
+    stly,
+    variance_rows,
+    staff_rows,
+    messaging,
+    engagement,
+):
+    """Render all hotels from one universal Report Template.
+
+    Direct Python translation of the Apps Script renderReport_() structure:
+      - A:J is cleared and rebuilt dynamically from style prototype rows.
+      - M:P keeps the fixed Messaging Overview template layout.
+      - Property differences remain in data/config rules, not formatting.
+    """
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule, FormulaRule
+
+    wb = openpyxl.load_workbook(io.BytesIO(template_bytes), data_only=False)
+    if "Report Template" not in wb.sheetnames:
+        raise ValueError('Template workbook is missing the "Report Template" sheet.')
+
+    template = wb["Report Template"]
+    if "Report" in wb.sheetnames:
+        del wb["Report"]
+
+    sh = wb.copy_worksheet(template)
+    sh.title = "Report"
+
+    # Apps Script equivalent:
+    # A1:J250.breakApart().clearContent().clearFormat()
+    blank_style = copy(Workbook().active["A1"]._style)
+
+    # Only unmerge dynamic A:J. Do not destroy fixed Messaging Overview merges.
+    for merged in list(sh.merged_cells.ranges):
+        if merged.min_row <= 250 and merged.min_col <= 10 and merged.max_col >= 1:
+            try:
+                sh.unmerge_cells(str(merged))
+            except Exception:
+                pass
+
+    # Clear content + formatting in the dynamic area, preserving dimensions.
+    for row in sh.iter_rows(min_row=1, max_row=250, min_col=1, max_col=10):
+        for cell in row:
+            cell.value = None
+            cell._style = copy(blank_style)
+
+    # Clear month-specific right-side values but keep right-side formatting.
+    for cell_range in ("M6:O18", "M22:P28", "M31:N38", "M40:O60"):
+        for row in sh[cell_range]:
+            for cell in row:
+                cell.value = None
+
+    month_name = report_month.strftime("%B")
+    month_abbr = report_month.strftime("%b").upper()
+    year = report_month.year
+
+    short_prop = re.sub(
+        r" by the Sea( Hotel)?$",
+        "",
+        property_name,
+        flags=re.I,
+    )
+    # Keep the established display name, but not a separate template.
+    if property_key == "pleasant view inn":
+        short_prop = "Westerly"
+
+    def unavailable_fill(cell):
+        cell.fill = PatternFill(fill_type="solid", fgColor="CCCCCC")
+
+    # ============================================================
+    # LEFT SIDE
+    # ============================================================
+    left = 1
+
+    _ar_copy_style_row(template, 1, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = f"{short_prop} Upsell Overview - {month_name}"
+    left += 1
+
+    _ar_copy_style_row(template, 2, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = year
+    left += 1
+
+    _ar_copy_style_row(template, 3, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "Name"
+    sh.cell(left, 3).value = "Total Count"
+    sh.cell(left, 4).value = "Total Revenue"
+    sh.cell(left, 5).value = "Average revenue"
+    left += 1
+
+    for r in main_rows:
+        _ar_copy_style_row(template, 4, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = r["name"]
+
+        count_blank = r.get("count") is None or r.get("count") == ""
+        avg_blank = r.get("average") is None or r.get("average") == ""
+
+        sh.cell(left, 3).value = "" if count_blank else r.get("count")
+        sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+        sh.cell(left, 5).value = "" if avg_blank else r.get("average")
+
+        # Approved template rule: populated current-year metric cells are
+        # light gray. Dark gray is reserved only for unavailable/blank metrics.
+        light_gray = PatternFill(fill_type="solid", fgColor="EFEFEF")
+        for metric_col in (3, 4, 5):
+            sh.cell(left, metric_col).fill = copy(light_gray)
+        if count_blank:
+            unavailable_fill(sh.cell(left, 3))
+        if avg_blank:
+            unavailable_fill(sh.cell(left, 5))
+        left += 1
+
+    main_count = sum(_ar_num(r.get("count")) or 0 for r in main_rows)
+    main_revenue = sum(_ar_num(r.get("revenue")) or 0 for r in main_rows)
+    avg_rows = [
+        r for r in main_rows
+        if r.get("count") is not None and (_ar_num(r.get("count")) or 0) > 0
+    ]
+    avg_den = sum(_ar_num(r.get("count")) or 0 for r in avg_rows)
+    avg_num = sum(_ar_num(r.get("revenue")) or 0 for r in avg_rows)
+
+    _ar_copy_style_row(template, 24, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "TOTALS"
+    sh.cell(left, 3).value = main_count
+    sh.cell(left, 4).value = main_revenue
+    sh.cell(left, 5).value = avg_num / avg_den if avg_den else 0
+    left += 1
+
+    _ar_copy_style_row(template, 25, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = "STLY"
+    left += 1
+
+    if stly["sourceType"] == "SNT":
+        _ar_copy_style_row(template, 3, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "Upsell Name"
+        sh.cell(left, 3).value = "Total Count"
+        sh.cell(left, 4).value = "Total Revenue"
+        sh.cell(left, 5).value = "Average Revenue"
+        left += 1
+
+        for r in stly["rows"]:
+            _ar_copy_style_row(template, 4, sh, left, 1, 5)
+            sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+            sh.cell(left, 1).value = r["name"]
+
+            count_blank = r.get("count") is None or r.get("count") == ""
+            avg_blank = r.get("average") is None or r.get("average") == ""
+
+            sh.cell(left, 3).value = "" if count_blank else r.get("count")
+            sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+            sh.cell(left, 5).value = "" if avg_blank else r.get("average")
+
+            if count_blank:
+                unavailable_fill(sh.cell(left, 3))
+            if avg_blank:
+                unavailable_fill(sh.cell(left, 5))
+            left += 1
+
+        _ar_copy_style_row(template, 24, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "TOTALS"
+        sh.cell(left, 3).value = _ar_num(stly["totals"].get("count")) or 0
+        sh.cell(left, 4).value = _ar_num(stly["totals"].get("revenue")) or 0
+
+        avg_values = [
+            _ar_num(r.get("average"))
+            for r in stly["rows"]
+            if r.get("average") not in (None, "")
+        ]
+        avg_values = [v for v in avg_values if v is not None]
+        sh.cell(left, 5).value = sum(avg_values) / len(avg_values) if avg_values else 0
+        left += 1
+
+    else:
+        _ar_copy_style_row(template, 26, sh, left, 1, 5)
+        for col, value in enumerate(
+            [
+                "Name",
+                "Revenue Requested $",
+                "Revenue Approved $",
+                "Revenue Denied $",
+                "Revenue Expired $",
+            ],
+            1,
+        ):
+            sh.cell(left, col).value = value
+        left += 1
+
+        for r in stly["rows"]:
+            _ar_copy_style_row(template, 27, sh, left, 1, 5)
+            for col, value in enumerate(
+                [r["name"], r["requested"], r["approved"], r["denied"], r["expired"]],
+                1,
+            ):
+                sh.cell(left, col).value = value
+            left += 1
+
+        _ar_copy_style_row(template, 43, sh, left, 1, 5)
+        for col, value in enumerate(
+            [
+                "TOTALS",
+                stly["totals"]["requested"],
+                stly["totals"]["approved"],
+                stly["totals"]["denied"],
+                stly["totals"]["expired"],
+            ],
+            1,
+        ):
+            sh.cell(left, col).value = value
+        left += 1
+
+    # Variance
+    _ar_copy_style_row(template, 44, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = "Variance"
+    left += 1
+
+    _ar_copy_style_row(template, 45, sh, left, 1, 5)
+    sh.cell(left, 1).value = "Name"
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
+    sh.cell(left, 2).value = "Total Revenue"
+    left += 1
+
+    variance_start = left
+    for r in variance_rows:
+        _ar_copy_style_row(template, 46, sh, left, 1, 5)
+        sh.cell(left, 1).value = r["name"]
+        sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
+        sh.cell(left, 2).value = _ar_num(r.get("variance")) or 0
+        left += 1
+    variance_end = left - 1
+
+    variance_total = sum(_ar_num(r.get("variance")) or 0 for r in variance_rows)
+    _ar_copy_style_row(template, 69, sh, left, 1, 5)
+    sh.cell(left, 1).value = "TOTALS"
+    sh.merge_cells(start_row=left, start_column=2, end_row=left, end_column=5)
+    sh.cell(left, 2).value = variance_total
+    sh.cell(left, 2).number_format = '$#,##0.00;$(#,##0.00);$-'
+
+    sh.cell(left, 1).fill = PatternFill(fill_type="solid", fgColor="1C4587")
+    sh.cell(left, 1).font = copy(template.cell(69, 1).font)
+    sh.cell(left, 1).font = Font(
+        name=sh.cell(left, 1).font.name or "Arial",
+        size=sh.cell(left, 1).font.sz,
+        bold=True,
+        color="FFFFFF",
+    )
+    sh.cell(left, 1).alignment = Alignment(horizontal="center")
+
+    variance_total_fill = "EA9999" if variance_total < 0 else "B6D7A8"
+    for col in range(2, 6):
+        sh.cell(left, col).fill = PatternFill(fill_type="solid", fgColor=variance_total_fill)
+        base_font = sh.cell(left, col).font
+        sh.cell(left, col).font = Font(
+            name=base_font.name or "Arial",
+            size=base_font.sz,
+            bold=True,
+            color="000000",
+        )
+    left += 1
+
+    left += 3
+
+    # Current-year itemized section
+    _ar_copy_style_row(template, 72, sh, left, 1, 5)
+    _ar_merge_name(sh, left, 1, 5)
+    sh.cell(left, 1).value = year
+    left += 1
+
+    _ar_copy_style_row(template, 73, sh, left, 1, 5)
+    sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+    sh.cell(left, 1).value = "Early Check In & Late Checkout Itemized"
+    sh.cell(left, 3).value = "Total Count"
+    sh.cell(left, 4).value = "Total Revenue"
+    sh.cell(left, 5).value = "Average revenue"
+    left += 1
+
+    for r in itemized_rows:
+        _ar_copy_style_row(template, 74, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = r["name"]
+        sh.cell(left, 3).value = "" if r.get("count") is None else r.get("count")
+        sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+        sh.cell(left, 5).value = "" if r.get("average") is None else (_ar_num(r.get("average")) or 0)
+        left += 1
+
+    # STLY itemized section for SNT historical source
+    if stly["sourceType"] == "SNT" and stly.get("itemizedRows"):
+        left += 2
+
+        _ar_copy_style_row(template, 72, sh, left, 1, 5)
+        _ar_merge_name(sh, left, 1, 5)
+        sh.cell(left, 1).value = year - 1
+        left += 1
+
+        _ar_copy_style_row(template, 73, sh, left, 1, 5)
+        sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+        sh.cell(left, 1).value = "Early Check In & Late Checkout Itemized"
+        sh.cell(left, 3).value = "Total Count"
+        sh.cell(left, 4).value = "Total Revenue"
+        sh.cell(left, 5).value = "Average revenue"
+        left += 1
+
+        for r in stly["itemizedRows"]:
+            _ar_copy_style_row(template, 74, sh, left, 1, 5)
+            sh.merge_cells(start_row=left, start_column=1, end_row=left, end_column=2)
+            sh.cell(left, 1).value = r["name"]
+            sh.cell(left, 3).value = "" if r.get("count") is None else r.get("count")
+            sh.cell(left, 4).value = _ar_num(r.get("revenue")) or 0
+            sh.cell(left, 5).value = "" if r.get("average") is None else (_ar_num(r.get("average")) or 0)
+            left += 1
+
+    # ============================================================
+    # MIDDLE SIDE — universal independent dynamic stack
+    # ============================================================
+    mid = 3
+
+    _ar_copy_style_row(template, 3, sh, mid, 7, 4)
+    for col, value in enumerate(
+        ["Name", "Total Count", "Total Revenue", "Average revenue"],
+        7,
+    ):
+        sh.cell(mid, col).value = value
+    mid += 1
+
+    for r in operational_rows:
+        _ar_copy_style_row(template, 4, sh, mid, 7, 4)
+        for col, value in enumerate(
+            [
+                r["name"],
+                "" if r.get("count") is None else r.get("count"),
+                _ar_num(r.get("revenue")) or 0,
+                "" if r.get("average") is None else (_ar_num(r.get("average")) or 0),
+            ],
+            7,
+        ):
+            sh.cell(mid, col).value = value
+        mid += 1
+
+    mid += 3
+
+    _ar_copy_style_row(template, 13, sh, mid, 7, 3)
+    for col, value in enumerate(
+        ["Staff Name", "Room Upgrades Produced", "Revenue Produced"],
+        7,
+    ):
+        sh.cell(mid, col).value = value
+    mid += 1
+
+    for r in upgrades["byStaff"]:
+        _ar_copy_style_row(template, 14, sh, mid, 7, 3)
+        sh.cell(mid, 7).value = r["name"]
+        sh.cell(mid, 8).value = r["count"]
+        sh.cell(mid, 9).value = r["revenue"]
+        mid += 1
+
+    mid += 3
+
+    _ar_copy_style_row(template, 25, sh, mid, 7, 2)
+    sh.cell(mid, 7).value = "Room Level Increase"
+    sh.cell(mid, 8).value = "Count"
+    mid += 1
+
+    for r in upgrades["byLevel"]:
+        _ar_copy_style_row(template, 26, sh, mid, 7, 2)
+        level = str(r.get("level") or "")
+        match = re.match(r"^\+(\d+)$", level)
+        sh.cell(mid, 7).value = f"{match.group(1)}+" if match else level
+        sh.cell(mid, 8).value = r["count"]
+        mid += 1
+
+    mid += 3
+
+    _ar_copy_style_row(template, 30, sh, mid, 7, 2)
+    sh.cell(mid, 7).value = "Staff Name"
+    sh.cell(mid, 8).value = "Messages"
+    mid += 1
+
+    for r in staff_rows:
+        _ar_copy_style_row(template, 31, sh, mid, 7, 2)
+        sh.cell(mid, 7).value = r["name"]
+        sh.cell(mid, 8).value = r["messages"]
+        mid += 1
+
+    # ============================================================
+    # RIGHT SIDE — fixed universal Messaging Overview M:P
+    # ============================================================
+    sh["M1"] = f"{short_prop} Messaging Overview - {month_name}"
+    sh["M2"] = year
+    sh["M21"] = ""
+    sh["N21"] = f"{month_abbr} {year}"
+    sh["O21"] = "STLY"
+    sh["P21"] = "YoY"
+
+    labels = [
+        "Total Messages",
+        "# of messages guest sent",
+        "# of messages hotel sent",
+        "% of your guests that sent a message",
+        "Response Rate",
+        "Average minutes to respond",
+        "Median minutes to respond",
+    ]
+    current = [
+        _ar_num(messaging.get("msgTotal")) or 0,
+        _ar_num(messaging.get("msgGuest")) or 0,
+        _ar_num(messaging.get("msgHotel")) or 0,
+        messaging.get("msgGuestPct", 0) or 0,
+        messaging.get("responseRate", 0) or 0,
+        _ar_num(messaging.get("avgResponse")) or 0,
+        _ar_num(messaging.get("medianResponse")) or 0,
+    ]
+    prior = [
+        _ar_num(messaging.get("stlyMsgTotal")) or 0,
+        _ar_num(messaging.get("stlyMsgGuest")) or 0,
+        _ar_num(messaging.get("stlyMsgHotel")) or 0,
+        messaging.get("stlyMsgGuestPct", 0) or 0,
+        messaging.get("stlyResponseRate", 0) or 0,
+        _ar_num(messaging.get("stlyAvgResponse")) or 0,
+        _ar_num(messaging.get("stlyMedianResponse")) or 0,
+    ]
+
+    for i, label in enumerate(labels):
+        row = 22 + i
+        sh.cell(row, 13).value = label
+        sh.cell(row, 14).value = current[i]
+        sh.cell(row, 15).value = prior[i]
+        sh.cell(row, 16).value = current[i] - prior[i]
+
+    for row in range(22, 25):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0"
+    for row in range(25, 27):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0.0%"
+    for row in range(27, 29):
+        for col in range(14, 17):
+            sh.cell(row, col).number_format = "0.0"
+
+    for i, (d, rate) in enumerate(engagement[:8], start=31):
+        sh.cell(i, 13).value = d
+        sh.cell(i, 14).value = rate
+        sh.cell(i, 13).number_format = "m/d/yyyy"
+        sh.cell(i, 14).number_format = "0.0%"
+
+    # ============================================================
+    # Conditional formatting
+    # ============================================================
+    sh.conditional_formatting = openpyxl.formatting.formatting.ConditionalFormattingList()
+
+    green_fill = PatternFill(fill_type="solid", fgColor="B6D7A8")
+    red_fill = PatternFill(fill_type="solid", fgColor="EA9999")
+
+    if variance_end >= variance_start:
+        # Every variance value is stored in the top-left cell of a B:E merged
+        # box. Use formula rules that reference column B so the approved fill
+        # applies across the ENTIRE merged box, not only the value cell.
+        rng = f"B{variance_start}:E{variance_end}"
+        sh.conditional_formatting.add(
+            rng,
+            FormulaRule(
+                formula=[f"$B{variance_start}>0"],
+                fill=green_fill,
+            ),
+        )
+        sh.conditional_formatting.add(
+            rng,
+            FormulaRule(
+                formula=[f"$B{variance_start}<0"],
+                fill=red_fill,
+            ),
+        )
+
+    sh.conditional_formatting.add(
+        "P22:P26",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
+    )
+    sh.conditional_formatting.add(
+        "P22:P26",
+        CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
+    )
+    sh.conditional_formatting.add(
+        "P27:P28",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=red_fill),
+    )
+    sh.conditional_formatting.add(
+        "P27:P28",
+        CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
+    )
+
+    # ============================================================
+    # Messaging Overview charts
+    # ============================================================
+    # copy_worksheet() does not copy charts. Clone any approved charts that
+    # already exist on Report Template, then create the two sentiment charts
+    # when the template does not contain them.
+    #
+    # This guarantees every generated report opens with all three charts:
+    #   1) Common Guest Conversation Topics — pie
+    #   2) Engagement Rate — line
+    #   3) Recurring Operational Concerns — column/bar
+    #
+    # The pie/bar charts intentionally point at blank paste-in tables. When the
+    # monthly sentiment data is pasted into M:N later, Excel populates them
+    # automatically without rebuilding a chart.
+    sh._charts = []
+
+    def _ar_chart_title_text(chart):
+        try:
+            return chart.title.tx.rich.p[0].r[0].t or ""
+        except Exception:
+            return ""
+
+    def _ar_set_chart_series_range(chart, cat_formula, val_formula):
+        if not getattr(chart, "ser", None):
+            return
+        ser = chart.ser[0]
+
+        if getattr(ser, "cat", None) is not None:
+            if getattr(ser.cat, "strRef", None) is not None:
+                ser.cat.strRef.f = cat_formula
+            elif getattr(ser.cat, "numRef", None) is not None:
+                ser.cat.numRef.f = cat_formula
+
+        if (
+            getattr(ser, "val", None) is not None
+            and getattr(ser.val, "numRef", None) is not None
+        ):
+            ser.val.numRef.f = val_formula
+
+    cloned_titles = set()
+
+    for template_chart in template._charts:
+        chart = deepcopy(template_chart)
+        title = _ar_chart_title_text(chart).strip()
+        title_l = title.lower()
+
+        if "engagement rate" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$31:$M$38",
+                "'Report'!$N$31:$N$38",
+            )
+            cloned_titles.add("engagement")
+        elif "common guest" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$6:$M$12",
+                "'Report'!$N$6:$N$12",
+            )
+            cloned_titles.add("guest")
+        elif "operational concerns" in title_l:
+            _ar_set_chart_series_range(
+                chart,
+                "'Report'!$M$40:$M$45",
+                "'Report'!$N$40:$N$45",
+            )
+            cloned_titles.add("concerns")
+
+        sh._charts.append(chart)
+
+    # ----- Common Guest Conversation Topics -----
+    # Format/placement matched to the completed Harbor Hotel AUG report.
+    if "guest" not in cloned_titles:
+        guest_chart = PieChart()
+        guest_chart.title = "Common Guest Conversation Topics"
+        guest_chart.height = 7.5
+        guest_chart.width = 15
+        guest_chart.varyColors = True
+        guest_chart.display_blanks = "gap"
+
+        guest_labels = Reference(
+            sh,
+            min_col=13,  # M
+            min_row=6,
+            max_row=12,
+        )
+        guest_values = Reference(
+            sh,
+            min_col=14,  # N
+            min_row=6,
+            max_row=12,
+        )
+        guest_chart.add_data(guest_values, titles_from_data=False)
+        guest_chart.set_categories(guest_labels)
+
+        if guest_chart.legend is not None:
+            guest_chart.legend.position = "r"
+
+        guest_chart.dLbls = DataLabelList()
+        guest_chart.dLbls.showLegendKey = False
+        guest_chart.dLbls.showVal = False
+        guest_chart.dLbls.showCatName = False
+        guest_chart.dLbls.showSerName = False
+        guest_chart.dLbls.showPercent = False
+        guest_chart.dLbls.showBubbleSize = False
+
+        # Completed Harbor AUG placement starts around column M / row 4.
+        sh.add_chart(guest_chart, "M4")
+
+    # ----- Recurring Operational Concerns -----
+    # Excel calls this a BarChart object with barDir="col"; visually it is the
+    # vertical column chart used in the completed Harbor report.
+    if "concerns" not in cloned_titles:
+        concerns_chart = BarChart()
+        concerns_chart.type = "col"
+        concerns_chart.style = None
+        concerns_chart.title = "Recurring Operational Concerns"
+        concerns_chart.height = 7.5
+        concerns_chart.width = 15
+        concerns_chart.grouping = "clustered"
+        concerns_chart.gapWidth = 150
+        concerns_chart.display_blanks = "gap"
+
+        concern_labels = Reference(
+            sh,
+            min_col=13,  # M
+            min_row=40,
+            max_row=45,
+        )
+        concern_values = Reference(
+            sh,
+            min_col=14,  # N
+            min_row=40,
+            max_row=45,
+        )
+        concerns_chart.add_data(
+            concern_values,
+            titles_from_data=False,
+        )
+        concerns_chart.set_categories(concern_labels)
+
+        if concerns_chart.legend is not None:
+            concerns_chart.legend.position = "r"
+
+        # Match the Harbor chart's visible horizontal gridlines.
+        try:
+            concerns_chart.y_axis.majorGridlines = ChartLines(
+                spPr=GraphicalProperties()
+            )
+            concerns_chart.y_axis.majorGridlines.spPr.ln.solidFill = "B7B7B7"
+            concerns_chart.y_axis.majorGridlines.spPr.ln.prstDash = "solid"
+        except Exception:
+            pass
+
+        # Completed Harbor AUG placement starts around column M / row 39.
+        sh.add_chart(concerns_chart, "M39")
+
+    sh.freeze_panes = None
+
+    # Put Report immediately after Report Template.
+    try:
+        wb._sheets.remove(sh)
+        idx = wb._sheets.index(template)
+        wb._sheets.insert(idx + 1, sh)
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def ancillary_build_monthly_report(template_bytes, property_name, report_month, addon_file, upsell_file, stly_addon_file=None, stly_upsell_file=None, canary_history_file=None, staff_file=None, journal_values=None, stly_journal_values=None, messaging=None, engagement=None):
+    profile,key=ancillary_profile(property_name); journal_values=journal_values or []; stly_journal_values=stly_journal_values or []; messaging=messaging or {}; engagement=engagement or []
+    addon=ancillary_parse_addon(_ar_file_rows(addon_file),key); upgrades=ancillary_parse_upsell(_ar_file_rows(upsell_file))
+    stly_month=datetime.datetime(report_month.year-1, report_month.month, 1)
+    if profile.get('stlySource')=='SNT':
+        if not stly_addon_file or not stly_upsell_file: raise ValueError('This property uses SNT for STLY and needs prior-year Add On Production + Upsell files.')
+        stly=ancillary_parse_snt_history(_ar_file_rows(stly_addon_file),_ar_file_rows(stly_upsell_file),key)
+        if profile.get('stlyJournal'):
+            rows=[]
+            for i,j in enumerate(profile.get('journal',[])[:2]): rows.append({'name':j['report'],'revenue':stly_journal_values[i] if i<len(stly_journal_values) else None})
+            stly=ancillary_apply_stly_journal(stly,rows)
+    else:
+        if not canary_history_file: raise ValueError('This property uses Canary for STLY and needs the historical Canary upsell export.')
+        stly=ancillary_parse_canary_history(_ar_file_rows(canary_history_file),stly_month)
+    stly=ancillary_property_corrections(stly,key)
+    journal_agg={}
+    for i,j in enumerate(profile.get('journal',[])):
+        v=journal_values[i] if i<len(journal_values) else None
+        if v is None: continue
+        journal_agg[j['report']]=journal_agg.get(j['report'],0)+(_ar_num(v) or 0)
+    journal_rows=[{'name':n,'count':None,'revenue':v,'average':None} for n,v in journal_agg.items()]
+    main=[r for r in addon['main'] if not _ar_is_journal_equivalent(r['name'])]
+    main=journal_rows+main+upgrades['byRoomType']; main=sorted(main,key=lambda x:(-(_ar_num(x.get('revenue')) or 0), str(x['name']).lower()))
+    variance=ancillary_variance(main,stly['byItem'],key); staff=ancillary_parse_staff(_ar_file_rows(staff_file)) if staff_file else []
+    output=ancillary_render_report(template_bytes,property_name,key,report_month,main,addon['operational'],addon['itemized'],upgrades,stly,variance,staff,messaging,engagement)
+    return output, {'mainRows':main,'stly':stly,'variance':variance,'operational':addon['operational'],'itemized':addon['itemized'],'upgrades':upgrades,'staff':staff}
+
+
+
+# ── Hilton Ancillary Revenue — NOR1 + Lobby ──────────────────────────────────
+HILTON_ANCILLARY_LOBBY_EXCLUDE_FROM_MAIN = {"self parking"}
+
+
+def _hilton_ar_round_revenue(value):
+    n = _ar_num(value)
+    if n is None:
+        return 0.0
+    return float(math.floor(n + 0.5)) if n >= 0 else float(math.ceil(n - 0.5))
+
+
+def hilton_ancillary_parse_nor1(uploaded_file, report_month=None):
+    """Parse a NOR1 Custom Export, optionally filtering one month."""
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("NOR1 report is empty.")
+
+    h = _ar_header_map(raw[0])
+    name_i = _ar_col(h, ["Category Name"])
+    revenue_i = _ar_col(h, ["Total Revenue"])
+    count_i = _ar_col(
+        h,
+        ["Total Upgrades", "ES Upgrades", "Accepted Quantity"],
+    )
+    type_i = _ar_col(h, ["Reporting Type"])
+    property_i = _ar_col(h, ["Property Name"])
+    date_i = _ar_col(h, ["Report Date", "Date"])
+
+    if min(name_i, revenue_i, count_i) < 0:
+        raise ValueError(
+            "NOR1 report must contain Category Name, Total Revenue, "
+            "and Total Upgrades."
+        )
+
+    if report_month is not None and date_i < 0:
+        raise ValueError(
+            "Grouped NOR1 file must contain Report Date."
+        )
+
+    by_key = collections.OrderedDict()
+    property_name = None
+    matched = 0
+
+    for row in raw[1:]:
+        if name_i >= len(row):
+            continue
+
+        if report_month is not None:
+            raw_date = row[date_i] if date_i < len(row) else None
+            d = parse_any_date(raw_date)
+            if (
+                d is None
+                or d.year != report_month.year
+                or d.month != report_month.month
+            ):
+                continue
+
+        name = str(row[name_i] or "").strip()
+        if not name:
+            continue
+
+        matched += 1
+        count = (
+            float(_ar_num(row[count_i]) or 0)
+            if count_i < len(row)
+            else 0.0
+        )
+        revenue = (
+            float(_ar_num(row[revenue_i]) or 0)
+            if revenue_i < len(row)
+            else 0.0
+        )
+
+        if (
+            property_name is None
+            and property_i >= 0
+            and property_i < len(row)
+        ):
+            property_name = str(row[property_i] or "").strip() or None
+
+        reporting_type = (
+            str(row[type_i] or "").strip()
+            if type_i >= 0 and type_i < len(row)
+            else ""
+        )
+
+        key = (_ar_norm(name), _ar_norm(reporting_type))
+        item = by_key.setdefault(
+            key,
+            {
+                "name": name,
+                "count": 0.0,
+                "revenue": 0.0,
+                "source": "NOR1",
+                "reporting_type": reporting_type,
+            },
+        )
+        item["count"] += count
+        item["revenue"] += revenue
+
+    if report_month is not None and matched == 0:
+        raise ValueError(
+            f"NOR1 grouped file has no rows for "
+            f"{report_month.strftime('%B %Y')}."
+        )
+
+    rows = []
+    for item in by_key.values():
+        if (
+            abs(item["count"]) < 1e-9
+            and abs(item["revenue"]) < 1e-9
+        ):
+            continue
+        item["avg"] = (
+            item["revenue"] / item["count"]
+            if item["count"]
+            else 0.0
+        )
+        rows.append(item)
+
+    return {
+        "rows": rows,
+        "property_name": property_name,
+        "total_count": sum(r["count"] for r in rows),
+        "total_revenue": sum(r["revenue"] for r in rows),
+    }
+
+
+def hilton_ancillary_parse_lobby(uploaded_file, report_month=None):
+    """Parse Lobby Add-ons, optionally filtering one Stay Date month."""
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("Lobby add-ons report is empty.")
+
+    h = _ar_header_map(raw[0])
+    name_i = _ar_col(h, ["Add-on Name", "Add On Name"])
+    count_i = _ar_col(h, ["AO Units", "Units"])
+    revenue_i = _ar_col(
+        h,
+        ["AO Stayed Revenue", "AO Revenue", "Stayed Revenue"],
+    )
+    inn_i = _ar_col(h, ["Inn Code", "InnCode"])
+    date_i = _ar_col(h, ["Stay Date", "Date"])
+
+    if min(name_i, count_i, revenue_i) < 0:
+        raise ValueError(
+            "Lobby report must contain Add-on Name, AO Units, and "
+            "AO Stayed Revenue (or AO Revenue)."
+        )
+
+    if report_month is not None and date_i < 0:
+        raise ValueError(
+            "Grouped Lobby file must contain Stay Date."
+        )
+
+    by_name = collections.OrderedDict()
+    inn_codes = set()
+    matched = 0
+
+    for row in raw[1:]:
+        if name_i >= len(row):
+            continue
+
+        if report_month is not None:
+            raw_date = row[date_i] if date_i < len(row) else None
+            d = parse_any_date(raw_date)
+            if (
+                d is None
+                or d.year != report_month.year
+                or d.month != report_month.month
+            ):
+                continue
+
+        name = str(row[name_i] or "").strip()
+        if not name:
+            continue
+
+        matched += 1
+        count = (
+            float(_ar_num(row[count_i]) or 0)
+            if count_i < len(row)
+            else 0.0
+        )
+        revenue = (
+            float(_ar_num(row[revenue_i]) or 0)
+            if revenue_i < len(row)
+            else 0.0
+        )
+
+        if inn_i >= 0 and inn_i < len(row):
+            code = str(row[inn_i] or "").strip().upper()
+            if code:
+                inn_codes.add(code)
+
+        key = _ar_norm(name)
+        item = by_name.setdefault(
+            key,
+            {
+                "name": name,
+                "count": 0.0,
+                "revenue_raw": 0.0,
+                "source": "Lobby",
+                "reporting_type": "lobby_addon",
+            },
+        )
+        item["count"] += count
+        item["revenue_raw"] += revenue
+
+    if report_month is not None and matched == 0:
+        raise ValueError(
+            f"Lobby grouped file has no rows for "
+            f"{report_month.strftime('%B %Y')}."
+        )
+
+    rows = []
+    self_parking = None
+
+    for key, item in by_name.items():
+        item["revenue"] = _hilton_ar_round_revenue(
+            item.pop("revenue_raw")
+        )
+        item["avg"] = (
+            item["revenue"] / item["count"]
+            if item["count"]
+            else 0.0
+        )
+        if key in HILTON_ANCILLARY_LOBBY_EXCLUDE_FROM_MAIN:
+            self_parking = dict(item)
+        else:
+            rows.append(item)
+
+    return {
+        "rows": rows,
+        "self_parking": self_parking,
+        "inn_codes": sorted(inn_codes),
+        "total_count": sum(r["count"] for r in rows),
+        "total_revenue": sum(r["revenue"] for r in rows),
+    }
+
+
+def hilton_ancillary_parse_dashboard(uploaded_file, hotel_name, report_month):
+    data=uploaded_file.getvalue() if hasattr(uploaded_file,'getvalue') else uploaded_file
+    inn_code=HILTON_INNCODES.get(hotel_name)
+    if not inn_code: raise ValueError(f"No Hilton InnCode mapping is configured for {hotel_name}.")
+    wb=openpyxl.load_workbook(io.BytesIO(data),data_only=True,read_only=True)
+    if 'Data_Compact' not in wb.sheetnames: raise ValueError("Front Desk dashboard is missing the Data_Compact sheet.")
+    ws=wb['Data_Compact']
+    headers=list(next(ws.iter_rows(min_row=1,max_row=1,values_only=True)))
+    hmap={str(v or '').strip():i for i,v in enumerate(headers) if str(v or '').strip()}
+    target_row=None; target_key=None; prefix=inn_code.strip().upper()+'|'
+    for row_idx,values in enumerate(ws.iter_rows(min_row=2,min_col=1,max_col=1,values_only=True),start=2):
+        key=str(values[0] or '').strip().upper()
+        if key.startswith(prefix): target_row=row_idx; target_key=key; break
+    if target_row is None: raise ValueError(f"Could not find InnCode {inn_code} in the dashboard.")
+    values=list(next(ws.iter_rows(min_row=target_row,max_row=target_row,values_only=True)))
+    def period_values(year):
+        period=f"{year}{report_month.month:02d}"
+        def field(label):
+            idx=hmap.get(f"{period} {label}")
+            return _ar_num(values[idx]) if idx is not None and idx < len(values) else None
+        return {'year':year,'front_desk':field('Front Office Revenue'),'awarded':field('Awarded Revenue'),'expired':field('Expired Revenue'),'potential':field('Potential Revenue')}
+    return {'hotel_key':target_key,'inn_code':inn_code,'current':period_values(report_month.year),'stly':period_values(report_month.year-1)}
+
+
+def _hilton_ar_variance_key(name):
+    key=_ar_norm(name).replace(' ','')
+    return {'pets':'petfee','pet':'petfee','latecheckout':'latecheckout'}.get(key,key)
+
+
+def _hilton_ar_main_sort_key(row):
+    name=_ar_norm(row.get('name')).replace(' ',''); source=row.get('source'); rtype=_ar_norm(row.get('reporting_type')).replace(' ','')
+    if name in ('pets','petfee'): return (10,name)
+    if source=='Lobby' and 'breakfast' in name: return (20,name)
+    if source=='NOR1' and (rtype=='foodbeverage' or 'breakfast' in name): return (30,name)
+    if source=='Lobby' and 'latecheckout' in name: return (40,name)
+    if rtype=='earlycheckin': return (50,name)
+    if source=='Lobby' and 'morepoints' in name: return (60,name)
+    if rtype=='roomupgrade': return (70,name)
+    if rtype=='latecheckout': return (80,name)
+    return (90,name)
+
+
+def _hilton_ancillary_add_month_sheet(
+    wb,
+    property_name,
+    report_month,
+    nor1_current_file,
+    lobby_file,
+    nor1_stly_file,
+):
+    """Add one Hilton ancillary month tab to an existing workbook.
+
+    The Front Desk table and Expired Revenue cells are intentionally created
+    but left blank for manual entry after download. This removes the need for
+    the Hilton Front Desk/dashboard upload.
+
+    Rules retained from the corrected Hilton monthly reports:
+      - Current rows = Lobby add-ons (except Self-Parking) + current NOR1.
+      - STLY rows = STLY NOR1 only.
+      - Main/STLY average TOTAL = AVERAGE of row averages.
+      - Variance is formula-driven.
+      - Current-only rows carry through as positive variance.
+      - STLY-only rows are added as negative variance rows.
+      - Expired Revenue variance = current expired - STLY expired.
+      - Self-Parking remains outside the main totals.
+    """
+    current_nor1 = hilton_ancillary_parse_nor1(
+        nor1_current_file,
+        report_month=report_month,
+    )
+    lobby = hilton_ancillary_parse_lobby(
+        lobby_file,
+        report_month=report_month,
+    )
+    stly_month = report_month.replace(
+        year=report_month.year - 1,
+    )
+    stly_nor1 = hilton_ancillary_parse_nor1(
+        nor1_stly_file,
+        report_month=stly_month,
+    )
+
+    main_rows = [
+        *[dict(r) for r in lobby["rows"]],
+        *[dict(r) for r in current_nor1["rows"]],
+    ]
+    main_rows.sort(key=_hilton_ar_main_sort_key)
+
+    stly_rows = [dict(r) for r in stly_nor1["rows"]]
+    stly_rows.sort(
+        key=lambda r: (
+            _ar_norm(r.get("reporting_type")),
+            _ar_norm(r.get("name")),
+        )
+    )
+
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+
+    dark = "1F4E78"
+    section = "D9EAF7"
+    subheader = "DDEBF7"
+    stly_fill = "FFF2CC"
+    variance_fill = "E2F0D9"
+    manual_fill = "FFF2CC"
+    white = "FFFFFF"
+    thin_gray = Side(style="thin", color="B7B7B7")
+    border = Border(
+        left=thin_gray,
+        right=thin_gray,
+        top=thin_gray,
+        bottom=thin_gray,
+    )
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    ws["A1"] = (
+        f"{property_name} Upsell Overview - "
+        f"{report_month.strftime('%B')}"
+    )
+    ws["A2"] = report_month.year
+    ws["A1"].font = Font(size=16, bold=True, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=dark)
+    ws.merge_cells("A1:E1")
+    for c in range(1, 6):
+        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
+
+    headers = [
+        "Upsell Name",
+        "Total number",
+        "Total Revenue",
+        "Average revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(headers, start=1):
+        cell = ws.cell(3, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=subheader)
+        cell.border = border
+
+    # ── Current-year table ──────────────────────────────────────────────────
+    current_start = 4
+    current_row_by_key = {}
+
+    for i, row in enumerate(main_rows, start=current_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+        current_row_by_key.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            i,
+        )
+
+    current_total_row = current_start + len(main_rows)
+    ws.cell(current_total_row, 1, "TOTALS")
+    ws.cell(
+        current_total_row,
+        2,
+        f"=SUM(B{current_start}:B{current_total_row-1})",
+    )
+    ws.cell(
+        current_total_row,
+        3,
+        f"=SUM(C{current_start}:C{current_total_row-1})",
+    )
+    ws.cell(
+        current_total_row,
+        4,
+        f"=AVERAGE(D{current_start}:D{current_total_row-1})",
+    )
+    # Manual entry: current-year Expired Revenue.
+    ws.cell(current_total_row, 5, None)
+    ws.cell(current_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=manual_fill,
+    )
+    ws.cell(current_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: current-year NOR1 Expired Revenue.",
+        "OpenAI",
+    )
+
+    for c in range(1, 6):
+        ws.cell(current_total_row, c).font = Font(bold=True)
+        if c != 5:
+            ws.cell(current_total_row, c).fill = PatternFill(
+                "solid",
+                fgColor=section,
+            )
+        ws.cell(current_total_row, c).border = border
+
+    # ── Front Desk history — manual entry ───────────────────────────────────
+    ws["H3"] = "Year"
+    ws["I3"] = "Front Desk Upsell Revenue"
+    for cell in ("H3", "I3"):
+        ws[cell].font = Font(bold=True)
+        ws[cell].fill = PatternFill("solid", fgColor=subheader)
+        ws[cell].border = border
+
+    front_desk_years = [
+        report_month.year - offset
+        for offset in range(4)
+    ]
+    for r, year in enumerate(front_desk_years, start=4):
+        ws.cell(r, 8, year)
+        ws.cell(r, 9, None)
+        ws.cell(r, 8).border = border
+        ws.cell(r, 9).border = border
+        ws.cell(r, 9).fill = PatternFill(
+            "solid",
+            fgColor=manual_fill,
+        )
+        ws.cell(r, 9).comment = openpyxl.comments.Comment(
+            "Manual entry: Front Desk upsell revenue for this year/month.",
+            "OpenAI",
+        )
+
+    # Self-Parking remains outside the main ancillary totals.
+    parking = lobby.get("self_parking")
+    if parking:
+        p_row = max(10, 4 + len(front_desk_years) + 2)
+        ws.cell(p_row, 8, parking["name"])
+        ws.cell(p_row, 9, parking["count"])
+        ws.cell(p_row, 10, parking["revenue"])
+        for c in range(8, 11):
+            ws.cell(p_row, c).border = border
+            if c == 8:
+                ws.cell(p_row, c).font = Font(bold=True)
+
+    # ── STLY table ──────────────────────────────────────────────────────────
+    stly_title_row = current_total_row + 1
+    stly_header_row = stly_title_row + 1
+    stly_start = stly_header_row + 1
+
+    ws.cell(stly_title_row, 1, "STLY")
+    ws.cell(stly_title_row, 1).font = Font(bold=True)
+    ws.cell(stly_title_row, 1).fill = PatternFill(
+        "solid",
+        fgColor=stly_fill,
+    )
+
+    stly_headers = [
+        "Upsell Name",
+        "Total number",
+        "Total Revenue",
+        "Average revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(stly_headers, start=1):
+        cell = ws.cell(stly_header_row, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=stly_fill)
+        cell.border = border
+
+    stly_row_by_key = {}
+    for i, row in enumerate(stly_rows, start=stly_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+        stly_row_by_key.setdefault(
+            _hilton_ar_variance_key(row["name"]),
+            i,
+        )
+
+    stly_total_row = stly_start + len(stly_rows)
+    ws.cell(stly_total_row, 1, "TOTALS")
+    ws.cell(
+        stly_total_row,
+        2,
+        f"=SUM(B{stly_start}:B{stly_total_row-1})",
+    )
+    ws.cell(
+        stly_total_row,
+        3,
+        f"=SUM(C{stly_start}:C{stly_total_row-1})",
+    )
+    ws.cell(
+        stly_total_row,
+        4,
+        f"=AVERAGE(D{stly_start}:D{stly_total_row-1})",
+    )
+    # Manual entry: STLY Expired Revenue.
+    ws.cell(stly_total_row, 5, None)
+    ws.cell(stly_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=manual_fill,
+    )
+    ws.cell(stly_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: STLY NOR1 Expired Revenue.",
+        "OpenAI",
+    )
+
+    for c in range(1, 6):
+        ws.cell(stly_total_row, c).font = Font(bold=True)
+        if c != 5:
+            ws.cell(stly_total_row, c).fill = PatternFill(
+                "solid",
+                fgColor=stly_fill,
+            )
+        ws.cell(stly_total_row, c).border = border
+
+    # ── Variance table ──────────────────────────────────────────────────────
+    variance_title_row = stly_total_row + 1
+    variance_header_row = variance_title_row + 1
+    variance_start = variance_header_row + 1
+
+    ws.cell(variance_title_row, 1, "Variance")
+    ws.cell(variance_title_row, 1).font = Font(bold=True)
+    ws.cell(variance_title_row, 1).fill = PatternFill(
+        "solid",
+        fgColor=variance_fill,
+    )
+
+    variance_headers = [
+        "Upsell Name",
+        "Total Count",
+        "Total Revenue",
+        "Average Revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(variance_headers, start=1):
+        cell = ws.cell(variance_header_row, c, value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor=variance_fill)
+        cell.border = border
+
+    variance_specs = []
+    used_stly_keys = set()
+
+    for cur in main_rows:
+        key = _hilton_ar_variance_key(cur["name"])
+        variance_specs.append({
+            "name": cur["name"],
+            "current_row": current_row_by_key.get(key),
+            "stly_row": stly_row_by_key.get(key),
+        })
+        if key in stly_row_by_key:
+            used_stly_keys.add(key)
+
+    for stly in stly_rows:
+        key = _hilton_ar_variance_key(stly["name"])
+        if key in used_stly_keys or key in current_row_by_key:
+            continue
+        variance_specs.append({
+            "name": stly["name"],
+            "current_row": None,
+            "stly_row": stly_row_by_key.get(key),
+        })
+
+    variance_rows = []
+    for offset, spec in enumerate(variance_specs):
+        i = variance_start + offset
+        cr = spec["current_row"]
+        sr = spec["stly_row"]
+
+        ws.cell(i, 1, spec["name"])
+
+        if cr and sr:
+            for col_letter, col_num in zip("BCD", range(2, 5)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{cr}-{col_letter}{sr}",
+                )
+        elif cr:
+            for col_letter, col_num in zip("BCD", range(2, 5)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{cr}",
+                )
+        elif sr:
+            for col_letter, col_num in zip("BCD", range(2, 5)):
+                ws.cell(
+                    i,
+                    col_num,
+                    f"={col_letter}{sr}*-1",
+                )
+
+        for c in range(1, 6):
+            ws.cell(i, c).border = border
+
+        variance_rows.append({
+            "name": spec["name"],
+            "current_row": cr,
+            "stly_row": sr,
+        })
+
+    variance_total_row = variance_start + len(variance_specs)
+    ws.cell(variance_total_row, 1, "TOTALS")
+    ws.cell(
+        variance_total_row,
+        2,
+        f"=SUM(B{variance_start}:B{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        3,
+        f"=SUM(C{variance_start}:C{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        4,
+        f"=SUM(D{variance_start}:D{variance_total_row-1})",
+    )
+    ws.cell(
+        variance_total_row,
+        5,
+        f'=IF(OR(E{current_total_row}<>"",E{stly_total_row}<>""),'
+        f'E{current_total_row}-E{stly_total_row},"")',
+    )
+
+    for c in range(1, 6):
+        ws.cell(variance_total_row, c).font = Font(bold=True)
+        ws.cell(variance_total_row, c).fill = PatternFill(
+            "solid",
+            fgColor=variance_fill,
+        )
+        ws.cell(variance_total_row, c).border = border
+
+    # ── Number formats / dimensions ─────────────────────────────────────────
+    for row in range(4, variance_total_row + 1):
+        ws.cell(row, 2).number_format = "0"
+        ws.cell(row, 3).number_format = "$#,##0.00"
+        ws.cell(row, 4).number_format = "$#,##0.00"
+        ws.cell(row, 5).number_format = "$#,##0.00"
+
+    for row in range(4, 8):
+        ws.cell(row, 9).number_format = "$#,##0.00"
+
+    if parking:
+        ws.cell(p_row, 9).number_format = "0"
+        ws.cell(p_row, 10).number_format = "$#,##0.00"
+
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["H"].width = 18
+    ws.column_dimensions["I"].width = 22
+    ws.column_dimensions["J"].width = 16
+    ws.freeze_panes = "A4"
+
+    for row in ws.iter_rows(
+        min_row=1,
+        max_row=ws.max_row,
+        min_col=1,
+        max_col=10,
+    ):
+        for cell in row:
+            cell.alignment = Alignment(
+                vertical="center",
+                wrap_text=True,
+            )
+
+    expected_inn = HILTON_INNCODES.get(property_name)
+    warnings = []
+    if (
+        lobby["inn_codes"]
+        and expected_inn
+        and expected_inn not in lobby["inn_codes"]
+    ):
+        warnings.append(
+            f"Lobby report InnCode(s) {', '.join(lobby['inn_codes'])} "
+            f"do not include expected {expected_inn} for {property_name}."
+        )
+
+    return {
+        "month": report_month,
+        "sheet": sheet_name,
+        "mainRows": main_rows,
+        "stlyRows": stly_rows,
+        "varianceRows": variance_rows,
+        "selfParking": parking,
+        "warnings": warnings,
+        "currentTotalCount": sum(r["count"] for r in main_rows),
+        "currentTotalRevenue": sum(r["revenue"] for r in main_rows),
+        "stlyTotalCount": sum(r["count"] for r in stly_rows),
+        "stlyTotalRevenue": sum(r["revenue"] for r in stly_rows),
+    }
+
+
+def hilton_ancillary_build_multi_month_report(
+    property_name,
+    month_inputs,
+):
+    """Build one workbook with one Hilton ancillary tab per selected month.
+
+    month_inputs is a list of dictionaries containing:
+      report_month, nor1_current_file, lobby_file, nor1_stly_file.
+    """
+    wb = openpyxl.Workbook()
+    # Remove the default sheet after the first real month tab is added.
+    default = wb.active
+    summaries = []
+
+    for item in sorted(
+        month_inputs,
+        key=lambda x: x["report_month"],
+    ):
+        summary = _hilton_ancillary_add_month_sheet(
+            wb=wb,
+            property_name=property_name,
+            report_month=item["report_month"],
+            nor1_current_file=item["nor1_current_file"],
+            lobby_file=item["lobby_file"],
+            nor1_stly_file=item["nor1_stly_file"],
+        )
+        summaries.append(summary)
+
+    if default.title in wb.sheetnames and len(wb.sheetnames) > 1:
+        wb.remove(default)
+
+    out = io.BytesIO()
+    wb.save(out)
+
+    return out.getvalue(), summaries
+
+
+# Backward-compatible single-month wrapper used nowhere in the new UI but
+# retained so older internal calls do not break.
+def hilton_ancillary_build_report(
+    property_name,
+    report_month,
+    nor1_current_file,
+    lobby_file,
+    nor1_stly_file,
+    dashboard_file=None,
+    historical_front_desk=None,
+):
+    output, summaries = hilton_ancillary_build_multi_month_report(
+        property_name,
+        [{
+            "report_month": report_month,
+            "nor1_current_file": nor1_current_file,
+            "lobby_file": lobby_file,
+            "nor1_stly_file": nor1_stly_file,
+        }],
+    )
+    return output, summaries[0]
+
+
+# ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
+PLYMOUTH_WEEKLY_COLS = {
+    1: (2, 3),   # B/C
+    2: (4, 5),   # D/E
+    3: (6, 7),   # F/G
+    4: (8, 9),   # H/I
+    5: (10, 11), # J/K
+}
+
+
+def _plymouth_find_row(ws, label, start=1, end=None):
+    """Find an exact normalized label in column A."""
+    end = end or ws.max_row
+    target = _ar_norm(label)
+    for r in range(start, min(end, ws.max_row) + 1):
+        if _ar_norm(ws.cell(r, 1).value) == target:
+            return r
+    return None
+
+
+def _plymouth_find_next_row(ws, label, start=1, end=None):
+    """Same as _plymouth_find_row but convenient for repeated section labels."""
+    return _plymouth_find_row(ws, label, start=start, end=end)
+
+
+def _plymouth_block_rows(ws, first_row, stop_row):
+    """Return row map for a named data block, excluding TOTALS."""
+    out = {}
+    if not first_row or not stop_row:
+        return out
+    for r in range(first_row, stop_row):
+        label = str(ws.cell(r, 1).value or "").strip()
+        if not label or _ar_norm(label) == "totals":
+            continue
+        out[_ar_norm(label)] = r
+    return out
+
+
+def _plymouth_section_layout(ws, report_year):
+    """Locate the weekly Plymouth sections from labels, not fixed row numbers."""
+    stly_row = _plymouth_find_row(ws, "STLY")
+    variance_row = _plymouth_find_row(ws, "VARIANCE")
+    if not stly_row or not variance_row:
+        raise ValueError(
+            "The selected Plymouth month tab is not in the July–September "
+            "weekly tracking format (STLY/VARIANCE sections were not found)."
+        )
+
+    current_total = _plymouth_find_row(ws, "TOTALS", start=4, end=stly_row - 1)
+    stly_total = _plymouth_find_row(
+        ws, "TOTALS", start=stly_row + 1, end=variance_row - 1
+    )
+    variance_total = _plymouth_find_row(
+        ws, "TOTALS", start=variance_row + 1, end=ws.max_row
+    )
+
+    if not current_total or not stly_total or not variance_total:
+        raise ValueError("Could not locate Plymouth weekly TOTALS rows.")
+
+    # Current itemized section: first year row after variance.
+    current_item_year = None
+    stly_item_year = None
+    for r in range(variance_total + 1, min(ws.max_row, variance_total + 80) + 1):
+        v = ws.cell(r, 1).value
+        try:
+            year = int(float(v))
+        except Exception:
+            continue
+        if year == report_year and current_item_year is None:
+            current_item_year = r
+        elif year == report_year - 1 and current_item_year is not None:
+            stly_item_year = r
+            break
+
+    if not current_item_year or not stly_item_year:
+        raise ValueError(
+            "Could not locate current-year and STLY ECI/LCO itemized sections."
+        )
+
+    current_item_total = stly_item_year - 1
+    while current_item_total > current_item_year:
+        if str(ws.cell(current_item_total, 1).value or "").strip():
+            break
+        current_item_total -= 1
+
+    return {
+        "current_header": 2,
+        "current_first": 4,
+        "current_total": current_total,
+        "stly_header": stly_row,
+        "stly_first": stly_row + 2,
+        "stly_total": stly_total,
+        "variance_header": variance_row,
+        "variance_first": variance_row + 2,
+        "variance_total": variance_total,
+        "current_item_header": current_item_year,
+        "current_item_first": current_item_year + 2,
+        "current_item_end": stly_item_year - 1,
+        "stly_item_header": stly_item_year,
+        "stly_item_first": stly_item_year + 2,
+        "stly_item_end": min(ws.max_row + 1, stly_item_year + 20),
+    }
+
+
+def _plymouth_write_named_rows(ws, row_map, rows, count_col, revenue_col, value_key="revenue"):
+    """Write count/revenue for rows already present in the Plymouth tracker."""
+    written = 0
+    missing = []
+    by_norm = {_ar_norm(x.get("name")): x for x in rows}
+
+    # Clear the selected pair in the existing block first so a prior test/run
+    # cannot leave stale values for items that are now zero/absent.
+    for r in row_map.values():
+        ws.cell(r, count_col).value = None
+        ws.cell(r, revenue_col).value = None
+
+    for key, obj in by_norm.items():
+        r = row_map.get(key)
+        if not r:
+            missing.append(obj.get("name"))
+            continue
+
+        count = obj.get("count")
+        revenue = obj.get(value_key)
+        if revenue is None:
+            revenue = obj.get("approved")
+        if count is not None:
+            ws.cell(r, count_col).value = _ar_num(count) or 0
+        if revenue is not None:
+            ws.cell(r, revenue_col).value = _ar_num(revenue) or 0
+        written += 1
+
+    return written, missing
+
+
+def _plymouth_extend_variance_formulas(ws, layout, week_slot):
+    """Extend the existing variance formulas to the selected week pair.
+
+    This deliberately translates the prior pair's formulas instead of rebuilding
+    the variance logic from item names. Plymouth has hand-resolved current/STLY
+    aliases in this section, and Translator preserves absolute STLY references.
+    """
+    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[week_slot]
+    if week_slot == 1:
+        return
+
+    prev_count_col, prev_revenue_col = PLYMOUTH_WEEKLY_COLS[week_slot - 1]
+    delta = count_col - prev_count_col
+
+    for r in range(layout["variance_first"], layout["variance_total"]):
+        for src_col, dst_col in (
+            (prev_count_col, count_col),
+            (prev_revenue_col, revenue_col),
+        ):
+            src = ws.cell(r, src_col)
+            dst = ws.cell(r, dst_col)
+            if isinstance(src.value, str) and src.value.startswith("="):
+                try:
+                    dst.value = Translator(
+                        src.value,
+                        origin=src.coordinate,
+                    ).translate_formula(dst.coordinate)
+                except Exception:
+                    dst.value = src.value
+
+    # TOTALS row formulas are normally prebuilt, but fill them if blank.
+    total_row = layout["variance_total"]
+    for col in (count_col, revenue_col):
+        cell = ws.cell(total_row, col)
+        if cell.value in (None, ""):
+            L = get_column_letter(col)
+            cell.value = (
+                f"=SUM({L}{layout['variance_first']}:{L}{total_row - 1})"
+            )
+
+
+def _plymouth_write_messaging(ws, messaging, week_date=None, engagement_rate=None, week_slot=None):
+    """Update Plymouth's right-side messaging KPI block without touching charts."""
+    label_hits = {}
+    for r in range(1, min(ws.max_row, 80) + 1):
+        for c in range(18, min(ws.max_column, 25) + 1):
+            label = _ar_norm(ws.cell(r, c).value)
+            if label in {
+                "total messages",
+                "of messages guest sent",
+                "of messages hotel sent",
+                "of your guests that sent a message",
+                "response rate",
+                "average minutes to respond",
+                "median minutes to respond",
+            }:
+                label_hits[label] = (r, c)
+
+    key_map = {
+        "total messages": "msgTotal",
+        "of messages guest sent": "msgGuest",
+        "of messages hotel sent": "msgHotel",
+        "of your guests that sent a message": "msgGuestPct",
+        "response rate": "responseRate",
+        "average minutes to respond": "avgResponse",
+        "median minutes to respond": "medianResponse",
+    }
+
+    for label, key in key_map.items():
+        hit = label_hits.get(label)
+        if not hit:
+            continue
+        r, label_col = hit
+        current_col = label_col + 1
+        if key in messaging and messaging.get(key) is not None:
+            ws.cell(r, current_col).value = messaging.get(key)
+
+    # One engagement point per weekly run.
+    if week_date is not None and engagement_rate is not None and week_slot:
+        date_row = None
+        date_col = None
+        for r in range(1, min(ws.max_row, 80) + 1):
+            for c in range(18, min(ws.max_column, 25) + 1):
+                if _ar_norm(ws.cell(r, c).value) == "date":
+                    nxt = _ar_norm(ws.cell(r, c + 1).value)
+                    if nxt == "rate":
+                        date_row, date_col = r, c
+                        break
+            if date_row:
+                break
+        if date_row:
+            target_row = date_row + week_slot
+            ws.cell(target_row, date_col).value = datetime.datetime.combine(
+                week_date, datetime.time()
+            )
+            ws.cell(target_row, date_col + 1).value = engagement_rate
+            ws.cell(target_row, date_col + 1).number_format = "0.0%"
+
+
+
+def _plymouth_copy_left_row_style(ws, src_row, dst_row):
+    """Copy A:L styling/formulas pattern for a newly-added Plymouth data row."""
+    for c in range(1, 13):
+        src = ws.cell(src_row, c)
+        dst = ws.cell(dst_row, c)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.number_format = src.number_format
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+
+
+def _plymouth_shift_left_down(ws, start_row, delta):
+    """Shift only A:L downward, preserving the independent N:V side tables."""
+    if delta <= 0:
+        return
+
+    max_row = ws.max_row
+
+    # Merged ranges in A:L do not follow move_range automatically.
+    shifted_merges = []
+    for rng in list(ws.merged_cells.ranges):
+        if rng.max_col <= 12 and rng.min_row >= start_row:
+            shifted_merges.append(
+                (
+                    rng.min_row + delta,
+                    rng.min_col,
+                    rng.max_row + delta,
+                    rng.max_col,
+                )
+            )
+            ws.unmerge_cells(str(rng))
+
+    heights = {
+        r: ws.row_dimensions[r].height
+        for r in range(start_row, max_row + 1)
+        if ws.row_dimensions[r].height is not None
+    }
+
+    ws.move_range(
+        f"A{start_row}:L{max_row}",
+        rows=delta,
+        cols=0,
+        translate=True,
+    )
+
+    for old_row, height in heights.items():
+        ws.row_dimensions[old_row + delta].height = height
+
+    for min_row, min_col, max_row2, max_col in shifted_merges:
+        ws.merge_cells(
+            start_row=min_row,
+            start_column=min_col,
+            end_row=max_row2,
+            end_column=max_col,
+        )
+
+
+def _plymouth_append_missing_names(
+    ws,
+    report_year,
+    block,
+    names,
+):
+    """Append newly-seen names without disturbing prior-week rows.
+
+    This creates a month-long union of item names. Existing rows keep their
+    position so prior weekly columns remain attached to the correct item.
+    """
+    layout = _plymouth_section_layout(ws, report_year)
+
+    keys = {
+        "current": ("current_first", "current_total"),
+        "stly": ("stly_first", "stly_total"),
+        "variance": ("variance_first", "variance_total"),
+    }
+    first_key, total_key = keys[block]
+    first_row = layout[first_key]
+    total_row = layout[total_key]
+
+    existing = []
+    existing_norm = set()
+    for r in range(first_row, total_row):
+        name = str(ws.cell(r, 1).value or "").strip()
+        if not name:
+            continue
+        existing.append(name)
+        existing_norm.add(_ar_norm(name))
+
+    missing = []
+    for name in names:
+        clean = str(name or "").strip()
+        if not clean:
+            continue
+        key = _ar_norm(clean)
+        if key not in existing_norm:
+            missing.append(clean)
+            existing_norm.add(key)
+
+    if not missing:
+        return _plymouth_section_layout(ws, report_year), []
+
+    # Insert blank A:L rows immediately before this block's TOTALS row.
+    _plymouth_shift_left_down(ws, total_row, len(missing))
+
+    # After the shift, the old TOTALS row moved down and the newly-created
+    # rows occupy total_row .. total_row + len(missing) - 1.
+    style_source = max(first_row, total_row - 1)
+    for offset, name in enumerate(missing):
+        r = total_row + offset
+        _plymouth_copy_left_row_style(ws, style_source, r)
+        for c in range(1, 13):
+            ws.cell(r, c).value = None
+        ws.cell(r, 1).value = name
+        ws.cell(r, 12).value = (
+            f"=IFERROR((C{r}+E{r}+G{r}+I{r}+K{r})/"
+            f"(B{r}+D{r}+F{r}+H{r}+J{r}),0)"
+        )
+
+    return _plymouth_section_layout(ws, report_year), missing
+
+
+
+PLYMOUTH_VARIANCE_ALIASES = {
+    # STLY SNT naming vs current SNT naming
+    _ar_norm("Standard One King Bed"): _ar_norm("Standard Room - One King Bed"),
+}
+
+
+def _plymouth_variance_key(name):
+    key = _ar_norm(name)
+    return PLYMOUTH_VARIANCE_ALIASES.get(key, key)
+
+
+def _plymouth_capture_total_sum_starts(ws, layout, week_slot):
+    """Capture the intended SUM start row before dynamic row insertions.
+
+    Plymouth's count totals do not always start on the same row as revenue
+    totals (for example, journal-only rows have revenue but no count). Keep the
+    existing workbook's start-row logic, then extend only the ending row.
+    """
+    captured = {}
+    for block_name, total_key in (
+        ("current", "current_total"),
+        ("stly", "stly_total"),
+    ):
+        total_row = layout[total_key]
+        block = {}
+        for slot in range(1, int(week_slot) + 1):
+            for col in PLYMOUTH_WEEKLY_COLS[slot]:
+                value = ws.cell(total_row, col).value
+                start_row = None
+                if isinstance(value, str):
+                    m = re.search(
+                        r"SUM\(\s*[A-Z]+(\d+)\s*:\s*[A-Z]+\d+\s*\)",
+                        value,
+                        flags=re.I,
+                    )
+                    if m:
+                        start_row = int(m.group(1))
+                block[col] = start_row
+        captured[block_name] = block
+    return captured
+
+
+def _plymouth_rebuild_block_totals(ws, layout, week_slot, captured):
+    """Rebuild current/STLY TOTALS after rows were appended."""
+    for block_name, first_key, total_key in (
+        ("current", "current_first", "current_total"),
+        ("stly", "stly_first", "stly_total"),
+    ):
+        total_row = layout[total_key]
+        default_start = layout[first_key]
+        starts = captured.get(block_name, {})
+
+        for slot in range(1, int(week_slot) + 1):
+            count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
+            for col in (count_col, revenue_col):
+                start_row = starts.get(col) or default_start
+                letter = get_column_letter(col)
+                ws.cell(total_row, col).value = (
+                    f"=SUM({letter}{start_row}:{letter}{total_row - 1})"
+                )
+
+
+def _plymouth_initialize_added_prior_weeks(
+    ws,
+    layout,
+    added_rows,
+    week_slot,
+):
+    """Newly-seen items get 0/0 in earlier completed weekly snapshots."""
+    if int(week_slot) <= 1:
+        return
+
+    for block_name, first_key, total_key in (
+        ("current", "current_first", "current_total"),
+        ("stly", "stly_first", "stly_total"),
+    ):
+        added_names = {
+            _ar_norm(x)
+            for x in added_rows.get(block_name, [])
+            if x
+        }
+        if not added_names:
+            continue
+
+        row_map = _plymouth_block_rows(
+            ws,
+            layout[first_key],
+            layout[total_key],
+        )
+        for name_key in added_names:
+            r = row_map.get(name_key)
+            if not r:
+                continue
+            for prior_slot in range(1, int(week_slot)):
+                count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[prior_slot]
+                if ws.cell(r, count_col).value in (None, ""):
+                    ws.cell(r, count_col).value = 0
+                if ws.cell(r, revenue_col).value in (None, ""):
+                    ws.cell(r, revenue_col).value = 0
+
+
+
+def _plymouth_remove_alias_only_variance_rows(ws, report_year):
+    """Remove duplicate variance rows created by older builds for STLY aliases."""
+    layout = _plymouth_section_layout(ws, report_year)
+    variance_first = layout["variance_first"]
+    variance_total = layout["variance_total"]
+
+    # Build set of preferred current-year variance display keys.
+    current_rows = _plymouth_block_rows(
+        ws,
+        layout["current_first"],
+        layout["current_total"],
+    )
+    current_keys = {
+        _plymouth_variance_key(name): name
+        for name in current_rows.keys()
+    }
+
+    rows_to_remove = []
+    seen = set()
+    for r in range(variance_first, variance_total):
+        name = str(ws.cell(r, 1).value or "").strip()
+        if not name:
+            continue
+        key = _plymouth_variance_key(name)
+
+        preferred = current_keys.get(key)
+        if preferred and _ar_norm(name) != _ar_norm(preferred):
+            rows_to_remove.append(r)
+            continue
+
+        if key in seen:
+            rows_to_remove.append(r)
+            continue
+        seen.add(key)
+
+    for r in reversed(rows_to_remove):
+        # Only shift A:L upward; N:V is a separate dashboard/table area.
+        max_row = ws.max_row
+        # Remove merges that start in/after this row in A:L, then shift/rebuild
+        affected_merges = []
+        for rng in list(ws.merged_cells.ranges):
+            if rng.max_col <= 12 and rng.min_row >= r:
+                affected_merges.append(
+                    (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
+                )
+                ws.unmerge_cells(str(rng))
+
+        ws.move_range(
+            f"A{r + 1}:L{max_row}",
+            rows=-1,
+            cols=0,
+            translate=True,
+        )
+        for c in range(1, 13):
+            ws.cell(max_row, c).value = None
+
+        for min_row, min_col, max_row2, max_col in affected_merges:
+            if min_row == r:
+                continue
+            ws.merge_cells(
+                start_row=min_row - 1,
+                start_column=min_col,
+                end_row=max_row2 - 1,
+                end_column=max_col,
+            )
+
+    return _plymouth_section_layout(ws, report_year), rows_to_remove
+
+
+def _plymouth_prepare_dynamic_main_rows(
+    ws,
+    report_year,
+    main_rows,
+    stly_rows,
+):
+    """Ensure current/STLY/variance sections can accept new item names."""
+    layout, added_current = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "current",
+        [r.get("name") for r in main_rows],
+    )
+
+    layout, added_stly = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "stly",
+        [r.get("name") for r in stly_rows],
+    )
+
+    # Variance uses canonicalized names so known current/STLY naming variants
+    # share one row instead of generating a duplicate negative-only row.
+    variance_names = []
+    seen = set()
+
+    current_display_by_key = {}
+    for row in main_rows:
+        name = str(row.get("name") or "").strip()
+        if name:
+            current_display_by_key[_plymouth_variance_key(name)] = name
+
+    for row in list(main_rows) + list(stly_rows):
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+
+        key = _plymouth_variance_key(name)
+        if key in seen:
+            continue
+
+        # Prefer the current-year display name when the STLY name is an alias.
+        display = current_display_by_key.get(key, name)
+        variance_names.append(display)
+        seen.add(key)
+
+    layout, added_variance = _plymouth_append_missing_names(
+        ws,
+        report_year,
+        "variance",
+        variance_names,
+    )
+
+    return layout, {
+        "current": added_current,
+        "stly": added_stly,
+        "variance": added_variance,
+    }
+
+
+def _plymouth_variance_formula_for_row(
+    ws,
+    layout,
+    variance_row,
+    item_name,
+    count_col,
+    revenue_col,
+):
+    """Create one week's variance formulas using canonical current/STLY names."""
+    current_raw = _plymouth_block_rows(
+        ws,
+        layout["current_first"],
+        layout["current_total"],
+    )
+    stly_raw = _plymouth_block_rows(
+        ws,
+        layout["stly_first"],
+        layout["stly_total"],
+    )
+
+    current_map = {}
+    for key, row in current_raw.items():
+        current_map.setdefault(_plymouth_variance_key(key), row)
+
+    stly_map = {}
+    for key, row in stly_raw.items():
+        stly_map.setdefault(_plymouth_variance_key(key), row)
+
+    key = _plymouth_variance_key(item_name)
+    current_row = current_map.get(key)
+    stly_row = stly_map.get(key)
+
+    count_letter = get_column_letter(count_col)
+    revenue_letter = get_column_letter(revenue_col)
+
+    if current_row and stly_row:
+        count_formula = (
+            f"={count_letter}{current_row}-{count_letter}{stly_row}"
+        )
+        revenue_formula = (
+            f"={revenue_letter}{current_row}-{revenue_letter}{stly_row}"
+        )
+    elif current_row:
+        count_formula = f"={count_letter}{current_row}"
+        revenue_formula = f"={revenue_letter}{current_row}"
+    elif stly_row:
+        count_formula = f"=-{count_letter}{stly_row}"
+        revenue_formula = f"=-{revenue_letter}{stly_row}"
+    else:
+        count_formula = "=0"
+        revenue_formula = "=0"
+
+    ws.cell(variance_row, count_col).value = count_formula
+    ws.cell(variance_row, revenue_col).value = revenue_formula
+
+
+def _plymouth_update_dynamic_variance(ws, layout, week_slot):
+    """Rebuild variance formulas for every completed weekly snapshot."""
+    for slot in range(1, int(week_slot) + 1):
+        count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
+
+        for r in range(layout["variance_first"], layout["variance_total"]):
+            name = str(ws.cell(r, 1).value or "").strip()
+            if not name:
+                ws.cell(r, count_col).value = None
+                ws.cell(r, revenue_col).value = None
+                continue
+
+            _plymouth_variance_formula_for_row(
+                ws,
+                layout,
+                r,
+                name,
+                count_col,
+                revenue_col,
+            )
+
+        total_row = layout["variance_total"]
+        count_letter = get_column_letter(count_col)
+        revenue_letter = get_column_letter(revenue_col)
+        ws.cell(total_row, count_col).value = (
+            f"=SUM({count_letter}{layout['variance_first']}:"
+            f"{count_letter}{total_row - 1})"
+        )
+        ws.cell(total_row, revenue_col).value = (
+            f"=SUM({revenue_letter}{layout['variance_first']}:"
+            f"{revenue_letter}{total_row - 1})"
+        )
+
+
+def _plymouth_excel_date(value):
+    """Parse Google Form posting dates, including Excel serial numbers."""
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return (
+                datetime.datetime(1899, 12, 30)
+                + datetime.timedelta(days=float(value))
+            ).date()
+        except Exception:
+            return None
+
+    parsed = _ar_date(value)
+    return parsed.date() if parsed else None
+
+
+def _plymouth_clean_agent_name(name):
+    return re.sub(r"\s+", " ", str(name or "").strip())
+
+
+def _plymouth_agent_key(name):
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        _plymouth_clean_agent_name(name).lower(),
+    )
+
+
+def _plymouth_parse_commission_form(raw, start_date, end_date):
+    """Aggregate Google Form add-on revenue by agent for the selected MTD window."""
+    if not raw:
+        return []
+
+    header_idx = None
+    h = None
+    for i, row in enumerate(raw[:15]):
+        hm = _ar_header_map(row)
+        if (
+            _ar_col(hm, ["agent name"]) >= 0
+            and _ar_col(
+                hm,
+                [
+                    "add on revenue posting date",
+                    "add-on revenue posting date",
+                ],
+            ) >= 0
+            and _ar_col(
+                hm,
+                [
+                    "add on revenue amount posted",
+                    "add-on revenue amount posted",
+                ],
+            ) >= 0
+        ):
+            header_idx = i
+            h = hm
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Employee Commission Recognition Form is missing Agent Name, "
+            "Add On Revenue Posting Date, or Add On Revenue Amount Posted."
+        )
+
+    name_col = _ar_col(h, ["agent name"])
+    date_col = _ar_col(
+        h,
+        ["add on revenue posting date", "add-on revenue posting date"],
+    )
+    amount_col = _ar_col(
+        h,
+        ["add on revenue amount posted", "add-on revenue amount posted"],
+    )
+
+    agg = {}
+    for row in raw[header_idx + 1:]:
+        def rv(c):
+            return row[c] if c >= 0 and c < len(row) else None
+
+        posted = _plymouth_excel_date(rv(date_col))
+        if not posted or posted < start_date or posted > end_date:
+            continue
+
+        name = _plymouth_clean_agent_name(rv(name_col))
+        if not name:
+            continue
+
+        amount = _ar_num(rv(amount_col)) or 0
+        key = _plymouth_agent_key(name)
+        entry = agg.setdefault(
+            key,
+            {
+                "name": name,
+                "addOnRevenue": 0,
+            },
+        )
+        # Prefer the longest/fullest display form found in the source.
+        if len(name) > len(entry["name"]):
+            entry["name"] = name
+        entry["addOnRevenue"] += amount
+
+    return list(agg.values())
+
+
+def _plymouth_canonical_agent_rows(upgrade_staff, commission_rows):
+    """Merge capitalization/spacing/short-name variants across both sources."""
+    all_names = []
+    for row in upgrade_staff:
+        name = _plymouth_clean_agent_name(row.get("name"))
+        if name:
+            all_names.append(name)
+    for row in commission_rows:
+        name = _plymouth_clean_agent_name(row.get("name"))
+        if name:
+            all_names.append(name)
+
+    # Build exact and unique-first-name references from the source data itself,
+    # not from the existing worksheet table.
+    exact_display = {}
+    first_to_full = {}
+    first_candidates = {}
+
+    for name in all_names:
+        key = _plymouth_agent_key(name)
+        if key not in exact_display or len(name) > len(exact_display[key]):
+            exact_display[key] = name
+
+        tokens = name.split()
+        if tokens:
+            first = tokens[0].lower()
+            if len(tokens) > 1:
+                first_candidates.setdefault(first, set()).add(name)
+
+    for first, candidates in first_candidates.items():
+        if len(candidates) == 1:
+            first_to_full[first] = next(iter(candidates))
+
+    def canonical(name):
+        clean = _plymouth_clean_agent_name(name)
+        key = _plymouth_agent_key(clean)
+        if key in exact_display:
+            return exact_display[key]
+
+        tokens = clean.split()
+        if len(tokens) == 1:
+            full = first_to_full.get(tokens[0].lower())
+            if full:
+                return full
+        return clean
+
+    merged = {}
+    for row in upgrade_staff:
+        name = canonical(row.get("name"))
+        key = _plymouth_agent_key(name)
+        entry = merged.setdefault(
+            key,
+            {
+                "name": name,
+                "upgradeCount": 0,
+                "upgradeRevenue": 0,
+                "addOnRevenue": 0,
+            },
+        )
+        entry["upgradeCount"] += _ar_num(row.get("count")) or 0
+        entry["upgradeRevenue"] += _ar_num(row.get("revenue")) or 0
+
+    for row in commission_rows:
+        name = canonical(row.get("name"))
+        key = _plymouth_agent_key(name)
+        entry = merged.setdefault(
+            key,
+            {
+                "name": name,
+                "upgradeCount": 0,
+                "upgradeRevenue": 0,
+                "addOnRevenue": 0,
+            },
+        )
+        entry["addOnRevenue"] += _ar_num(row.get("addOnRevenue")) or 0
+
+    rows = []
+    for row in merged.values():
+        row["totalRevenue"] = (
+            (_ar_num(row.get("upgradeRevenue")) or 0)
+            + (_ar_num(row.get("addOnRevenue")) or 0)
+        )
+        if (
+            row["upgradeCount"]
+            or row["upgradeRevenue"]
+            or row["addOnRevenue"]
+        ):
+            rows.append(row)
+
+    rows.sort(
+        key=lambda x: (
+            -x["totalRevenue"],
+            -x["upgradeRevenue"],
+            x["name"].lower(),
+        )
+    )
+    return rows
+
+
+def _plymouth_agent_table_style_rows(ws):
+    """Find normal and blue-highlight style examples in the current month tab."""
+    normal_row = None
+    highlight_row = None
+
+    for r in range(16, min(ws.max_row, 60) + 1):
+        name = str(ws.cell(r, 14).value or "").strip()
+        if not name:
+            continue
+
+        fill = ws.cell(r, 14).fill
+        rgb = (
+            fill.fgColor.rgb
+            if fill and fill.fgColor.type == "rgb"
+            else None
+        )
+        if rgb and str(rgb).upper().endswith("3C78D8"):
+            highlight_row = r
+        elif normal_row is None:
+            normal_row = r
+
+    return normal_row or 18, highlight_row or 17
+
+
+def _plymouth_copy_agent_row_style(ws, src_row, dst_row):
+    for c in range(14, 19):
+        src = ws.cell(src_row, c)
+        dst = ws.cell(dst_row, c)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.number_format = src.number_format
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+
+
+def _plymouth_rebuild_agent_table(
+    ws,
+    upgrade_staff,
+    commission_raw,
+    report_month,
+    week_date,
+):
+    """Rebuild N:R from source data, sorted by total revenue descending."""
+    start_date = report_month.date().replace(day=1)
+    end_date = week_date
+
+    commission_rows = _plymouth_parse_commission_form(
+        commission_raw,
+        start_date,
+        end_date,
+    )
+    agent_rows = _plymouth_canonical_agent_rows(
+        upgrade_staff,
+        commission_rows,
+    )
+
+    normal_style_row, highlight_style_row = _plymouth_agent_table_style_rows(ws)
+
+    # Preserve style blueprints before clearing the previous table.
+    normal_styles = [
+        copy(ws.cell(normal_style_row, c)._style)
+        for c in range(14, 19)
+    ]
+    highlight_styles = [
+        copy(ws.cell(highlight_style_row, c)._style)
+        for c in range(14, 19)
+    ]
+    normal_formats = [
+        ws.cell(normal_style_row, c).number_format
+        for c in range(14, 19)
+    ]
+    highlight_formats = [
+        ws.cell(highlight_style_row, c).number_format
+        for c in range(14, 19)
+    ]
+
+    # Table occupies N:R only; T:V messaging remains untouched.
+    clear_end = max(60, 15 + len(agent_rows) + 5)
+    for r in range(16, clear_end + 1):
+        for c in range(14, 19):
+            ws.cell(r, c).value = None
+            ws.cell(r, c)._style = copy(normal_styles[c - 14])
+            ws.cell(r, c).number_format = normal_formats[c - 14]
+
+    for idx, row in enumerate(agent_rows, start=16):
+        for c in range(14, 19):
+            ws.cell(idx, c)._style = copy(normal_styles[c - 14])
+            ws.cell(idx, c).number_format = normal_formats[c - 14]
+
+        ws.cell(idx, 14).value = row["name"]
+        ws.cell(idx, 15).value = row["upgradeCount"]
+        ws.cell(idx, 16).value = row["upgradeRevenue"]
+        ws.cell(idx, 17).value = row["addOnRevenue"]
+        ws.cell(idx, 18).value = f"=SUM(P{idx}:Q{idx})"
+
+    # Blue highlight = highest-revenue human staff member. WEB/Unknown remain
+    # visible in the sorted table but are not eligible for champion highlight.
+    top_human_index = None
+    for idx, row in enumerate(agent_rows, start=16):
+        if _ar_norm(row["name"]) not in {"web", "unknown"}:
+            top_human_index = idx
+            break
+
+    if top_human_index is not None:
+        for c in range(14, 19):
+            ws.cell(top_human_index, c)._style = copy(
+                highlight_styles[c - 14]
+            )
+            ws.cell(top_human_index, c).number_format = (
+                highlight_formats[c - 14]
+            )
+
+    return agent_rows, (
+        agent_rows[top_human_index - 16]["name"]
+        if top_human_index is not None
+        else None
+    )
+
+
+
+def plymouth_build_weekly_update(
+    workbook_bytes,
+    report_month,
+    week_slot,
+    week_date,
+    addon_file,
+    upsell_file,
+    stly_addon_file,
+    stly_upsell_file,
+    commission_file,
+    journal_values=None,
+    stly_journal_values=None,
+    messaging=None,
+    engagement_rate=None,
+    month_end=False,
+):
+    """Update one Plymouth weekly MTD snapshot inside the existing month tab."""
+    journal_values = journal_values or []
+    stly_journal_values = stly_journal_values or []
+    messaging = messaging or {}
+
+    wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes), data_only=False)
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(
+            f"Plymouth weekly tab **{sheet_name}** was not found in the "
+            "existing tracking workbook. Create the new month tab from the "
+            "weekly template first, then run the weekly updater."
+        )
+
+    ws = wb[sheet_name]
+    layout = _plymouth_section_layout(ws, report_month.year)
+    count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[int(week_slot)]
+
+    # Parse current-year MTD source.
+    profile, key = ancillary_profile("Hotel 1620")
+    addon = ancillary_parse_addon(_ar_file_rows(addon_file), key)
+    upgrades = ancillary_parse_upsell(_ar_file_rows(upsell_file))
+
+    journal_agg = {}
+    for i, j in enumerate(profile.get("journal", [])):
+        value = journal_values[i] if i < len(journal_values) else None
+        if value is None:
+            continue
+        journal_agg[j["report"]] = (
+            journal_agg.get(j["report"], 0) + (_ar_num(value) or 0)
+        )
+
+    journal_rows = [
+        {"name": name, "count": None, "revenue": value, "average": None}
+        for name, value in journal_agg.items()
+    ]
+
+    main = [
+        r for r in addon["main"]
+        if not _ar_is_journal_equivalent(r["name"])
+    ]
+    main = journal_rows + main + upgrades["byRoomType"]
+
+    # Parse STLY MTD source.
+    stly = ancillary_parse_snt_history(
+        _ar_file_rows(stly_addon_file),
+        _ar_file_rows(stly_upsell_file),
+        key,
+    )
+    if profile.get("stlyJournal"):
+        rows = []
+        for i, j in enumerate(profile.get("journal", [])[:2]):
+            value = (
+                stly_journal_values[i]
+                if i < len(stly_journal_values)
+                else None
+            )
+            rows.append({"name": j["report"], "revenue": value})
+        stly = ancillary_apply_stly_journal(stly, rows)
+
+    # Clean up duplicate alias-only variance rows that may exist from an older
+    # Plymouth weekly build before capturing ranges/adding any new rows.
+    layout, removed_alias_variance_rows = _plymouth_remove_alias_only_variance_rows(
+        ws,
+        report_month.year,
+    )
+
+    # Capture the original TOTALS range starts before any A:L rows move.
+    total_sum_starts = _plymouth_capture_total_sum_starts(
+        ws,
+        layout,
+        int(week_slot),
+    )
+
+    # Main/STLY/variance names are dynamic. Preserve prior-week rows and append
+    # any newly-seen add-on or room-upgrade names so prior week columns remain
+    # attached to the correct item.
+    layout, added_dynamic = _plymouth_prepare_dynamic_main_rows(
+        ws,
+        report_month.year,
+        main,
+        stly.get("rows", []),
+    )
+
+    current_map = _plymouth_block_rows(
+        ws, layout["current_first"], layout["current_total"]
+    )
+    stly_map = _plymouth_block_rows(
+        ws, layout["stly_first"], layout["stly_total"]
+    )
+    cur_item_map = _plymouth_block_rows(
+        ws, layout["current_item_first"], layout["current_item_end"]
+    )
+    stly_item_map = _plymouth_block_rows(
+        ws, layout["stly_item_first"], layout["stly_item_end"]
+    )
+
+    current_written, current_missing = _plymouth_write_named_rows(
+        ws, current_map, main, count_col, revenue_col, value_key="revenue"
+    )
+    stly_written, stly_missing = _plymouth_write_named_rows(
+        ws, stly_map, stly.get("rows", []), count_col, revenue_col,
+        value_key="approved",
+    )
+    item_written, item_missing = _plymouth_write_named_rows(
+        ws, cur_item_map, addon.get("itemized", []), count_col, revenue_col,
+        value_key="revenue",
+    )
+    stly_item_written, stly_item_missing = _plymouth_write_named_rows(
+        ws, stly_item_map, stly.get("itemizedRows", []), count_col, revenue_col,
+        value_key="revenue",
+    )
+
+    # Any item that first appears this week should show 0 / $0 in earlier
+    # completed week columns, matching the corrected Plymouth tracker.
+    _plymouth_initialize_added_prior_weeks(
+        ws,
+        layout,
+        added_dynamic,
+        int(week_slot),
+    )
+
+    # Structural row additions can shift/translate TOTALS formulas. Rebuild
+    # them using the original start-row logic and the new block end rows.
+    _plymouth_rebuild_block_totals(
+        ws,
+        layout,
+        int(week_slot),
+        total_sum_starts,
+    )
+
+    # Week header labels across all Plymouth weekly sections.
+    if month_end:
+        current_label = "MONTH END"
+    else:
+        date_suffix = f" - {week_date.month}/{week_date.day}" if week_date else ""
+        current_label = f"WK {week_slot}{date_suffix}"
+
+    stly_label = (
+        "MONTH END"
+        if month_end and week_slot == 5
+        else current_label
+    )
+
+    for header_key, label in (
+        ("current_header", current_label),
+        ("stly_header", stly_label),
+        ("variance_header", current_label),
+        ("current_item_header", current_label),
+        ("stly_item_header", stly_label),
+    ):
+        ws.cell(layout[header_key], count_col).value = label
+
+    _plymouth_update_dynamic_variance(
+        ws,
+        layout,
+        int(week_slot),
+    )
+
+    agent_rows, top_agent = _plymouth_rebuild_agent_table(
+        ws,
+        upgrades.get("byStaff", []),
+        _ar_file_rows(commission_file),
+        report_month,
+        week_date,
+    )
+
+    _plymouth_write_messaging(
+        ws,
+        messaging,
+        week_date=week_date,
+        engagement_rate=engagement_rate,
+        week_slot=int(week_slot),
+    )
+
+    out = io.BytesIO()
+    wb.save(out)
+
+    summary = {
+        "sheet": sheet_name,
+        "weekSlot": int(week_slot),
+        "weekLabel": current_label,
+        "currentWritten": current_written,
+        "stlyWritten": stly_written,
+        "itemizedWritten": item_written,
+        "stlyItemizedWritten": stly_item_written,
+        "missingCurrent": current_missing,
+        "missingSTLY": stly_missing,
+        "missingItemized": item_missing,
+        "missingSTLYItemized": stly_item_missing,
+        "currentRows": main,
+        "stly": stly,
+        "addedDynamicRows": added_dynamic,
+        "removedAliasVarianceRows": removed_alias_variance_rows,
+        "agentRows": agent_rows,
+        "topAgent": top_agent,
+    }
+    return out.getvalue(), summary
+
+
+def _plymouth_resolve_drive_target(service, report_month):
+    """Resolve Hotel 1620/Plymouth's existing ancillary tracking workbook."""
+    discovered = dict(get_hotels_from_drive())
+    hotel_id = (
+        discovered.get("Hotel 1620")
+        or discovered.get("Plymouth")
+        or discovered.get("1620")
+    )
+    if not hotel_id:
+        for label, folder_id in discovered.items():
+            n = _ar_norm(label)
+            if "1620" in n or "plymouth" in n:
+                hotel_id = folder_id
+                break
+
+    if hotel_id:
+        target, err = ancillary_find_drive_report(
+            service,
+            hotel_id,
+            "1620",
+            report_month,
+        )
+        if target and not err:
+            return target, None
+
+    # Fallback to the older dedicated Plymouth ancillary folder resolver.
+    file_id, name_or_err = find_ancillary_revenue_file(service)
+    if file_id:
+        return {
+            "file_id": file_id,
+            "file_name": name_or_err,
+            "folder_name": ANCILLARY_REVENUE_FOLDER_NAME,
+        }, None
+
+    return None, (
+        name_or_err
+        if isinstance(name_or_err, str)
+        else "Plymouth ancillary tracking workbook was not found in Drive."
+    )
 
 
 # ── Ancillary Revenue (Plymouth/Hotel 1620 only, for now) ────────────────────
@@ -5939,6 +12737,146 @@ if st.session_state.get("view") == "admin_settings" and st.session_state.get("is
     render_admin_settings(_admin_svc, _users_file_id, _users_err)
     st.stop()
 
+def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
+    """Shared ROB new-month setup for Hilton and IHG.
+
+    Uses the exact same setup_new_rob_month() engine as Stay In Touch:
+      - finds/copies the ROB master
+      - carries prior-month / last-year values
+      - preserves each week tab's own as-of date for completed months
+      - rebuilds Pickup WoW formulas across every month/year
+      - leaves an undo snapshot
+
+    selected_hotels is [(display_name, drive_folder_id), ...].
+    """
+    if not selected_hotels:
+        return
+
+    setup_toggle = st.checkbox(
+        "Set up new month",
+        key=f"{key_prefix}_new_month",
+        help="Uses the same ROB month-setup logic as the Stay In Touch portfolio."
+    )
+    if not setup_toggle:
+        return
+
+    with st.container(border=True):
+        today = datetime.date.today()
+        cur_month = today.replace(day=1)
+        prev_month = (cur_month - datetime.timedelta(days=1)).replace(day=1)
+        next_month = (cur_month + datetime.timedelta(days=32)).replace(day=1)
+
+        options = {
+            prev_month.strftime("%B %Y"): prev_month,
+            cur_month.strftime("%B %Y"): cur_month,
+            next_month.strftime("%B %Y"): next_month,
+        }
+        labels = list(options.keys())
+        default_dt = next_month if today.day >= 22 else cur_month
+
+        sel = st.selectbox(
+            "Month to set up",
+            labels,
+            index=labels.index(default_dt.strftime("%B %Y")),
+            key=f"{key_prefix}_setup_month",
+        )
+        target_month = options[sel]
+
+        names = ", ".join(n for n, _ in selected_hotels)
+        st.caption(f"ROB setup will run for: **{names}**")
+
+        if st.button(
+            "Set Up New ROB",
+            key=f"{key_prefix}_setup_rob_btn",
+            type="primary",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            undo_items = []
+            successes = 0
+
+            for hotel_name, hotel_id in selected_hotels:
+                if not hotel_id:
+                    st.error(f"{hotel_name}: no Drive folder found.")
+                    continue
+                try:
+                    with st.spinner(f"Setting up {hotel_name} ROB..."):
+                        name, err, file_id, original = setup_new_rob_month(
+                            svc, hotel_id, hotel_name, target_month
+                        )
+
+                    if err and not name:
+                        st.error(f"{hotel_name}: {err}")
+                        continue
+
+                    if err:
+                        st.warning(f"{hotel_name}: {err}")
+
+                    if file_id and original is not None:
+                        undo_items.append({
+                            "file_id": file_id,
+                            "file_name": name,
+                            "bytes": original,
+                        })
+
+                    st.success(
+                        f"{hotel_name}: **{name}** ready for "
+                        f"{target_month:%B %Y}."
+                    )
+                    successes += 1
+                except Exception as e:
+                    st.error(f"{hotel_name}: ROB setup error — {e}")
+
+            if undo_items:
+                st.session_state[f"{key_prefix}_setup_rob_undo"] = undo_items
+
+            if successes:
+                st.info(
+                    "The same week-date carryover and Pickup WoW formula setup "
+                    "used for Stay In Touch was applied."
+                )
+
+        undo_key = f"{key_prefix}_setup_rob_undo"
+        if undo_key in st.session_state:
+            if st.button(
+                "↩ Reset ROB setup to original",
+                key=f"{key_prefix}_setup_rob_reset",
+                use_container_width=True,
+            ):
+                svc = get_drive_service()
+                errors = []
+                for item in st.session_state[undo_key]:
+                    try:
+                        drive_upload(
+                            svc,
+                            item["file_id"],
+                            item["bytes"],
+                            item["file_name"],
+                        )
+                    except Exception as e:
+                        errors.append(f"{item['file_name']}: {e}")
+
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    del st.session_state[undo_key]
+                    st.success("ROB workbook(s) restored to their original state.")
+
+
+HILTON_PERMANENT_ROOM_PROPERTIES = {
+    "northbrook",
+    "kansas city",
+    "memphis",
+    "nashua",
+}
+
+
+def _hilton_has_permanent_rooms(hotel_name):
+    name = str(hotel_name or "").strip().lower()
+    return any(key in name for key in HILTON_PERMANENT_ROOM_PROPERTIES)
+
+
 def render_hilton_update(hotels):
     """Hilton portfolio run.
 
@@ -5972,11 +12910,12 @@ def render_hilton_update(hotels):
                 if st.checkbox(name, key=f"hil_sel_{fid}"):
                     selected.append((name, fid))
 
+        hilton_workbooks = portfolio_workbook_options("Hilton")
         wb_sels = st.pills(
             "Workbooks to update",
-            PORTFOLIO_WORKBOOKS["Hilton"],
+            hilton_workbooks,
             selection_mode="multi",
-            default=PORTFOLIO_WORKBOOKS["Hilton"],
+            default=hilton_workbooks,
             key="hil_wb",
         ) or []
 
@@ -5990,6 +12929,15 @@ def render_hilton_update(hotels):
                  "all lands on the OTB rows and none on the actuals.",
         )
 
+        if "ROB" in wb_sels and selected:
+            render_portfolio_rob_month_setup(selected, "hil")
+
+        if NEXT_YEAR_ROB_TYPE in wb_sels and selected:
+            render_portfolio_next_year_rob_month_setup(
+                selected,
+                "hil",
+            )
+
         srp_file = st.file_uploader(
             "SRP Activity — all Hilton properties (one file)",
             type=["xlsx"], key="hil_srp")
@@ -6001,7 +12949,117 @@ def render_hilton_update(hotels):
             for i, (name, fid) in enumerate(selected):
                 with wcols[i % 2]:
                     wash_files[name] = st.file_uploader(
-                        name, type=["xlsx"], key=f"hil_wash_{fid}")
+                        name,
+                        type=["xlsx"],
+                        key=f"hil_wash_{fid}",
+                    )
+
+        hilton_manual_mtd = {}
+        if selected and "ROB" in wb_sels:
+            st.markdown("### Hilton ROB Actuals")
+            st.caption(
+                "Enter actual totals through **T-2**. The ROB adds live OTB from "
+                "**T-1 through month-end**. These inputs affect the ROB only."
+            )
+
+            for name, fid in selected:
+                with st.container(border=True):
+                    st.markdown(f"**{name}**")
+
+                    h0, h1, h2 = st.columns([1.45, 1, 1])
+                    with h0:
+                        st.caption("Line")
+                    with h1:
+                        st.caption("Room Nights")
+                    with h2:
+                        st.caption("Revenue")
+
+                    # Total Rooms
+                    r0, r1, r2 = st.columns([1.45, 1, 1])
+                    with r0:
+                        st.markdown("**Total Rooms**")
+                    with r1:
+                        total_rooms = st.number_input(
+                            f"{name} Total Room Nights through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"hil_total_rooms_{fid}",
+                            label_visibility="collapsed",
+                        )
+                    with r2:
+                        total_revenue = st.number_input(
+                            f"{name} Total Revenue through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            key=f"hil_total_revenue_{fid}",
+                            label_visibility="collapsed",
+                        )
+
+                    # Group
+                    g0, g1, g2 = st.columns([1.45, 1, 1])
+                    with g0:
+                        st.markdown("**Group**")
+                    with g1:
+                        group_rooms = st.number_input(
+                            f"{name} Group Room Nights through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"hil_group_rooms_{fid}",
+                            label_visibility="collapsed",
+                        )
+                    with g2:
+                        group_revenue = st.number_input(
+                            f"{name} Group Revenue through T-2",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0,
+                            format="%.2f",
+                            key=f"hil_group_revenue_{fid}",
+                            label_visibility="collapsed",
+                        )
+
+                    has_perm = _hilton_has_permanent_rooms(name)
+                    perm_rooms = 0.0
+                    perm_revenue = 0.0
+
+                    if has_perm:
+                        # Permanent
+                        p0, p1, p2 = st.columns([1.45, 1, 1])
+                        with p0:
+                            st.markdown("**Permanent**")
+                        with p1:
+                            perm_rooms = st.number_input(
+                                f"{name} Permanent Room Nights through T-2",
+                                min_value=0.0,
+                                value=0.0,
+                                step=1.0,
+                                key=f"hil_perm_rooms_{fid}",
+                                label_visibility="collapsed",
+                            )
+                        with p2:
+                            perm_revenue = st.number_input(
+                                f"{name} Permanent Revenue through T-2",
+                                min_value=0.0,
+                                value=0.0,
+                                step=100.0,
+                                format="%.2f",
+                                key=f"hil_perm_revenue_{fid}",
+                                label_visibility="collapsed",
+                            )
+
+                    hilton_manual_mtd[name] = {
+                        "rooms": total_rooms,
+                        "revenue": total_revenue,
+                        "group_rooms": group_rooms,
+                        "group_revenue": group_revenue,
+                        "perm_rooms": perm_rooms,
+                        "perm_revenue": perm_revenue,
+                        "has_perm": has_perm,
+                    }
 
     if not selected:
         st.info("Select at least one property.")
@@ -6030,12 +13088,21 @@ def render_hilton_update(hotels):
         srp_filters = None
     for msg in srp_filter_warnings(srp_filters):
         st.warning(msg)
+    hilton_as_of = (
+        srp_filters.get("run_date")
+        if srp_filters and srp_filters.get("run_date")
+        else datetime.date.today()
+    )
+
     if srp_filters and srp_filters.get("lines"):
         with st.expander("Filters this export was run with"):
             for line in srp_filters["lines"]:
                 st.markdown(f"- {line}")
-            st.caption("Booked Date should be the day you run it, and Departure "
-                       "Date should start on the 1st of the month.")
+            st.caption("Booked Date should match the report run date. For the "
+                       "current month, the ROB combines manually entered actual Room Nights / "
+                       "Revenue through T-2 with live SRP OTB from T-1 through month "
+                       "end. The Forecast remains separate: T-1 stays blank for manual "
+                       "daily actual entry, while T and future dates use SRP OTB.")
 
     # Resolved up front, not inside the run. A hotel the export doesn't cover
     # can't be updated, and finding that out only after pressing the button is
@@ -6058,7 +13125,7 @@ def render_hilton_update(hotels):
 
     if st.button("Preview changes", key="hil_preview", type="primary"):
         svc = get_drive_service()
-        next_month = (datetime.date.today().replace(day=1)
+        next_month = (hilton_as_of.replace(day=1)
                       + datetime.timedelta(days=32)).replace(day=1)
         jobs, problems = [], []
         for name, fid in selected:
@@ -6069,7 +13136,7 @@ def render_hilton_update(hotels):
                     f"{service_account_email() or 'the service account'} as Editor.")
                 continue
             try:
-                wash = parse_group_wash(wash_files[name])
+                wash = parse_group_wash(wash_files[name], hotel_name=name)
             except Exception as e:
                 problems.append(f"{name}: could not read the Group Wash report — {e}")
                 continue
@@ -6081,13 +13148,27 @@ def render_hilton_update(hotels):
             prop = srp[inn]
             for wb_type in wb_sels:
                 if wb_type == "Forecast":
-                    job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
-                                               problems)
+                    job = _hilton_forecast_job(
+                        svc, fid, name, inn, prop, wash, problems,
+                        as_of=hilton_as_of
+                    )
                     if job:
                         jobs.append(job)
                     continue
 
-                result, err = resolve_drive_workbook(svc, fid, name, wb_type)
+                if wb_type == NEXT_YEAR_ROB_TYPE:
+                    report_month = hilton_as_of.replace(day=1)
+                    result, err = resolve_next_year_rob_workbook(
+                        svc,
+                        fid,
+                        name,
+                        report_month=report_month,
+                        tracked_year=report_month.year + 1,
+                    )
+                else:
+                    result, err = resolve_drive_workbook(
+                        svc, fid, name, wb_type
+                    )
                 if err or not result:
                     problems.append(f"{name} — {wb_type}: {err}")
                     continue
@@ -6100,11 +13181,114 @@ def render_hilton_update(hotels):
                                     f"week tabs were found.")
                     continue
                 sheet = first_uncolored_sheet(wb, avail)
+                current_month_total = None
+
+                # Current-month Hilton ROB uses the user's manually reconciled
+                # actual Room Nights / Revenue through T-2, then adds the live
+                # SRP tail beginning T-1 (yesterday).
+                # Forecast workbook mapping remains separate and unchanged.
+                if wb_type != NEXT_YEAR_ROB_TYPE:
+                    manual = hilton_manual_mtd.get(name) or {}
+                    manual_rooms = _ar_num(manual.get("rooms")) or 0
+                    manual_revenue = _ar_num(manual.get("revenue")) or 0
+                    manual_group_rooms = _ar_num(manual.get("group_rooms")) or 0
+                    manual_group_revenue = _ar_num(manual.get("group_revenue")) or 0
+                    manual_perm_rooms = _ar_num(manual.get("perm_rooms")) or 0
+                    manual_perm_revenue = _ar_num(manual.get("perm_revenue")) or 0
+
+                    if manual_rooms == 0 and manual_revenue == 0:
+                        problems.append(
+                            f"{name} — ROB: T-2 actual Room Nights and Revenue are both "
+                            f"0. Enter the reconciled MTD actuals before applying "
+                            f"if that is not intentional."
+                        )
+
+                    month_end = (
+                        (hilton_as_of.replace(day=28) + datetime.timedelta(days=4))
+                        .replace(day=1)
+                        - datetime.timedelta(days=1)
+                    )
+                    srp_start = hilton_as_of - datetime.timedelta(days=1)
+
+                    srp_rooms = 0.0
+                    srp_revenue_raw = 0.0
+                    d = srp_start
+                    while d <= month_end:
+                        rooms, rev = _srp_seg(prop["days"].get(d), "TOT")
+                        srp_rooms += rooms
+                        srp_revenue_raw += rev
+                        d += datetime.timedelta(days=1)
+
+                    # Completed Hilton ROBs are not uniform here:
+                    # Nashua preserves the live SRP tail to cents, while the
+                    # previously-confirmed Ann Arbor workbook uses a whole-
+                    # dollar SRP component. Preserve both known conventions
+                    # until the remaining Hilton properties are validated.
+                    if "ann arbor" in str(name or "").strip().lower():
+                        srp_revenue = int(
+                            math.floor(srp_revenue_raw + 0.5)
+                        )
+                    else:
+                        srp_revenue = round(srp_revenue_raw, 2)
+
+                    current_month_total = {
+                        "rooms": manual_rooms + srp_rooms,
+                        "revenue": manual_revenue + srp_revenue,
+                        "actual_rooms": manual_rooms,
+                        "actual_revenue": manual_revenue,
+                        "actual_group_rooms": manual_group_rooms,
+                        "actual_group_revenue": manual_group_revenue,
+                        "actual_perm_rooms": manual_perm_rooms,
+                        "actual_perm_revenue": manual_perm_revenue,
+                        "srp_rooms": srp_rooms,
+                        "srp_revenue": srp_revenue,
+                        "srp_revenue_raw": srp_revenue_raw,
+                        "actual_through": (
+                            hilton_as_of - datetime.timedelta(days=2)
+                        ),
+                        "srp_from": srp_start,
+                        "forecast_sheet": None,
+                        "source": "manual_mtd",
+                    }
+
                 changes, rob_warns = build_hilton_rob_plan(
-                    prop["months"], wash["months"], wb[sheet])
+                    prop["months"],
+                    wash["months"],
+                    wb[sheet],
+                    as_of=hilton_as_of,
+                    current_month_total=(
+                        None
+                        if wb_type == NEXT_YEAR_ROB_TYPE
+                        else current_month_total
+                    ),
+                    tracked_year=(
+                        hilton_as_of.year + 1
+                        if wb_type == NEXT_YEAR_ROB_TYPE
+                        else hilton_as_of.year
+                    ),
+                    wash_days=wash.get("days"),
+                )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
                 note = f"  ·  InnCode {inn}"
+                if current_month_total is not None:
+                    note += (
+                        f"  ·  current month = Manual actuals through T-2 "
+                        f"{current_month_total['actual_through']:%b %d} + SRP "
+                        f"{current_month_total['srp_from']:%b %d}–month end "
+                        f"({current_month_total['actual_rooms']:,.0f} + "
+                        f"{current_month_total['srp_rooms']:,.0f} rooms; "
+                        f"${current_month_total['actual_revenue']:,.2f} + "
+                        f"${current_month_total['srp_revenue']:,.0f})"
+                    )
+                    note += (
+                        f"  ·  Group T-2 actuals "
+                        f"{current_month_total.get('actual_group_rooms', 0):,.0f} rms / "
+                        f"${current_month_total.get('actual_group_revenue', 0):,.2f}"
+                        f"  ·  Permanent T-2 actuals "
+                        f"{current_month_total.get('actual_perm_rooms', 0):,.0f} rms / "
+                        f"${current_month_total.get('actual_perm_revenue', 0):,.2f}"
+                    )
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
                 if passed:
@@ -6117,8 +13301,10 @@ def render_hilton_update(hotels):
                 })
 
             if hil_next_month and "Forecast" in wb_sels:
-                job = _hilton_forecast_job(svc, fid, name, inn, prop, wash,
-                                           problems, month_date=next_month)
+                job = _hilton_forecast_job(
+                    svc, fid, name, inn, prop, wash, problems,
+                    month_date=next_month, as_of=hilton_as_of
+                )
                 if job:
                     jobs.append(job)
         st.session_state["hil_jobs"] = jobs
@@ -6184,6 +13370,233 @@ def _render_undo_bar(undo_key: str):
                     st.rerun()
 
 
+def render_ihg_strategy_month_setup(hotel_name, hotel_id):
+    """Set up next month's IHG Strategy Report using the shared SR engine.
+
+    Structural setup matches the Stay In Touch Strategy workflow:
+      - locate/copy the correct-year Strategy master
+      - create/use the next month's workbook
+      - clear week-tab completion colors on a fresh copy
+      - rebuild the Strategy date ranges for all week tabs
+      - preload previous-month / LY reference fields where the shared
+        Strategy headers exist
+      - keep an undo snapshot
+
+    Current IHG operational values are still filled later from the IHG PDFs.
+    """
+    st.markdown("**Set Up Next Month — Strategy Report**")
+
+    today = datetime.date.today()
+    cur_month = today.replace(day=1)
+    next_month = (cur_month + datetime.timedelta(days=32)).replace(day=1)
+
+    target_month = st.selectbox(
+        "Strategy month to set up",
+        [cur_month, next_month],
+        index=1,
+        format_func=lambda d: d.strftime("%B %Y"),
+        key=f"ihg_sr_setup_month_{hotel_name}",
+    )
+
+    if st.button(
+        "Set Up New Strategy Report",
+        key=f"ihg_setup_sr_{hotel_name}",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not hotel_id:
+            st.error(f"{hotel_name}: no Drive folder found.")
+            return
+
+        try:
+            svc = get_drive_service()
+            month_kw = target_month.strftime("%b%Y").upper()
+
+            # Step 1 — locate or create the target workbook.
+            is_fresh_copy = False
+            with st.spinner("Step 1 / 3 — locating or creating Strategy workbook..."):
+                existing, find_err = _resolve_drive_workbook_session_cached(
+                    svc, hotel_id, hotel_name, "Strategy Report", target_month
+                )
+
+                if existing:
+                    st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                else:
+                    is_fresh_copy = True
+                    created_name, create_err = setup_new_sr_month(
+                        svc,
+                        hotel_id,
+                        hotel_name,
+                        target_month,
+                    )
+                    if create_err:
+                        master_id, master_name = find_sr_master(
+                            svc,
+                            hotel_id,
+                            target_month.year,
+                        )
+                        hotel_suffix = ""
+                        if master_name and "STRATEGY" in master_name.upper():
+                            hotel_suffix = (
+                                master_name[
+                                    master_name.upper().find("STRATEGY")
+                                    + len("STRATEGY"):
+                                ]
+                                .strip()
+                                .replace(".xlsx", "")
+                                .replace(".XLSX", "")
+                                .strip()
+                            )
+                        suggested_name = (
+                            f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
+                        )
+
+                        if "storageQuotaExceeded" in str(create_err):
+                            st.warning(
+                                f"Auto-copy requires a Shared Drive. In Google Drive:\n\n"
+                                f"1. Right-click **{master_name or 'the Strategy master'}** → *Make a copy*\n"
+                                f"2. Rename it to **`{suggested_name}`**\n"
+                                f"3. Move it into the **{month_kw}** folder\n\n"
+                                f"Then run **Set Up New Strategy Report** again."
+                            )
+                        else:
+                            st.error(f"Could not create workbook: {create_err}")
+                        return
+
+            # Step 2 — load references.
+            with st.spinner("Step 2 / 3 — loading Strategy references..."):
+                prev_month = (
+                    target_month - datetime.timedelta(days=1)
+                ).replace(day=1)
+                ly_month = target_month.replace(year=target_month.year - 1)
+
+                prev_wb = _load_wb_from_drive(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    prev_month,
+                    data_only=False,
+                )
+                ly_wb = _load_wb_from_drive(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    "Strategy Report",
+                    ly_month,
+                )
+
+            st.info(
+                "Strategy references · "
+                f"Previous month ({prev_month:%b %Y}): "
+                f"{'found' if prev_wb else 'not found'} · "
+                f"Last year ({ly_month:%b %Y}): "
+                f"{'found' if ly_wb else 'not found'}"
+            )
+
+            # Step 3 — populate all week tabs.
+            with st.spinner("Step 3 / 3 — preparing all Strategy week tabs..."):
+                result, err = _resolve_drive_workbook_session_cached(
+                    svc, hotel_id, hotel_name, "Strategy Report", target_month
+                )
+                if err or not result:
+                    st.error(f"Cannot open Strategy workbook: {err}")
+                    return
+
+                file_id, file_name = result
+                wb_bytes = drive_download(svc, file_id)
+                original_bytes = wb_bytes
+
+                wb = openpyxl.load_workbook(
+                    io.BytesIO(wb_bytes),
+                    data_only=False,
+                )
+
+                if is_fresh_copy:
+                    clear_tab_colors(wb, STRATEGY_SHEETS)
+
+                restructure_sr_dates(wb, target_month)
+
+                first_ws = (
+                    wb[STRATEGY_SHEETS[0]]
+                    if STRATEGY_SHEETS[0] in wb.sheetnames
+                    else None
+                )
+                num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
+                scope_start = target_month
+                scope_end = target_month + datetime.timedelta(
+                    days=max(0, num_rows - 1)
+                )
+
+                total_written = 0
+                for sheet_name in STRATEGY_SHEETS:
+                    if sheet_name not in wb.sheetnames:
+                        continue
+
+                    # No current IHG PDF data is written during setup.
+                    # This call only carries forward prior-month / LY reference
+                    # data that can be mapped by the shared Strategy headers.
+                    changes = build_strategy_change_plan(
+                        None,
+                        wb,
+                        sheet_name,
+                        prev_month_wb=prev_wb,
+                        ly_wb=ly_wb,
+                        scope_start=scope_start,
+                        scope_end=scope_end,
+                    )
+                    apply_strategy_changes(wb, sheet_name, changes)
+                    total_written += len(
+                        [c for c in changes if not c.get("skip_reason")]
+                    )
+
+                strip_tables(wb)
+                out = io.BytesIO()
+                wb.save(out)
+                drive_upload(
+                    svc,
+                    file_id,
+                    out.getvalue(),
+                    file_name,
+                )
+
+                st.session_state["ihg_setup_undo_sr"] = {
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "bytes": original_bytes,
+                }
+
+            st.success(
+                f"**{file_name}** is set up for {target_month:%B %Y}. "
+                f"Prepared all Strategy week tabs."
+            )
+
+        except Exception as e:
+            st.error(f"Strategy setup error: {e}")
+
+    if "ihg_setup_undo_sr" in st.session_state:
+        if st.button(
+            "↩ Reset Strategy Report to Original",
+            key=f"ihg_setup_reset_sr_{hotel_name}",
+            type="secondary",
+            use_container_width=True,
+        ):
+            try:
+                info = st.session_state["ihg_setup_undo_sr"]
+                drive_upload(
+                    get_drive_service(),
+                    info["file_id"],
+                    info["bytes"],
+                    info["file_name"],
+                )
+                del st.session_state["ihg_setup_undo_sr"]
+                st.success(
+                    f"**{info['file_name']}** restored to its original state."
+                )
+            except Exception as e:
+                st.error(f"Reset error: {e}")
+
+
 def render_ihg_update(hotels):
     """IHG portfolio run.
 
@@ -6213,11 +13626,12 @@ def render_ihg_update(hotels):
         with col_h:
             hotel_sel = st.selectbox("Hotel", hotel_names, key="ihg_hotel")
         with col_w:
+            ihg_workbooks = portfolio_workbook_options("IHG")
             wb_sels = st.pills(
                 "Workbooks to update",
-                WORKBOOK_TYPES,
+                ihg_workbooks,
                 selection_mode="multi",
-                default=WORKBOOK_TYPES,
+                default=ihg_workbooks,
                 key="ihg_wb",
             ) or []
         c1, c2 = st.columns(2)
@@ -6234,6 +13648,34 @@ def render_ihg_update(hotels):
             key="ihg_fcst_next",
             help="Fills next month's Forecast workbook from the Business on the "
                  "Books daily rows. Needs that PDF.")
+
+        if "ROB" in wb_sels:
+            render_portfolio_rob_month_setup(
+                [(hotel_sel, id_map.get(hotel_sel, ""))],
+                "ihg",
+            )
+
+        if NEXT_YEAR_ROB_TYPE in wb_sels:
+            render_portfolio_next_year_rob_month_setup(
+                [(hotel_sel, id_map.get(hotel_sel, ""))],
+                "ihg",
+            )
+
+        if "Strategy Report" in wb_sels:
+            ihg_sr_setup_toggle = st.checkbox(
+                "Set up new month — Strategy Report",
+                key="ihg_sr_new_month",
+                help=(
+                    "Show the next-month Strategy setup controls. "
+                    "Leave unchecked for a normal Strategy update."
+                ),
+            )
+            if ihg_sr_setup_toggle:
+                st.divider()
+                render_ihg_strategy_month_setup(
+                    hotel_sel,
+                    id_map.get(hotel_sel, ""),
+                )
 
     if not pdf_file:
         st.info("Upload the History and Forecast PDF to continue.")
@@ -6295,17 +13737,38 @@ def render_ihg_update(hotels):
             )
             st.stop()
         for wb_type in wb_sels:
-            result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
+            if wb_type == NEXT_YEAR_ROB_TYPE:
+                report_month = parsed["report_date"].replace(day=1)
+                result, err = resolve_next_year_rob_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_sel,
+                    report_month=report_month,
+                    tracked_year=report_month.year + 1,
+                )
+            else:
+                result, err = resolve_drive_workbook(
+                    svc, hotel_id, hotel_sel, wb_type
+                )
             if err or not result:
                 problems.append(f"{wb_type}: {err}")
                 continue
             file_id, file_name = result
             raw = drive_download(svc, file_id)
             wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
-            if wb_type == "ROB":
+            if wb_type in ("ROB", NEXT_YEAR_ROB_TYPE):
                 avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
                 sheet = first_uncolored_sheet(wb, avail)
-                changes = build_ihg_rob_plan(parsed, wb[sheet], bob=bob)
+                changes = build_ihg_rob_plan(
+                    parsed,
+                    wb[sheet],
+                    bob=bob,
+                    tracked_year=(
+                        parsed["report_date"].year + 1
+                        if wb_type == NEXT_YEAR_ROB_TYPE
+                        else parsed["report_date"].year
+                    ),
+                )
                 passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
                           if w and n != sheet]
                 note = "  ·  skipped " + "; ".join(passed) if passed else ""
@@ -6436,21 +13899,52 @@ def _show_ihg_plan(changes):
 
 
 def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
-                         month_date=None):
+                         month_date=None, as_of=None):
     """Build the Forecast job for one Hilton hotel and one month.
 
     month_date picks which month's workbook to open; None means the current
-    one. Nothing else differs between the two. The SRP export runs a year
-    forward, and build_hilton_forecast_plan already sends every date that
-    hasn't happened yet to the OTB rows, so next month needs no separate
-    builder the way IHG's does — there, next month genuinely comes from a
-    different report.
+    one. If a requested future-month Forecast does not exist yet, the job
+    creates it first using setup_new_forecast_month (master if available,
+    otherwise the prior month's Forecast as the template), then fills it.
+
+    The SRP export runs a year forward, and build_hilton_forecast_plan already
+    sends every date that has not happened yet to the OTB rows.
 
     Returns the job, or None having appended the reason to `problems`.
     """
     label = f"Forecast ({month_date:%b %Y})" if month_date else "Forecast"
     result, err = resolve_drive_workbook(
-        svc, hotel_id, hotel_name, "Forecast", month_date=month_date)
+        svc, hotel_id, hotel_name, "Forecast", month_date=month_date
+    )
+
+    # For a requested future month, do not fail just because that Forecast
+    # workbook has not been created yet. Use the same setup path as the other
+    # portfolios: Forecast master when available, otherwise prior month's
+    # Forecast as the template, then resolve the newly-created workbook.
+    if (err or not result) and month_date is not None:
+        created_name, create_err = setup_new_forecast_month(
+            svc,
+            hotel_id,
+            hotel_name,
+            month_date,
+        )
+        if create_err:
+            problems.append(
+                f"{hotel_name} — {label}: could not create the next-month "
+                f"Forecast — {create_err}"
+            )
+            return None
+
+        # Resolve again after creation so the normal Hilton Forecast job can
+        # preview/apply changes to the exact new workbook.
+        result, err = resolve_drive_workbook(
+            svc,
+            hotel_id,
+            hotel_name,
+            "Forecast",
+            month_date=month_date,
+        )
+
     if err or not result:
         problems.append(f"{hotel_name} — {label}: {err}")
         return None
@@ -6465,7 +13959,9 @@ def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
         return None
 
     sheet = first_unhighlighted_forecast_sheet(wb, avail)
-    changes, warns = build_hilton_forecast_plan(prop["days"], wb[sheet])
+    changes, warns = build_hilton_forecast_plan(
+        prop["days"], wb[sheet], as_of=as_of
+    )
     for w in warns:
         problems.append(f"{hotel_name} — {label} ({file_name}, {sheet}): {w}")
     if not changes:
@@ -6591,7 +14087,11 @@ if test_mode:
         with col_a:
             csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv", "xlsx"], key="str_csv")
         with col_b:
-            rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
+            rate_file2 = st.file_uploader(
+                "Upload Rates & Restrictions",
+                type=["csv", "xlsx"],
+                key="str_rate",
+            )
     
         col_c, col_d = st.columns(2)
         with col_c:
@@ -6626,7 +14126,7 @@ if test_mode:
                 if rate_file2:
                     rate_df = parse_rate_csv(rate_file2.read())
                     rate_changes, rate_warnings = build_rates_change_plan(
-                        rate_df, wb2_full, sheet_choice2)
+                        rate_df, wb2_full, sheet_choice2, hotel_name=None)
                     all_changes += rate_changes
     
                 st.session_state["str_changes"]   = all_changes
@@ -6949,7 +14449,7 @@ with tab_weekly:
     hotels = hotels_in_portfolio(portfolio, all_discovered)
     hotel_names = [h[0] for h in hotels]
     hotel_id_map = {h[0]: h[1] for h in hotels}
-    allowed_wbs = PORTFOLIO_WORKBOOKS[portfolio]
+    allowed_wbs = portfolio_workbook_options(portfolio)
 
     missing = portfolio_hotels_missing(portfolio, all_discovered)
     if missing:
@@ -6996,8 +14496,23 @@ with tab_weekly:
         # applied to a different hotel.
         drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}")
         drive_rate_csv = None
+        drive_lighthouse_xlsx = None
         if "Strategy Report" in (wb_sels or []):
-            drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}")
+            drive_rate_csv = st.file_uploader(
+                "SNT Rates & Restrictions",
+                type=["csv", "xlsx"],
+                key=f"drive_rate_csv_{hotel_sel}",
+            )
+            drive_lighthouse_xlsx = st.file_uploader(
+                "Optional — Lighthouse Compset Rates (.xlsx)",
+                type=["xlsx"],
+                key=f"drive_lighthouse_{hotel_sel}",
+                help=(
+                    "Optional for SNT hotels that use Lighthouse. The selected "
+                    "hotel's own rate still comes from SNT; Lighthouse only fills "
+                    "competitors already listed in the Strategy Report."
+                ),
+            )
         drive_npu_compare_csv = None
         if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
             drive_npu_compare_csv = st.file_uploader(
@@ -7011,6 +14526,15 @@ with tab_weekly:
                 forecast_next_month = st.checkbox("Include next month's Forecast", key="drive_fcst_next")
         with opt_col2:
             start_new_month = st.checkbox("Set up new month", key="drive_new_month")
+    if (
+        NEXT_YEAR_ROB_TYPE in (wb_sels or [])
+        and next_year_rob_enabled()
+    ):
+        render_portfolio_next_year_rob_month_setup(
+            [(hotel_sel, hotel_id_map.get(hotel_sel, ""))],
+            "snt",
+        )
+
     if start_new_month:
         with st.container(border=True):
             today         = datetime.date.today()
@@ -7047,7 +14571,7 @@ with tab_weekly:
                                 svc, hotel_id_nm, hotel_sel, setup_month_dt)
                         if rob_err and not rob_name:
                             if "storageQuotaExceeded" in str(rob_err):
-                                _, master_name = find_rob_master(svc, hotel_id_nm)
+                                _, master_name = find_rob_master(svc, hotel_id_nm, target_month.year)
                                 rob_suffix = hotel_sel.upper()
                                 if master_name and "ROB" in master_name.upper():
                                     after = master_name[master_name.upper().find("ROB") + 3:].strip()
@@ -7101,15 +14625,17 @@ with tab_weekly:
                         # Step 1 — ensure the file exists; skip copy if it's already there
                         is_fresh_copy = False
                         with st.spinner("Step 1 / 3 — locating or creating workbook..."):
-                            existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                                  "Strategy Report", month_date=setup_month_dt)
+                            existing, find_err = _resolve_drive_workbook_session_cached(
+                                svc, hotel_id_nm, hotel_sel,
+                                "Strategy Report", setup_month_dt
+                            )
                             if existing:
                                 st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
                             else:
                                 is_fresh_copy = True
                                 created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
                                 if create_err:
-                                    master_id, master_name = find_sr_master(svc, hotel_id_nm)
+                                    master_id, master_name = find_sr_master(svc, hotel_id_nm, setup_month_dt.year)
                                     hotel_suffix = ""
                                     if master_name and "STRATEGY" in master_name.upper():
                                         hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
@@ -7137,8 +14663,10 @@ with tab_weekly:
 
                         # Step 3 — populate all 5 weeks
                         with st.spinner("Step 3 / 3 — populating all weeks..."):
-                            result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                                 "Strategy Report", month_date=setup_month_dt)
+                            result, err = _resolve_drive_workbook_session_cached(
+                                svc, hotel_id_nm, hotel_sel,
+                                "Strategy Report", setup_month_dt
+                            )
                             if err:
                                 st.error(f"Cannot open new workbook: {err}")
                                 st.stop()
@@ -7196,7 +14724,17 @@ with tab_weekly:
 
 
 
-    def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False, npu_compare_df=None):
+    def build_all_plans(
+        svc,
+        hotel_sel,
+        hotel_id,
+        wb_sels,
+        df,
+        rate_df,
+        forecast_next_month=False,
+        npu_compare_df=None,
+        lighthouse_data=None,
+    ):
         today = datetime.date.today()
         current_month = today.replace(day=1)
         all_plans = {}
@@ -7214,24 +14752,48 @@ with tab_weekly:
             # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
             # not found, those fields silently produce nothing (no warning previously),
             # which looked like "dates transferred but no text" with no explanation why.
-            st.info(f"SR reference workbooks — Prev month ({prev_month_dt.strftime('%b %Y')}): "
-                    f"{'✓ found' if prev_month_sr_wb else '✗ NOT FOUND — OTB Lst Wek will be blank'} | "
-                    f"Last year ({ly_month_dt.strftime('%b %Y')}): "
-                    f"{'✓ found' if ly_sr_wb else '✗ NOT FOUND — all LY columns (incl. Comp Set LY text) will be blank'}")
+            st.info(
+                "Strategy references · "
+                f"Previous month ({prev_month_dt:%b %Y}): "
+                f"{'found' if prev_month_sr_wb else 'not found — Last Week OTB will stay blank'} · "
+                f"Last year ({ly_month_dt:%b %Y}): "
+                f"{'found' if ly_sr_wb else 'not found — LY fields will stay blank'}"
+            )
 
         for wb_type in wb_sels:
-            result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
+            if wb_type == NEXT_YEAR_ROB_TYPE:
+                report_month = datetime.date.today().replace(day=1)
+                result, err = resolve_next_year_rob_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_sel,
+                    report_month=report_month,
+                    tracked_year=report_month.year + 1,
+                )
+            else:
+                result, err = resolve_drive_workbook(
+                    svc, hotel_id, hotel_sel, wb_type
+                )
             if err:
                 st.error(f"{wb_type}: {err}")
                 continue
             file_id, file_name = result
             wb_bytes = drive_download(svc, file_id)
             wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-            if wb_type == "ROB":
+            if wb_type in ("ROB", NEXT_YEAR_ROB_TYPE):
                 avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
                 auto     = first_uncolored_sheet(wb, avail)
                 sheet    = auto or avail[0]
-                changes  = build_rob_change_plan(df, wb[sheet], grp_npu_rev_override=grp_npu_rev_override)
+                changes  = build_rob_change_plan(
+                    df,
+                    wb[sheet],
+                    grp_npu_rev_override=grp_npu_rev_override,
+                    tracked_year=(
+                        datetime.date.today().year + 1
+                        if wb_type == NEXT_YEAR_ROB_TYPE
+                        else datetime.date.today().year
+                    ),
+                )
                 warnings = []
                 # Say which weeks were passed over and why — a silently skipped
                 # week tab is otherwise invisible until someone spots the gap.
@@ -7244,47 +14806,39 @@ with tab_weekly:
                 auto     = first_undone_strategy_sheet(wb, avail)
                 sheet    = auto or avail[0]
                 date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
-                st.info(f"SR: **{file_name}** (id: `{file_id}`) → sheet **{sheet}** | "
-                        f"date rows mapped: {len(date_row_map_debug)} | "
-                        f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
-                if "WKONE" in wb.sheetnames:
-                    from openpyxl.utils import get_column_letter
-                    wkone_ws = wb["WKONE"]
-                    wkone_col = detect_date_column(wkone_ws, wb=wb)
-                    raw_r5  = wkone_ws.cell(5, wkone_col).value
-                    raw_r10 = wkone_ws.cell(10, wkone_col).value
-                    st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
-                            f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
-                    # Column C specifically — the active sheet's date formulas
-                    # reference WKONE!C directly, which may not be the same
-                    # column detect_date_column just picked as WKONE's own
-                    # "best" column above. Need this exact value to settle
-                    # whether the remaining offset originates in WKONE's own
-                    # column C data, not wherever else WKONE's calendar lives.
-                    raw_c5  = wkone_ws.cell(5, 3).value
-                    raw_c6  = wkone_ws.cell(6, 3).value
-                    st.info(f"WKONE column C specifically — raw row 5: `{raw_c5!r}` | raw row 6: `{raw_c6!r}`")
-                # Strict, no-fallback view of the ACTIVE sheet's own date column —
-                # this is what actually gates whether CSV data can be written at
-                # all (own_date_row_map inside build_strategy_change_plan uses
-                # the exact same fallback_to_wkone=False call). Always shown so
-                # one run's output settles both "wrong day" and "no data" at once
-                # instead of needing another round of screenshots.
-                own_debug = build_date_row_map(wb, prefer_sheet=sheet, fallback_to_wkone=False)
-                own_col = detect_date_column(wb[sheet], wb=wb)
-                from openpyxl.utils import get_column_letter as _gcl
-                st.info(f"**{sheet}**'s own date column (strict, no WKONE fallback): "
-                        f"col **{_gcl(own_col)}** | rows mapped: {len(own_debug)} | "
-                        f"range: {min(own_debug) if own_debug else 'NONE — this is why no CSV data would write'} "
-                        f"– {max(own_debug) if own_debug else ''} | "
-                        f"raw row5: `{wb[sheet].cell(5, own_col).value!r}` | "
-                        f"raw row10: `{wb[sheet].cell(10, own_col).value!r}`")
-                if df is not None:
-                    sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
-                    bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
-                    st.info(f"BOB CSV: {len(df)} rows | daily rows matched: {bob_daily} | first 5 col-0 values: {sample_dates}")
+                own_debug = build_date_row_map(
+                    wb, prefer_sheet=sheet, fallback_to_wkone=False
+                )
+
+                if date_row_map_debug:
+                    date_summary = (
+                        f"{len(date_row_map_debug)} dates mapped "
+                        f"({min(date_row_map_debug):%m/%d/%Y}–"
+                        f"{max(date_row_map_debug):%m/%d/%Y})"
+                    )
                 else:
-                    st.warning("BOB CSV: df is None — no CSV uploaded or parse failed")
+                    date_summary = "no dates mapped"
+
+                if df is not None:
+                    bob_daily = sum(
+                        1 for _, r in df.iterrows()
+                        if classify_row(str(r[0]).strip())[0] == "daily"
+                    )
+                    bob_summary = f" · BOB daily rows: {bob_daily}"
+                else:
+                    bob_summary = " · BOB file not loaded"
+
+                st.info(
+                    f"Strategy Report: **{file_name}** → **{sheet}** · "
+                    f"{date_summary}{bob_summary}"
+                )
+
+                if not own_debug:
+                    st.warning(
+                        f"{sheet}: date rows could not be mapped on this tab, "
+                        f"so daily Strategy values may not populate."
+                    )
+
                 # Only extract LY data during month setup, not on regular CSV uploads
                 # (ly_sr_wb is already cleared of blanking logic if ly_data is empty)
                 changes  = build_strategy_change_plan(df, wb, sheet,
@@ -7292,9 +14846,18 @@ with tab_weekly:
                                                        ly_wb=None)
                 warnings = []
                 if rate_df is not None:
-                    rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
-                    changes  += rate_changes
+                    rate_changes, rate_warnings = build_rates_change_plan(
+                        rate_df, wb, sheet, hotel_name=hotel_sel
+                    )
+                    changes += rate_changes
                     warnings += rate_warnings
+
+                if lighthouse_data is not None:
+                    lh_changes, lh_warnings = build_lighthouse_compset_change_plan(
+                        lighthouse_data, wb, sheet, hotel_sel
+                    )
+                    changes += lh_changes
+                    warnings += lh_warnings
             else:  # Forecast — current month (no Month Ending Forecast fill here)
                 avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
                 auto     = first_unhighlighted_forecast_sheet(wb, avail)
@@ -7393,7 +14956,7 @@ with tab_weekly:
                     "sheet":     plan["sheet"],
                     "cells":     snap,
                 }
-                if wb_type == "ROB":
+                if wb_type in ("ROB", NEXT_YEAR_ROB_TYPE):
                     apply_rob_changes(wb_apply, plan["sheet"], plan["changes"])
                 elif wb_type == "Strategy Report":
                     apply_strategy_changes(wb_apply, plan["sheet"], plan["changes"])
@@ -7445,8 +15008,15 @@ with tab_weekly:
                 svc = get_drive_service()
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                lighthouse_data = (
+                    parse_lighthouse_rates_xlsx(drive_lighthouse_xlsx.read())
+                    if drive_lighthouse_xlsx else None
+                )
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
-                st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                st.session_state["drive_plans"] = build_all_plans(
+                    svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
+                    df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                )
                 st.session_state["drive_hotel_sel"] = hotel_sel
             except Exception as e:
                 st.error(f"Drive error: {e}")
@@ -7488,10 +15058,17 @@ with tab_weekly:
                 svc = get_drive_service()
                 df      = parse_bob_source(drive_csv) if drive_csv else None
                 rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                lighthouse_data = (
+                    parse_lighthouse_rates_xlsx(drive_lighthouse_xlsx.read())
+                    if drive_lighthouse_xlsx else None
+                )
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
                 with st.spinner("Updating workbooks in Google Drive..."):
-                    all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
-                    saved, errors   = apply_and_upload(svc, all_plans)
+                    all_plans = build_all_plans(
+                        svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
+                        df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                    )
+                    saved, errors = apply_and_upload(svc, all_plans)
                 for name in saved:
                     st.success(f"Saved **{name}** to Google Drive.")
                 for err in errors:
@@ -7517,201 +15094,1056 @@ with tab_weekly:
 
 
 with tab_ancillary:
-    st.caption("Fills in the next available week (auto-detected from the sheet's own "
-               "yellow highlighting) in the Upsell Overview table.")
+    st.subheader("Monthly Ancillary Revenue Report Builder")
 
-    ar_month = st.selectbox(
-        "Month tab", ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"],
-        index=["FEB", "MAR", "APR", "MAY", "JUN", "JUL"].index(
-            datetime.date.today().strftime("%b").upper()
-        ) if datetime.date.today().strftime("%b").upper() in
-             ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"] else 5,
-        key="ar_month",
+    ancillary_platform = st.radio(
+        "Choose report type",
+        ["Hilton", "SNT / Independent Hotels"],
+        horizontal=True,
+        key="ancillary_platform_choice",
     )
-    ar_addon_file = st.file_uploader(
-        "Add-on Production report (CSV)", type=["csv"], key="ar_addon_csv")
-    ar_upsell_file = st.file_uploader(
-        "Upsell Report (format not wired up yet — feeds the room-upgrade rows, "
-        "coming soon)", type=["csv", "xlsx"], key="ar_upsell_csv", disabled=True)
 
-    if ar_addon_file and st.button("Preview Ancillary Revenue Changes", key="ar_preview"):
-        try:
-            svc = get_drive_service()
-            ar_file_id, ar_file_name = find_ancillary_revenue_file(svc)
-            if not ar_file_id:
-                st.error(ar_file_name)  # error string in the name slot
-            else:
-                ar_bytes = drive_download(svc, ar_file_id)
-                ar_wb = openpyxl.load_workbook(io.BytesIO(ar_bytes), data_only=False)
-                if ar_month not in ar_wb.sheetnames:
-                    st.error(f"No '{ar_month}' tab found in {ar_file_name}.")
-                else:
-                    ar_ws = ar_wb[ar_month]
-                    ar_week = find_next_available_week(ar_ws)
-                    if ar_week is None:
-                        st.warning("No yellow-highlighted week found — every week may already be filled in.")
-                    else:
-                        daily_by_name = parse_addon_production_csv(ar_addon_file.read())
-                        ar_changes = build_ancillary_addon_change_plan(daily_by_name, ar_ws, ar_week)
-                        st.session_state["ar_file_id"]    = ar_file_id
-                        st.session_state["ar_file_name"]  = ar_file_name
-                        st.session_state["ar_bytes"]      = ar_bytes
-                        st.session_state["ar_month_sel"]  = ar_month
-                        st.session_state["ar_week_sel"]   = ar_week
-                        st.session_state["ar_changes"]    = ar_changes
-                        st.success(f"Detected **Week {ar_week}** as next available in **{ar_month}**.")
-        except Exception as e:
-            st.error(f"Preview error: {e}")
-
-    if "ar_changes" in st.session_state:
-        ar_changes = st.session_state["ar_changes"]
-        st.write(f"**{len(ar_changes)}** cells will be written to "
-                 f"**{st.session_state['ar_file_name']}** → {st.session_state['ar_month_sel']} "
-                 f"→ Week {st.session_state['ar_week_sel']}:")
-        st.dataframe(
-            [{"Cell": f"{openpyxl.utils.get_column_letter(c['col'])}{c['row']}",
-              "Field": c["label"], "New value": c["new_value"]} for c in ar_changes],
-            use_container_width=True,
+    if ancillary_platform == "Hilton":
+        st.markdown("### Hilton — NOR1 + Lobby Report Builder")
+        st.caption(
+            "Build several Hilton ancillary months at once using three "
+            "grouped source files for the hotel: current NOR1, Lobby Add-ons, "
+            "and STLY NOR1. Front Desk Upsell and Expired Revenue cells are built "
+            "into the report but left blank for manual entry in Excel."
         )
-        if st.button("Apply to Google Drive", key="ar_apply", type="primary"):
+
+        har_property = st.selectbox(
+            "Hilton Property",
+            list(PORTFOLIO_HOTELS["Hilton"].keys()),
+            key="har_property",
+        )
+
+        today_month = datetime.date.today().replace(day=1)
+        month_options = []
+        cursor = today_month
+        for _ in range(18):
+            month_options.append(cursor)
+            cursor = (
+                cursor.replace(day=1) - datetime.timedelta(days=1)
+            ).replace(day=1)
+
+        default_months = month_options[:3]
+        har_months = st.multiselect(
+            "Months to build",
+            options=month_options,
+            default=default_months,
+            format_func=lambda d: d.strftime("%B %Y"),
+            key="har_months_multi",
+            help=(
+                "Select as many months as you want. The download will contain "
+                "one tab per month."
+            ),
+        )
+
+        st.markdown("**Upload three grouped source files**")
+        st.caption(
+            "Each file can contain every month selected above. The tool "
+            "splits NOR1 by Report Date and Lobby by Stay Date."
+        )
+
+        gc1, gc2, gc3 = st.columns(3)
+
+        with gc1:
+            har_nor1_current = st.file_uploader(
+                "Current-Year NOR1 — all selected months",
+                type=["xlsx"],
+                key="har_nor1_current_grouped",
+            )
+
+        with gc2:
+            har_lobby = st.file_uploader(
+                "Lobby Add-ons — all selected months",
+                type=["xlsx"],
+                key="har_lobby_grouped",
+            )
+
+        with gc3:
+            har_nor1_stly = st.file_uploader(
+                "STLY NOR1 — matching prior-year months",
+                type=["xlsx"],
+                key="har_nor1_stly_grouped",
+            )
+
+        all_ready = bool(har_months) and all([
+            har_nor1_current is not None,
+            har_lobby is not None,
+            har_nor1_stly is not None,
+        ])
+
+        month_uploads = []
+        for month_date in sorted(har_months):
+            month_dt = datetime.datetime(
+                month_date.year,
+                month_date.month,
+                1,
+            )
+            month_uploads.append({
+                "report_month": month_dt,
+                "nor1_current_file": har_nor1_current,
+                "lobby_file": har_lobby,
+                "nor1_stly_file": har_nor1_stly,
+            })
+
+        if st.button(
+            "Build Hilton Ancillary Workbook",
+            type="primary",
+            key="har_build_multi",
+            disabled=not all_ready,
+            use_container_width=True,
+        ):
             try:
-                svc = get_drive_service()
-                ar_wb = openpyxl.load_workbook(io.BytesIO(st.session_state["ar_bytes"]), data_only=False)
-                ar_ws = ar_wb[st.session_state["ar_month_sel"]]
-                apply_ancillary_changes(ar_ws, st.session_state["ar_changes"])
-                out = io.BytesIO()
-                ar_wb.save(out)
-                drive_upload(svc, st.session_state["ar_file_id"], out.getvalue(), st.session_state["ar_file_name"])
-                st.success(f"**{st.session_state['ar_file_name']}** updated.")
-                for key in ["ar_changes", "ar_bytes", "ar_file_id", "ar_file_name", "ar_month_sel", "ar_week_sel"]:
-                    del st.session_state[key]
-            except Exception as e:
-                st.error(f"Apply error: {e}")
-
-with tab_ooo:
-    st.caption(
-        "Pulls the Sell-Out Efficiency Report straight from Drive, adds a bright-green "
-        "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
-        "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
-        "the selected month, with an ADR column pulled from that property's own ROB "
-        "(most recently-finalized week, current month falling back to previous month), "
-        "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
-        "macro buttons on every existing tab are left completely untouched."
-    )
-
-    today = datetime.date.today()
-    ooo_cur_month_dt  = today.replace(day=1)
-    ooo_prev_month_dt = (ooo_cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
-    ooo_next_month_dt = (ooo_cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
-    ooo_month_options = {
-        ooo_prev_month_dt.strftime("%B %Y"): ooo_prev_month_dt,
-        ooo_cur_month_dt.strftime("%B %Y"):  ooo_cur_month_dt,
-        ooo_next_month_dt.strftime("%B %Y"): ooo_next_month_dt,
-    }
-    ooo_month_labels = list(ooo_month_options.keys())
-    # Default to the previous (just-completed) month — e.g. on Aug 1st this
-    # defaults to July — since current/next are only there for override.
-    ooo_sel_label = st.selectbox(
-        "Month to summarize", ooo_month_labels,
-        index=ooo_month_labels.index(ooo_prev_month_dt.strftime("%B %Y")),
-        key="ooo_month_sel",
-    )
-    ooo_target_dt = ooo_month_options[ooo_sel_label]
-
-    if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
-        try:
-            svc = get_drive_service()
-            ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
-            if not ooo_file_id:
-                st.error(ooo_file_name)
-            else:
-                ooo_bytes = drive_download(svc, ooo_file_id)
-                ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
-                ooo_months = list_ooo_available_months(ooo_wb)
-                match = next((m for m in ooo_months
-                              if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
-                if not match:
-                    st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
-                else:
-                    ooo_year, ooo_month, ooo_sheet_names = match
-                    order, totals, days_included, skipped = build_ooo_monthly_totals(
-                        ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
-                    if not order:
-                        st.error(
-                            "None of that month's tabs matched the expected layout "
-                            "('Property' header in row 7 col C, 'End...OOO' in row 7 col J) — "
-                            "nothing was totaled, so no report was built."
+                with st.spinner("Building Hilton ancillary workbook..."):
+                    har_output, har_summaries = (
+                        hilton_ancillary_build_multi_month_report(
+                            property_name=har_property,
+                            month_inputs=month_uploads,
                         )
-                    else:
-                        with st.spinner("Looking up ADR for each property from its ROB..."):
-                            hotels_for_adr = get_hotels_from_drive()
-                            if not hotels_for_adr:
-                                # A silent [] can also be a cached transient Drive
-                                # failure (5-min TTL) — clear and retry once before
-                                # concluding nothing is shared.
-                                get_hotels_from_drive.clear()
-                                hotels_for_adr = get_hotels_from_drive()
-                            adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
-                        st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
-                        st.session_state["ooo_file_id"]       = ooo_file_id
-                        st.session_state["ooo_file_name"]     = ooo_file_name
-                        st.session_state["ooo_bytes"]         = ooo_bytes
-                        st.session_state["ooo_year"]          = ooo_year
-                        st.session_state["ooo_month"]         = ooo_month
-                        st.session_state["ooo_order"]         = order
-                        st.session_state["ooo_totals"]        = totals
-                        st.session_state["ooo_days_included"] = days_included
-                        st.session_state["ooo_skipped"]       = skipped
-                        st.session_state["ooo_adr_lookup"]    = adr_lookup
-                        matched = sum(1 for adr, _ in adr_lookup.values() if adr is not None)
-                        st.success(f"Ready to summarize **{ooo_target_dt.strftime('%B %Y')}** "
-                                   f"from **{ooo_file_name}** ({days_included} daily reports found, "
-                                   f"ADR matched for {matched}/{len(order)} properties).")
-        except Exception as e:
-            st.error(f"Preview error: {e}")
+                    )
 
-    if "ooo_order" in st.session_state:
-        order      = st.session_state["ooo_order"]
-        totals     = st.session_state["ooo_totals"]
-        adr_lookup = st.session_state["ooo_adr_lookup"]
-        hotels_seen = st.session_state.get("ooo_hotels_seen", [])
-        with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
-            st.write(", ".join(hotels_seen) if hotels_seen else
-                     "None — no hotel folders are shared with this environment's service account.")
-        if st.session_state.get("ooo_skipped"):
-            st.caption(f"Skipped tabs that didn't match the expected layout: "
-                       f"{', '.join(st.session_state['ooo_skipped'])}")
-        st.dataframe(
-            [{"Property": p, "Total End. OOO Rooms": totals[p],
-              "ADR": adr_lookup[p][0],
-              "Revenue": round(adr_lookup[p][0] * totals[p], 2) if adr_lookup[p][0] is not None else None,
-              "ADR note": adr_lookup[p][1] or ""} for p in order],
-            use_container_width=True,
-        )
-        if st.button("Apply to Google Drive", key="ooo_apply", type="primary"):
-            try:
-                svc = get_drive_service()
-                new_bytes, tab_name, err = inject_ooo_monthly_sheet(
-                    st.session_state["ooo_bytes"], st.session_state["ooo_year"],
-                    st.session_state["ooo_month"], order, totals,
-                    st.session_state["ooo_days_included"], adr_lookup)
-                if err:
-                    st.error(err)
-                else:
-                    drive_upload(svc, st.session_state["ooo_file_id"], new_bytes,
-                                 st.session_state["ooo_file_name"])
-                    st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
-                    for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
-                                "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
-                                "ooo_adr_lookup", "ooo_hotels_seen"]:
-                        st.session_state.pop(key, None)
+                    years = sorted({
+                        item["report_month"].year
+                        for item in month_uploads
+                    })
+                    year_label = (
+                        str(years[0])
+                        if len(years) == 1
+                        else f"{years[0]}-{years[-1]}"
+                    )
+
+                    st.session_state["har_output"] = har_output
+                    st.session_state["har_summaries"] = har_summaries
+                    st.session_state["har_filename"] = (
+                        f"{year_label} {har_property} NOR1 Upsell Report.xlsx"
+                    )
+
+                st.success(
+                    f"Built {len(har_summaries)} Hilton month tab(s). "
+                    "Front Desk and Expired Revenue cells are ready for "
+                    "manual entry in the downloaded workbook."
+                )
             except Exception as e:
-                st.error(f"Apply error: {e}")
+                st.error(
+                    f"Hilton ancillary report build error: {e}"
+                )
+
+        if "har_output" in st.session_state:
+            summaries = st.session_state.get("har_summaries", [])
+
+            if summaries:
+                preview_rows = []
+                for hs in summaries:
+                    preview_rows.append({
+                        "Month": hs["month"].strftime("%b %Y"),
+                        "Current Revenue": hs.get(
+                            "currentTotalRevenue",
+                            0,
+                        ),
+                        "STLY NOR1 Revenue": hs.get(
+                            "stlyTotalRevenue",
+                            0,
+                        ),
+                        "YoY Revenue Variance": (
+                            hs.get("currentTotalRevenue", 0)
+                            - hs.get("stlyTotalRevenue", 0)
+                        ),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(preview_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                for hs in summaries:
+                    for warning in hs.get("warnings", []):
+                        st.warning(
+                            f"{hs['month']:%b %Y}: {warning}"
+                        )
+
+            st.download_button(
+                "Download Hilton Ancillary Workbook",
+                data=st.session_state["har_output"],
+                file_name=st.session_state["har_filename"],
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key="har_download_multi",
+                use_container_width=True,
+            )
+    else:
+        st.markdown("### SNT / Independent Hotels")
+        st.caption(
+            "Builds the monthly report from the universal template. After reviewing "
+            "the result, you can save the month directly into the hotel's existing "
+            "Canary and/or SNT Report workbook in Drive."
+        )
+
+        ar_properties = [p['display'] for p in ANCILLARY_PROPERTY_PROFILES.values()]
+        # Remove duplicate display names while preserving order.
+        ar_properties = list(dict.fromkeys(ar_properties))
+        ar_property = st.selectbox("Property", ar_properties, key="ar_monthly_property")
+        ar_profile, ar_key = ancillary_profile(ar_property)
+
+        # Hotel 1620 is tracked as cumulative MTD weekly snapshots inside one
+        # month tab. Keep this separate from the standard monthly report builder.
+        if ar_key == "hotel 1620":
+            st.info(
+                "Hotel 1620 / Plymouth uses the weekly tracking format. "
+                "Use this section for weekly updates and month-end tracking."
+            )
+
+            with st.expander("Hotel 1620 — Weekly Ancillary Update", expanded=True):
+                pw_month_date = st.date_input(
+                    "Plymouth report month",
+                    value=datetime.date.today().replace(day=1),
+                    key="pw_month",
+                )
+                pw_month_dt = datetime.datetime(
+                    pw_month_date.year, pw_month_date.month, 1
+                )
+
+                wcol1, wcol2, wcol3 = st.columns(3)
+                with wcol1:
+                    pw_week = st.selectbox(
+                        "Week slot",
+                        [1, 2, 3, 4, 5],
+                        key="pw_week_slot",
+                        help=(
+                            "Each upload is month-to-date. Week 1 writes B/C, "
+                            "Week 2 D/E, Week 3 F/G, Week 4 H/I, Week 5 J/K."
+                        ),
+                    )
+                with wcol2:
+                    pw_week_date = st.date_input(
+                        "As-of date",
+                        value=datetime.date.today(),
+                        key="pw_week_date",
+                    )
+                with wcol3:
+                    pw_month_end = st.checkbox(
+                        "Month End",
+                        value=False,
+                        key="pw_month_end",
+                    )
+
+                st.caption(
+                    "Upload SNT reports covering the **1st of the month through "
+                    "this as-of date**. The updater writes the cumulative MTD "
+                    "snapshot into the selected week pair."
+                )
+
+                st.markdown("**Current-year MTD source**")
+                pw_addon = st.file_uploader(
+                    "Plymouth SNT Add On Production",
+                    type=["csv", "xlsx"],
+                    key="pw_addon",
+                )
+                pw_upsell = st.file_uploader(
+                    "Plymouth SNT Upsell By Day/User",
+                    type=["csv", "xlsx"],
+                    key="pw_upsell",
+                )
+
+                st.markdown(f"**STLY MTD source — {pw_month_dt.year - 1}**")
+                pw_stly_addon = st.file_uploader(
+                    f"Plymouth {pw_month_dt.year - 1} SNT Add On Production",
+                    type=["csv", "xlsx"],
+                    key="pw_stly_addon",
+                )
+                pw_stly_upsell = st.file_uploader(
+                    f"Plymouth {pw_month_dt.year - 1} SNT Upsell By Day/User",
+                    type=["csv", "xlsx"],
+                    key="pw_stly_upsell",
+                )
+
+                st.markdown("**Revenue by Agent source**")
+                pw_commission = st.file_uploader(
+                    "1620 Employee Commission Recognition Form Responses",
+                    type=["xlsx", "csv"],
+                    key="pw_commission",
+                    help=(
+                        "Upload the current Google Form response export. "
+                        "The tool filters Add On Revenue Posting Date from the "
+                        "1st of the selected month through the as-of date."
+                    ),
+                )
+
+                st.markdown("**Journal totals — MTD as of this week**")
+                pjc1, pjc2 = st.columns(2)
+                with pjc1:
+                    pw_eci = st.number_input(
+                        "Early Check In — Journal Total",
+                        value=0.0,
+                        step=1.0,
+                        key="pw_eci",
+                    )
+                    pw_stly_eci = st.number_input(
+                        "STLY Early Check In — Journal Total",
+                        value=0.0,
+                        step=1.0,
+                        key="pw_stly_eci",
+                    )
+                with pjc2:
+                    pw_lco = st.number_input(
+                        "Late Checkout — Journal Total",
+                        value=0.0,
+                        step=1.0,
+                        key="pw_lco",
+                    )
+                    pw_stly_lco = st.number_input(
+                        "STLY Late Checkout — Journal Total",
+                        value=0.0,
+                        step=1.0,
+                        key="pw_stly_lco",
+                    )
+
+                st.markdown("**Weekly Canary messaging KPI update (optional)**")
+                with st.container(border=True):
+                    pm1, pm2 = st.columns(2)
+                    with pm1:
+                        pw_msg_total = st.number_input(
+                            "Plymouth Total Messages", value=0.0, key="pw_msg_total"
+                        )
+                        pw_msg_guest = st.number_input(
+                            "Plymouth Guest Messages", value=0.0, key="pw_msg_guest"
+                        )
+                        pw_msg_hotel = st.number_input(
+                            "Plymouth Hotel Messages", value=0.0, key="pw_msg_hotel"
+                        )
+                        pw_msg_pct = st.number_input(
+                            "Plymouth % Guests Messaged",
+                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                            key="pw_msg_pct",
+                        )
+                    with pm2:
+                        pw_resp = st.number_input(
+                            "Plymouth Response Rate %",
+                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                            key="pw_resp",
+                        )
+                        pw_avg = st.number_input(
+                            "Plymouth Avg Minutes to Respond",
+                            value=0.0,
+                            key="pw_avg",
+                        )
+                        pw_med = st.number_input(
+                            "Plymouth Median Minutes to Respond",
+                            value=0.0,
+                            key="pw_med",
+                        )
+                        pw_engagement = st.number_input(
+                            "Engagement Rate % for this week",
+                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                            key="pw_engagement",
+                        )
+
+                pw_ready = all([
+                    pw_addon is not None,
+                    pw_upsell is not None,
+                    pw_stly_addon is not None,
+                    pw_stly_upsell is not None,
+                    pw_commission is not None,
+                ])
+
+                if st.button(
+                    "Build Plymouth Weekly Update",
+                    type="primary",
+                    key="pw_build",
+                    disabled=not pw_ready,
+                ):
+                    try:
+                        svc = get_drive_service()
+                        with st.spinner(
+                            "Loading Plymouth tracker from Drive and updating the selected week..."
+                        ):
+                            target, target_err = _plymouth_resolve_drive_target(
+                                svc, pw_month_dt
+                            )
+                            if target_err or not target:
+                                raise ValueError(
+                                    target_err or "Plymouth tracking workbook not found."
+                                )
+
+                            original_bytes = drive_download(
+                                svc, target["file_id"]
+                            )
+
+                            pw_messaging = {
+                                "msgTotal": pw_msg_total,
+                                "msgGuest": pw_msg_guest,
+                                "msgHotel": pw_msg_hotel,
+                                "msgGuestPct": pw_msg_pct / 100.0,
+                                "responseRate": pw_resp / 100.0,
+                                "avgResponse": pw_avg,
+                                "medianResponse": pw_med,
+                            }
+
+                            updated_bytes, pw_summary = plymouth_build_weekly_update(
+                                workbook_bytes=original_bytes,
+                                report_month=pw_month_dt,
+                                week_slot=pw_week,
+                                week_date=pw_week_date,
+                                addon_file=pw_addon,
+                                upsell_file=pw_upsell,
+                                stly_addon_file=pw_stly_addon,
+                                stly_upsell_file=pw_stly_upsell,
+                                commission_file=pw_commission,
+                                journal_values=[pw_eci, pw_lco],
+                                stly_journal_values=[pw_stly_eci, pw_stly_lco],
+                                messaging=pw_messaging,
+                                engagement_rate=pw_engagement / 100.0,
+                                month_end=pw_month_end,
+                            )
+
+                            st.session_state["pw_output"] = updated_bytes
+                            st.session_state["pw_summary"] = pw_summary
+                            st.session_state["pw_target"] = target
+                            st.session_state["pw_original"] = original_bytes
+
+                        st.success(
+                            f"Built {pw_summary['sheet']} — "
+                            f"{pw_summary['weekLabel']}."
+                        )
+                    except Exception as e:
+                        st.error(f"Plymouth weekly build error: {e}")
+
+                if st.session_state.get("pw_output"):
+                    ps = st.session_state.get("pw_summary", {})
+                    pc1, pc2, pc3, pc4 = st.columns(4)
+                    pc1.metric("Current rows", ps.get("currentWritten", 0))
+                    pc2.metric("STLY rows", ps.get("stlyWritten", 0))
+                    pc3.metric("Current itemized", ps.get("itemizedWritten", 0))
+                    pc4.metric("STLY itemized", ps.get("stlyItemizedWritten", 0))
+
+                    missing = (
+                        ps.get("missingCurrent", [])
+                        + ps.get("missingSTLY", [])
+                        + ps.get("missingItemized", [])
+                        + ps.get("missingSTLYItemized", [])
+                    )
+                    dynamic_added = ps.get("addedDynamicRows", {})
+                    added_names = (
+                        dynamic_added.get("current", [])
+                        + dynamic_added.get("stly", [])
+                        + dynamic_added.get("variance", [])
+                    )
+                    if added_names:
+                        st.success(
+                            "Added new month tracking rows automatically: "
+                            + ", ".join(sorted(set(added_names)))
+                        )
+
+                    if ps.get("topAgent"):
+                        st.info(
+                            f"Top staff upseller for this MTD snapshot: "
+                            f"**{ps['topAgent']}**"
+                        )
+
+                    if missing:
+                        st.markdown(
+                            "**Items in the uploaded reports not found on this month tab**"
+                        )
+                        with st.container(border=True):
+                            st.write(sorted(set(x for x in missing if x)))
+                            st.caption(
+                                "These are not silently inserted because inserting "
+                                "rows can disturb Plymouth's side tables/charts. "
+                                "Add the new row to the month template once, then "
+                                "rerun the same week."
+                            )
+
+                    pdl, psv, pundo = st.columns(3)
+                    with pdl:
+                        st.download_button(
+                            "Download Plymouth Weekly Workbook",
+                            data=st.session_state["pw_output"],
+                            file_name=(
+                                f"{pw_month_dt.year} Plymouth Ancillary "
+                                f"{pw_month_dt.strftime('%b').upper()} "
+                                f"WK{pw_week}.xlsx"
+                            ),
+                            mime=(
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            ),
+                            key="pw_download",
+                            use_container_width=True,
+                        )
+
+                    with psv:
+                        if st.button(
+                            "Save Plymouth Weekly Update to Drive",
+                            key="pw_save_drive",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                svc = get_drive_service()
+                                target = st.session_state["pw_target"]
+                                original = st.session_state["pw_original"]
+
+                                st.session_state["pw_drive_undo"] = {
+                                    "file_id": target["file_id"],
+                                    "file_name": target["file_name"],
+                                    "bytes": original,
+                                }
+
+                                drive_upload(
+                                    svc,
+                                    target["file_id"],
+                                    st.session_state["pw_output"],
+                                    target["file_name"],
+                                )
+                                st.success(
+                                    f"Saved {ps.get('sheet')} "
+                                    f"{ps.get('weekLabel')} into "
+                                    f"**{target['file_name']}**."
+                                )
+                            except Exception as e:
+                                st.error(
+                                    f"Could not save Plymouth weekly update: {e}"
+                                )
+
+                    with pundo:
+                        if st.button(
+                            "↩ Undo Last 1620 Upload",
+                            key="pw_undo_drive",
+                            type="secondary",
+                            use_container_width=True,
+                            disabled=not bool(
+                                st.session_state.get("pw_drive_undo")
+                            ),
+                        ):
+                            try:
+                                undo = st.session_state["pw_drive_undo"]
+                                drive_upload(
+                                    get_drive_service(),
+                                    undo["file_id"],
+                                    undo["bytes"],
+                                    undo["file_name"],
+                                )
+                                st.session_state.pop("pw_drive_undo", None)
+                                st.session_state.pop("pw_output", None)
+                                st.success(
+                                    "Restored the Plymouth workbook to the version "
+                                    "from immediately before the last 1620 upload."
+                                )
+                            except Exception as e:
+                                st.error(
+                                    f"Could not undo the last Plymouth upload: {e}"
+                                )
+
+            st.divider()
+
+        if ar_key != "hotel 1620":
+            ar_month_date = st.date_input(
+                "Report month",
+                value=datetime.date.today().replace(day=1),
+                key="ar_monthly_report_month",
+            )
+            ar_month_dt = datetime.datetime(ar_month_date.year, ar_month_date.month, 1)
+
+            local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
+            ar_template_upload = None
+            if local_template.exists():
+                st.success(f"Using bundled template: {ANCILLARY_TEMPLATE_FILENAME}")
+            else:
+                st.info(
+                    f"Add **{ANCILLARY_TEMPLATE_FILENAME}** to the GitHub repo beside app.py "
+                    "for permanent use. For testing, upload it here."
+                )
+                ar_template_upload = st.file_uploader(
+                    "Ancillary Report Builder template workbook",
+                    type=["xlsx"],
+                    key="ar_template_upload",
+                )
+
+            st.markdown("**Current-year source files**")
+            ar_addon = st.file_uploader(
+                "SNT Add On Production",
+                type=["csv", "xlsx"],
+                key="ar_monthly_addon",
+            )
+            ar_upsell = st.file_uploader(
+                "SNT Upsell By Day/User",
+                type=["csv", "xlsx"],
+                key="ar_monthly_upsell",
+            )
+
+            st.markdown(f"**STLY source — {ar_profile.get('stlySource')}**")
+            ar_stly_addon = ar_stly_upsell = ar_canary_history = None
+            if ar_profile.get('stlySource') == 'SNT':
+                ar_stly_addon = st.file_uploader(
+                    f"{ar_month_dt.year - 1} SNT Add On Production",
+                    type=["csv", "xlsx"],
+                    key="ar_stly_addon",
+                )
+                ar_stly_upsell = st.file_uploader(
+                    f"{ar_month_dt.year - 1} SNT Upsell By Day/User",
+                    type=["csv", "xlsx"],
+                    key="ar_stly_upsell",
+                )
+            else:
+                ar_canary_history = st.file_uploader(
+                    "Historical Canary Upsells",
+                    type=["csv", "xlsx"],
+                    key="ar_canary_history",
+                )
+
+            ar_staff = st.file_uploader(
+                "Canary Message Count by Staff (optional)",
+                type=["csv", "xlsx"],
+                key="ar_staff_counts",
+            )
+
+            st.markdown("**SNT Journal revenue**")
+            ar_journal_values = []
+            journal_cols = st.columns(2)
+            for i, journal in enumerate(ar_profile.get('journal', [])):
+                with journal_cols[i % 2]:
+                    v = st.number_input(
+                        journal['label'],
+                        min_value=-1000000.0,
+                        max_value=1000000.0,
+                        value=0.0,
+                        step=1.0,
+                        key=f"ar_journal_{ar_key}_{i}",
+                        help=f"Main report line: {journal['report']}",
+                    )
+                    ar_journal_values.append(v)
+
+            ar_stly_journal_values = []
+            if ar_profile.get('stlySource') == 'SNT' and ar_profile.get('stlyJournal'):
+                st.markdown(f"**{ar_month_dt.year - 1} STLY Journal revenue**")
+                stly_cols = st.columns(2)
+                for i, journal in enumerate(ar_profile.get('journal', [])[:2]):
+                    with stly_cols[i % 2]:
+                        v = st.number_input(
+                            f"STLY — {journal['report']}",
+                            min_value=-1000000.0,
+                            max_value=1000000.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"ar_stly_journal_{ar_key}_{i}",
+                        )
+                        ar_stly_journal_values.append(v)
+
+            st.divider()
+            st.markdown("### Canary Messaging Overview")
+            st.caption(
+                "Enter the monthly Canary Insights values here. Percentage fields use "
+                "normal percentage points — enter 5.0 for 5%, not 0.05."
+            )
+
+            current_col, stly_col = st.columns(2)
+
+            with current_col:
+                st.markdown(f"**{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year}**")
+                msg_total = st.number_input(
+                    "Total Messages", value=0.0, key="ar_msg_total"
+                )
+                msg_guest = st.number_input(
+                    "Guest Messages", value=0.0, key="ar_msg_guest"
+                )
+                msg_hotel = st.number_input(
+                    "Hotel Messages", value=0.0, key="ar_msg_hotel"
+                )
+                msg_pct_ui = st.number_input(
+                    "% Guests Messaged",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key="ar_msg_pct",
+                )
+                resp_ui = st.number_input(
+                    "Response Rate %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key="ar_resp",
+                )
+                avg = st.number_input(
+                    "Average Minutes to Respond", value=0.0, key="ar_avg"
+                )
+                med = st.number_input(
+                    "Median Minutes to Respond", value=0.0, key="ar_med"
+                )
+
+            with stly_col:
+                st.markdown(f"**STLY — {ar_month_dt.year - 1}**")
+                stly_total = st.number_input(
+                    "STLY Total Messages", value=0.0, key="ar_stly_total"
+                )
+                stly_guest = st.number_input(
+                    "STLY Guest Messages", value=0.0, key="ar_stly_guest"
+                )
+                stly_hotel = st.number_input(
+                    "STLY Hotel Messages", value=0.0, key="ar_stly_hotel"
+                )
+                stly_pct_ui = st.number_input(
+                    "STLY % Guests Messaged",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key="ar_stly_pct",
+                )
+                stly_resp_ui = st.number_input(
+                    "STLY Response Rate %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key="ar_stly_resp",
+                )
+                stly_avg = st.number_input(
+                    "STLY Average Minutes to Respond",
+                    value=0.0,
+                    key="ar_stly_avg",
+                )
+                stly_med = st.number_input(
+                    "STLY Median Minutes to Respond",
+                    value=0.0,
+                    key="ar_stly_med",
+                )
+
+            msg_pct = msg_pct_ui / 100.0
+            resp = resp_ui / 100.0
+            stly_pct = stly_pct_ui / 100.0
+            stly_resp = stly_resp_ui / 100.0
+
+            engagement_rows = []
+            with st.expander("Engagement Rate points (optional)"):
+                st.caption(
+                    "Add up to eight Canary engagement-rate points for the monthly table."
+                )
+                for i in range(8):
+                    c_date, c_rate = st.columns([2, 1])
+                    with c_date:
+                        e_date = st.date_input(
+                            f"Date {i + 1}",
+                            value=None,
+                            key=f"ar_eng_date_{i}",
+                        )
+                    with c_rate:
+                        e_rate = st.number_input(
+                            f"Rate % {i + 1}",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=0.0,
+                            step=0.1,
+                            key=f"ar_eng_rate_{i}",
+                        )
+                    if e_date is not None:
+                        engagement_rows.append(
+                            (
+                                datetime.datetime.combine(e_date, datetime.time()),
+                                e_rate / 100.0,
+                            )
+                        )
+
+            ar_messaging={
+                'msgTotal':msg_total,'msgGuest':msg_guest,'msgHotel':msg_hotel,'msgGuestPct':msg_pct,
+                'responseRate':resp,'avgResponse':avg,'medianResponse':med,
+                'stlyMsgTotal':stly_total,'stlyMsgGuest':stly_guest,'stlyMsgHotel':stly_hotel,
+                'stlyMsgGuestPct':stly_pct,'stlyResponseRate':stly_resp,'stlyAvgResponse':stly_avg,'stlyMedianResponse':stly_med,
+            }
+
+            required_ok = ar_addon is not None and ar_upsell is not None
+            if ar_profile.get('stlySource') == 'SNT':
+                required_ok = required_ok and ar_stly_addon is not None and ar_stly_upsell is not None
+            else:
+                required_ok = required_ok and ar_canary_history is not None
+            template_ok = local_template.exists() or ar_template_upload is not None
+
+            if st.button(
+                "Build Ancillary Revenue Report",
+                type="primary",
+                key="ar_build_monthly",
+                disabled=not (required_ok and template_ok),
+            ):
+                try:
+                    with st.spinner("Building ancillary report..."):
+                        template_bytes = (
+                            local_template.read_bytes()
+                            if local_template.exists()
+                            else ar_template_upload.getvalue()
+                        )
+                        ar_output, ar_summary = ancillary_build_monthly_report(
+                            template_bytes=template_bytes,
+                            property_name=ar_property,
+                            report_month=ar_month_dt,
+                            addon_file=ar_addon,
+                            upsell_file=ar_upsell,
+                            stly_addon_file=ar_stly_addon,
+                            stly_upsell_file=ar_stly_upsell,
+                            canary_history_file=ar_canary_history,
+                            staff_file=ar_staff,
+                            journal_values=ar_journal_values,
+                            stly_journal_values=ar_stly_journal_values,
+                            messaging=ar_messaging,
+                            engagement=engagement_rows,
+                        )
+                        st.session_state['ar_monthly_output'] = ar_output
+                        st.session_state['ar_monthly_filename'] = (
+                            f"{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year} "
+                            f"Ancillary Revenue - {ar_property}.xlsx"
+                        )
+                        st.session_state['ar_monthly_summary'] = ar_summary
+                    st.success("Report built. Review the summary below, then download the workbook for validation.")
+                except Exception as e:
+                    st.error(f"Ancillary report build error: {e}")
+
+            if 'ar_monthly_output' in st.session_state:
+                summary=st.session_state.get('ar_monthly_summary',{})
+                main=summary.get('mainRows',[]); stly=summary.get('stly',{}); variance=summary.get('variance',[])
+                c1,c2,c3=st.columns(3)
+                c1.metric("Current Revenue", f"${sum(_ar_num(x.get('revenue')) or 0 for x in main):,.2f}")
+                c2.metric("STLY Revenue", f"${sum(_ar_num(x.get('approved')) or 0 for x in stly.get('rows',[])):,.2f}")
+                c3.metric("YoY Variance", f"${sum(_ar_num(x.get('variance')) or 0 for x in variance):,.2f}")
+                with st.expander("Preview current-year revenue rows"):
+                    st.dataframe(pd.DataFrame(main),use_container_width=True)
+                download_col, drive_col = st.columns(2)
+
+                with download_col:
+                    st.download_button(
+                        "Download Ancillary Revenue Report",
+                        data=st.session_state['ar_monthly_output'],
+                        file_name=st.session_state['ar_monthly_filename'],
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="ar_download_monthly",
+                        use_container_width=True,
+                    )
+
+                with drive_col:
+                    if st.button(
+                        f"Save {ar_month_dt.strftime('%b').upper()} Sheet to Drive",
+                        key="ar_save_drive",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            svc = get_drive_service()
+
+                            discovered = dict(get_hotels_from_drive())
+                            drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(ar_key)
+                            hotel_id = discovered.get(drive_label, "")
+
+                            if not drive_label:
+                                raise ValueError(
+                                    f"No Drive hotel mapping is configured for {ar_property}."
+                                )
+                            if not hotel_id:
+                                raise ValueError(
+                                    f"Could not find {drive_label}'s Revenue Reports folders "
+                                    "with the current Drive connection."
+                                )
+
+                            target, target_err = ancillary_find_drive_report(
+                                svc,
+                                hotel_id,
+                                drive_label,
+                                ar_month_dt,
+                            )
+                            if target_err or not target:
+                                raise ValueError(target_err or "Ancillary Drive report not found.")
+
+                            original_bytes = drive_download(svc, target["file_id"])
+                            merged_bytes, month_sheet = ancillary_insert_report_sheet(
+                                original_bytes,
+                                st.session_state['ar_monthly_output'],
+                                ar_month_dt,
+                                destination_name=target["file_name"],
+                            )
+
+                            # Keep one-click undo until the next save.
+                            st.session_state["ar_drive_undo"] = {
+                                "file_id": target["file_id"],
+                                "file_name": target["file_name"],
+                                "bytes": original_bytes,
+                            }
+
+                            drive_upload(
+                                svc,
+                                target["file_id"],
+                                merged_bytes,
+                                target["file_name"],
+                            )
+
+                            st.session_state["ar_drive_last_target"] = {
+                                "file_name": target["file_name"],
+                                "folder_name": target["folder_name"],
+                                "sheet_name": month_sheet,
+                            }
+
+                            st.success(
+                                f"Saved **{month_sheet}** inside **{target['file_name']}** "
+                                f"in **{target['folder_name']}**."
+                            )
+
+                        except Exception as e:
+                            st.error(f"Could not save ancillary report to Drive: {e}")
+
+                if st.session_state.get("ar_drive_last_target"):
+                    t = st.session_state["ar_drive_last_target"]
+                    st.caption(
+                        f"Last Drive save: **{t['file_name']}** → "
+                        f"sheet **{t['sheet_name']}**"
+                    )
+
+                if st.session_state.get("ar_drive_undo"):
+                    if st.button(
+                        "↩ Undo Last Ancillary Drive Save",
+                        key="ar_drive_undo_btn",
+                    ):
+                        try:
+                            undo = st.session_state["ar_drive_undo"]
+                            drive_upload(
+                                get_drive_service(),
+                                undo["file_id"],
+                                undo["bytes"],
+                                undo["file_name"],
+                            )
+                            st.session_state.pop("ar_drive_undo", None)
+                            st.session_state.pop("ar_drive_last_target", None)
+                            st.success("Restored the ancillary workbook to its previous version.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not undo ancillary Drive save: {e}")
+
+        with tab_ooo:
+            st.caption(
+                "Pulls the Sell-Out Efficiency Report straight from Drive, adds a bright-green "
+                "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
+                "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
+                "the selected month, with an ADR column pulled from that property's own ROB "
+                "(most recently-finalized week, current month falling back to previous month), "
+                "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
+                "macro buttons on every existing tab are left completely untouched."
+            )
+
+            today = datetime.date.today()
+            ooo_cur_month_dt  = today.replace(day=1)
+            ooo_prev_month_dt = (ooo_cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+            ooo_next_month_dt = (ooo_cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
+            ooo_month_options = {
+                ooo_prev_month_dt.strftime("%B %Y"): ooo_prev_month_dt,
+                ooo_cur_month_dt.strftime("%B %Y"):  ooo_cur_month_dt,
+                ooo_next_month_dt.strftime("%B %Y"): ooo_next_month_dt,
+            }
+            ooo_month_labels = list(ooo_month_options.keys())
+            # Default to the previous (just-completed) month — e.g. on Aug 1st this
+            # defaults to July — since current/next are only there for override.
+            ooo_sel_label = st.selectbox(
+                "Month to summarize", ooo_month_labels,
+                index=ooo_month_labels.index(ooo_prev_month_dt.strftime("%B %Y")),
+                key="ooo_month_sel",
+            )
+            ooo_target_dt = ooo_month_options[ooo_sel_label]
+
+            if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
+                try:
+                    svc = get_drive_service()
+                    ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
+                    if not ooo_file_id:
+                        st.error(ooo_file_name)
+                    else:
+                        ooo_bytes = drive_download(svc, ooo_file_id)
+                        ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
+                        ooo_months = list_ooo_available_months(ooo_wb)
+                        match = next((m for m in ooo_months
+                                      if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
+                        if not match:
+                            st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
+                        else:
+                            ooo_year, ooo_month, ooo_sheet_names = match
+                            order, totals, days_included, skipped = build_ooo_monthly_totals(
+                                ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
+                            if not order:
+                                st.error(
+                                    "None of that month's tabs matched the expected layout "
+                                    "('Property' header in row 7 col C, 'End...OOO' in row 7 col J) — "
+                                    "nothing was totaled, so no report was built."
+                                )
+                            else:
+                                with st.spinner("Looking up ADR for each property from its ROB..."):
+                                    hotels_for_adr = get_hotels_from_drive()
+                                    if not hotels_for_adr:
+                                        # A silent [] can also be a cached transient Drive
+                                        # failure (5-min TTL) — clear and retry once before
+                                        # concluding nothing is shared.
+                                        get_hotels_from_drive.clear()
+                                        hotels_for_adr = get_hotels_from_drive()
+                                    adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
+                                st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
+                                st.session_state["ooo_file_id"]       = ooo_file_id
+                                st.session_state["ooo_file_name"]     = ooo_file_name
+                                st.session_state["ooo_bytes"]         = ooo_bytes
+                                st.session_state["ooo_year"]          = ooo_year
+                                st.session_state["ooo_month"]         = ooo_month
+                                st.session_state["ooo_order"]         = order
+                                st.session_state["ooo_totals"]        = totals
+                                st.session_state["ooo_days_included"] = days_included
+                                st.session_state["ooo_skipped"]       = skipped
+                                st.session_state["ooo_adr_lookup"]    = adr_lookup
+                                matched = sum(1 for adr, _ in adr_lookup.values() if adr is not None)
+                                st.success(f"Ready to summarize **{ooo_target_dt.strftime('%B %Y')}** "
+                                           f"from **{ooo_file_name}** ({days_included} daily reports found, "
+                                           f"ADR matched for {matched}/{len(order)} properties).")
+                except Exception as e:
+                    st.error(f"Preview error: {e}")
+
+            if "ooo_order" in st.session_state:
+                order      = st.session_state["ooo_order"]
+                totals     = st.session_state["ooo_totals"]
+                adr_lookup = st.session_state["ooo_adr_lookup"]
+                hotels_seen = st.session_state.get("ooo_hotels_seen", [])
+                with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
+                    st.write(", ".join(hotels_seen) if hotels_seen else
+                             "None — no hotel folders are shared with this environment's service account.")
+                if st.session_state.get("ooo_skipped"):
+                    st.caption(f"Skipped tabs that didn't match the expected layout: "
+                               f"{', '.join(st.session_state['ooo_skipped'])}")
+                st.dataframe(
+                    [{"Property": p, "Total End. OOO Rooms": totals[p],
+                      "ADR": adr_lookup[p][0],
+                      "Revenue": round(adr_lookup[p][0] * totals[p], 2) if adr_lookup[p][0] is not None else None,
+                      "ADR note": adr_lookup[p][1] or ""} for p in order],
+                    use_container_width=True,
+                )
+                if st.button("Apply to Google Drive", key="ooo_apply", type="primary"):
+                    try:
+                        svc = get_drive_service()
+                        new_bytes, tab_name, err = inject_ooo_monthly_sheet(
+                            st.session_state["ooo_bytes"], st.session_state["ooo_year"],
+                            st.session_state["ooo_month"], order, totals,
+                            st.session_state["ooo_days_included"], adr_lookup)
+                        if err:
+                            st.error(err)
+                        else:
+                            drive_upload(svc, st.session_state["ooo_file_id"], new_bytes,
+                                         st.session_state["ooo_file_name"])
+                            st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
+                            for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
+                                        "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
+                                        "ooo_adr_lookup", "ooo_hotels_seen"]:
+                                st.session_state.pop(key, None)
+                    except Exception as e:
+                        st.error(f"Apply error: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# P&L Spreadsheet
-# ══════════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════════
+    # P&L Spreadsheet
+    # ══════════════════════════════════════════════════════════════════════════════
+
 with tab_pl:
     st.divider()
     st.header("P&L Spreadsheet")
@@ -7878,4 +16310,3 @@ with tab_projection:
 # only the open section reaches the page. Must stay the last statement in the
 # file — anything added after it would render into the void.
 _offstage.empty()
-
