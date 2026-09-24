@@ -9844,37 +9844,33 @@ def _hilton_ar_main_sort_key(row):
     return (90,name)
 
 
-def hilton_ancillary_build_report(
+def _hilton_ancillary_add_month_sheet(
+    wb,
     property_name,
     report_month,
     nor1_current_file,
     lobby_file,
     nor1_stly_file,
-    dashboard_file,
-    historical_front_desk=None,
 ):
-    """Build one Hilton monthly ancillary report matching the completed
-    month-tab format used in the Hilton report workbook.
+    """Add one Hilton ancillary month tab to an existing workbook.
 
-    Key rules confirmed against the corrected Ann Arbor August report:
+    The Front Desk table and Expired Revenue cells are intentionally created
+    but left blank for manual entry after download. This removes the need for
+    the Hilton Front Desk/dashboard upload.
+
+    Rules retained from the corrected Hilton monthly reports:
       - Current rows = Lobby add-ons (except Self-Parking) + current NOR1.
       - STLY rows = STLY NOR1 only.
       - Main/STLY average TOTAL = AVERAGE of row averages.
       - Variance is formula-driven.
       - Current-only rows carry through as positive variance.
       - STLY-only rows are added as negative variance rows.
-      - Expired Revenue variance = current total expired - STLY total expired.
+      - Expired Revenue variance = current expired - STLY expired.
       - Self-Parking remains outside the main totals.
     """
     current_nor1 = hilton_ancillary_parse_nor1(nor1_current_file)
     lobby = hilton_ancillary_parse_lobby(lobby_file)
     stly_nor1 = hilton_ancillary_parse_nor1(nor1_stly_file)
-    dash = hilton_ancillary_parse_dashboard(
-        dashboard_file,
-        property_name,
-        report_month,
-    )
-    historical_front_desk = historical_front_desk or {}
 
     main_rows = [
         *[dict(r) for r in lobby["rows"]],
@@ -9890,30 +9886,17 @@ def hilton_ancillary_build_report(
         )
     )
 
-    # Create row matching with the same alias behavior used for variance.
-    current_key_to_index = {}
-    for idx, row in enumerate(main_rows):
-        current_key_to_index.setdefault(
-            _hilton_ar_variance_key(row["name"]),
-            idx,
-        )
-
-    stly_key_to_index = {}
-    for idx, row in enumerate(stly_rows):
-        stly_key_to_index.setdefault(
-            _hilton_ar_variance_key(row["name"]),
-            idx,
-        )
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = report_month.strftime("%b").upper()
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
 
     dark = "1F4E78"
     section = "D9EAF7"
     subheader = "DDEBF7"
     stly_fill = "FFF2CC"
     variance_fill = "E2F0D9"
+    manual_fill = "FFF2CC"
     white = "FFFFFF"
     thin_gray = Side(style="thin", color="B7B7B7")
     border = Border(
@@ -9923,7 +9906,7 @@ def hilton_ancillary_build_report(
         bottom=thin_gray,
     )
 
-    # ── Header ────────────────────────────────────────────────────────────────
+    # ── Header ───────────────────────────────────────────────────────────────
     ws["A1"] = (
         f"{property_name} Upsell Overview - "
         f"{report_month.strftime('%B')}"
@@ -9948,9 +9931,10 @@ def hilton_ancillary_build_report(
         cell.fill = PatternFill("solid", fgColor=subheader)
         cell.border = border
 
-    # ── Current-year table ───────────────────────────────────────────────────
+    # ── Current-year table ──────────────────────────────────────────────────
     current_start = 4
     current_row_by_key = {}
+
     for i, row in enumerate(main_rows, start=current_start):
         ws.cell(i, 1, row["name"])
         ws.cell(i, 2, row["count"])
@@ -9980,20 +9964,27 @@ def hilton_ancillary_build_report(
         4,
         f"=AVERAGE(D{current_start}:D{current_total_row-1})",
     )
-    ws.cell(
-        current_total_row,
-        5,
-        dash["current"].get("expired") or 0,
+    # Manual entry: current-year Expired Revenue.
+    ws.cell(current_total_row, 5, None)
+    ws.cell(current_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=manual_fill,
     )
+    ws.cell(current_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: current-year NOR1 Expired Revenue.",
+        "OpenAI",
+    )
+
     for c in range(1, 6):
         ws.cell(current_total_row, c).font = Font(bold=True)
-        ws.cell(current_total_row, c).fill = PatternFill(
-            "solid",
-            fgColor=section,
-        )
+        if c != 5:
+            ws.cell(current_total_row, c).fill = PatternFill(
+                "solid",
+                fgColor=section,
+            )
         ws.cell(current_total_row, c).border = border
 
-    # ── Front Desk history ───────────────────────────────────────────────────
+    # ── Front Desk history — manual entry ───────────────────────────────────
     ws["H3"] = "Year"
     ws["I3"] = "Front Desk Upsell Revenue"
     for cell in ("H3", "I3"):
@@ -10001,27 +9992,28 @@ def hilton_ancillary_build_report(
         ws[cell].fill = PatternFill("solid", fgColor=subheader)
         ws[cell].border = border
 
-    front_desk_rows = [
-        (report_month.year, dash["current"].get("front_desk")),
-        (report_month.year - 1, dash["stly"].get("front_desk")),
+    front_desk_years = [
+        report_month.year - offset
+        for offset in range(4)
     ]
-    for year in sorted(historical_front_desk.keys(), reverse=True):
-        if year not in (report_month.year, report_month.year - 1):
-            front_desk_rows.append(
-                (year, historical_front_desk.get(year))
-            )
-
-    for r, (year, value) in enumerate(front_desk_rows, start=4):
+    for r, year in enumerate(front_desk_years, start=4):
         ws.cell(r, 8, year)
-        ws.cell(r, 9, value if value is not None else 0)
+        ws.cell(r, 9, None)
         ws.cell(r, 8).border = border
         ws.cell(r, 9).border = border
+        ws.cell(r, 9).fill = PatternFill(
+            "solid",
+            fgColor=manual_fill,
+        )
+        ws.cell(r, 9).comment = openpyxl.comments.Comment(
+            "Manual entry: Front Desk upsell revenue for this year/month.",
+            "OpenAI",
+        )
 
-    # Self-Parking remains separate from the main table and does NOT get an
-    # average formula in the corrected Hilton report.
+    # Self-Parking remains outside the main ancillary totals.
     parking = lobby.get("self_parking")
     if parking:
-        p_row = max(10, 4 + len(front_desk_rows) + 2)
+        p_row = max(10, 4 + len(front_desk_years) + 2)
         ws.cell(p_row, 8, parking["name"])
         ws.cell(p_row, 9, parking["count"])
         ws.cell(p_row, 10, parking["revenue"])
@@ -10030,7 +10022,7 @@ def hilton_ancillary_build_report(
             if c == 8:
                 ws.cell(p_row, c).font = Font(bold=True)
 
-    # ── STLY table ───────────────────────────────────────────────────────────
+    # ── STLY table ──────────────────────────────────────────────────────────
     stly_title_row = current_total_row + 1
     stly_header_row = stly_title_row + 1
     stly_start = stly_header_row + 1
@@ -10085,20 +10077,27 @@ def hilton_ancillary_build_report(
         4,
         f"=AVERAGE(D{stly_start}:D{stly_total_row-1})",
     )
-    ws.cell(
-        stly_total_row,
-        5,
-        dash["stly"].get("expired") or 0,
+    # Manual entry: STLY Expired Revenue.
+    ws.cell(stly_total_row, 5, None)
+    ws.cell(stly_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=manual_fill,
     )
+    ws.cell(stly_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: STLY NOR1 Expired Revenue.",
+        "OpenAI",
+    )
+
     for c in range(1, 6):
         ws.cell(stly_total_row, c).font = Font(bold=True)
-        ws.cell(stly_total_row, c).fill = PatternFill(
-            "solid",
-            fgColor=stly_fill,
-        )
+        if c != 5:
+            ws.cell(stly_total_row, c).fill = PatternFill(
+                "solid",
+                fgColor=stly_fill,
+            )
         ws.cell(stly_total_row, c).border = border
 
-    # ── Variance table ───────────────────────────────────────────────────────
+    # ── Variance table ──────────────────────────────────────────────────────
     variance_title_row = stly_total_row + 1
     variance_header_row = variance_title_row + 1
     variance_start = variance_header_row + 1
@@ -10123,33 +10122,28 @@ def hilton_ancillary_build_report(
         cell.fill = PatternFill("solid", fgColor=variance_fill)
         cell.border = border
 
-    # Preserve current-year row order first.
     variance_specs = []
     used_stly_keys = set()
+
     for cur in main_rows:
         key = _hilton_ar_variance_key(cur["name"])
-        variance_specs.append(
-            {
-                "name": cur["name"],
-                "current_row": current_row_by_key.get(key),
-                "stly_row": stly_row_by_key.get(key),
-            }
-        )
+        variance_specs.append({
+            "name": cur["name"],
+            "current_row": current_row_by_key.get(key),
+            "stly_row": stly_row_by_key.get(key),
+        })
         if key in stly_row_by_key:
             used_stly_keys.add(key)
 
-    # Then append STLY-only items as negative variance rows.
     for stly in stly_rows:
         key = _hilton_ar_variance_key(stly["name"])
         if key in used_stly_keys or key in current_row_by_key:
             continue
-        variance_specs.append(
-            {
-                "name": stly["name"],
-                "current_row": None,
-                "stly_row": stly_row_by_key.get(key),
-            }
-        )
+        variance_specs.append({
+            "name": stly["name"],
+            "current_row": None,
+            "stly_row": stly_row_by_key.get(key),
+        })
 
     variance_rows = []
     for offset, spec in enumerate(variance_specs):
@@ -10160,21 +10154,21 @@ def hilton_ancillary_build_report(
         ws.cell(i, 1, spec["name"])
 
         if cr and sr:
-            for col_letter, col_num in zip("BCDE", range(2, 6)):
+            for col_letter, col_num in zip("BCD", range(2, 5)):
                 ws.cell(
                     i,
                     col_num,
                     f"={col_letter}{cr}-{col_letter}{sr}",
                 )
         elif cr:
-            for col_letter, col_num in zip("BCDE", range(2, 6)):
+            for col_letter, col_num in zip("BCD", range(2, 5)):
                 ws.cell(
                     i,
                     col_num,
                     f"={col_letter}{cr}",
                 )
         elif sr:
-            for col_letter, col_num in zip("BCDE", range(2, 6)):
+            for col_letter, col_num in zip("BCD", range(2, 5)):
                 ws.cell(
                     i,
                     col_num,
@@ -10210,8 +10204,10 @@ def hilton_ancillary_build_report(
     ws.cell(
         variance_total_row,
         5,
-        f"=E{current_total_row}-E{stly_total_row}",
+        f'=IF(OR(E{current_total_row}<>"",E{stly_total_row}<>""),'
+        f'E{current_total_row}-E{stly_total_row},"")',
     )
+
     for c in range(1, 6):
         ws.cell(variance_total_row, c).font = Font(bold=True)
         ws.cell(variance_total_row, c).fill = PatternFill(
@@ -10220,14 +10216,14 @@ def hilton_ancillary_build_report(
         )
         ws.cell(variance_total_row, c).border = border
 
-    # ── Number formats / dimensions ──────────────────────────────────────────
+    # ── Number formats / dimensions ─────────────────────────────────────────
     for row in range(4, variance_total_row + 1):
         ws.cell(row, 2).number_format = "0"
         ws.cell(row, 3).number_format = "$#,##0.00"
         ws.cell(row, 4).number_format = "$#,##0.00"
         ws.cell(row, 5).number_format = "$#,##0.00"
 
-    for row in range(4, 4 + len(front_desk_rows)):
+    for row in range(4, 8):
         ws.cell(row, 9).number_format = "$#,##0.00"
 
     if parking:
@@ -10256,29 +10252,8 @@ def hilton_ancillary_build_report(
                 wrap_text=True,
             )
 
-    # ── Source validation warnings ───────────────────────────────────────────
-    warnings = []
-    current_awarded = dash["current"].get("awarded")
-    if current_awarded is not None and abs(
-        current_awarded - current_nor1["total_revenue"]
-    ) > 1.0:
-        warnings.append(
-            f"Current NOR1 total (${current_nor1['total_revenue']:,.2f}) "
-            f"does not match dashboard Awarded Revenue "
-            f"(${current_awarded:,.2f})."
-        )
-
-    stly_awarded = dash["stly"].get("awarded")
-    if stly_awarded is not None and abs(
-        stly_awarded - stly_nor1["total_revenue"]
-    ) > 1.0:
-        warnings.append(
-            f"STLY NOR1 total (${stly_nor1['total_revenue']:,.2f}) "
-            f"does not match dashboard Awarded Revenue "
-            f"(${stly_awarded:,.2f})."
-        )
-
     expected_inn = HILTON_INNCODES.get(property_name)
+    warnings = []
     if (
         lobby["inn_codes"]
         and expected_inn
@@ -10289,20 +10264,79 @@ def hilton_ancillary_build_report(
             f"do not include expected {expected_inn} for {property_name}."
         )
 
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue(), {
+    return {
+        "month": report_month,
+        "sheet": sheet_name,
         "mainRows": main_rows,
         "stlyRows": stly_rows,
         "varianceRows": variance_rows,
         "selfParking": parking,
-        "dashboard": dash,
         "warnings": warnings,
         "currentTotalCount": sum(r["count"] for r in main_rows),
         "currentTotalRevenue": sum(r["revenue"] for r in main_rows),
         "stlyTotalCount": sum(r["count"] for r in stly_rows),
         "stlyTotalRevenue": sum(r["revenue"] for r in stly_rows),
     }
+
+
+def hilton_ancillary_build_multi_month_report(
+    property_name,
+    month_inputs,
+):
+    """Build one workbook with one Hilton ancillary tab per selected month.
+
+    month_inputs is a list of dictionaries containing:
+      report_month, nor1_current_file, lobby_file, nor1_stly_file.
+    """
+    wb = openpyxl.Workbook()
+    # Remove the default sheet after the first real month tab is added.
+    default = wb.active
+    summaries = []
+
+    for item in sorted(
+        month_inputs,
+        key=lambda x: x["report_month"],
+    ):
+        summary = _hilton_ancillary_add_month_sheet(
+            wb=wb,
+            property_name=property_name,
+            report_month=item["report_month"],
+            nor1_current_file=item["nor1_current_file"],
+            lobby_file=item["lobby_file"],
+            nor1_stly_file=item["nor1_stly_file"],
+        )
+        summaries.append(summary)
+
+    if default.title in wb.sheetnames and len(wb.sheetnames) > 1:
+        wb.remove(default)
+
+    out = io.BytesIO()
+    wb.save(out)
+
+    return out.getvalue(), summaries
+
+
+# Backward-compatible single-month wrapper used nowhere in the new UI but
+# retained so older internal calls do not break.
+def hilton_ancillary_build_report(
+    property_name,
+    report_month,
+    nor1_current_file,
+    lobby_file,
+    nor1_stly_file,
+    dashboard_file=None,
+    historical_front_desk=None,
+):
+    output, summaries = hilton_ancillary_build_multi_month_report(
+        property_name,
+        [{
+            "report_month": report_month,
+            "nor1_current_file": nor1_current_file,
+            "lobby_file": lobby_file,
+            "nor1_stly_file": nor1_stly_file,
+        }],
+    )
+    return output, summaries[0]
 
 
 # ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
@@ -14890,43 +14924,178 @@ with tab_ancillary:
 
     if ancillary_platform == "Hilton":
         st.markdown("### Hilton — NOR1 + Lobby Report Builder")
-        st.caption("Hilton uses four source reports: current NOR1, current Lobby Add-ons, STLY NOR1, and the Hilton Front Desk Upsell Dashboard. The dashboard also supplies current/STLY expired revenue.")
-        har_property = st.selectbox("Hilton Property", list(PORTFOLIO_HOTELS["Hilton"].keys()), key="har_property")
-        har_month_date = st.date_input("Hilton report month", value=datetime.date.today().replace(day=1), key="har_month")
-        har_month_dt = datetime.datetime(har_month_date.year, har_month_date.month, 1)
-        hc1, hc2 = st.columns(2)
-        with hc1:
-            har_nor1_current = st.file_uploader(f"{har_month_dt:%b %Y} — NOR1 Custom Export", type=["xlsx"], key="har_nor1_current")
-            har_lobby = st.file_uploader(f"{har_month_dt:%b %Y} — Lobby Add-ons Hotel-Level Dashboard", type=["xlsx"], key="har_lobby")
-        with hc2:
-            har_nor1_stly = st.file_uploader(f"{har_month_dt.year - 1} {har_month_dt:%b} — STLY NOR1 Custom Export", type=["xlsx"], key="har_nor1_stly")
-            har_dashboard = st.file_uploader("Hilton Front Desk Upsell Dashboard", type=["xlsm","xlsx"], key="har_dashboard")
-        with st.container(border=True):
-            st.markdown("**Older Front Desk history (optional)**")
-            st.caption("The current Hilton dashboard contains 2025–2026. Older years are optional and do not require another upload.")
-            h1,h2=st.columns(2)
-            with h1: har_fd_2024=st.number_input("2024 Front Desk Upsell Revenue", value=0.0, step=1.0, key="har_fd_2024")
-            with h2: har_fd_2023=st.number_input("2023 Front Desk Upsell Revenue", value=0.0, step=1.0, key="har_fd_2023")
-        har_ready=all([har_nor1_current is not None,har_lobby is not None,har_nor1_stly is not None,har_dashboard is not None])
-        if st.button("Build Hilton Ancillary Revenue Report", type="primary", key="har_build", disabled=not har_ready, use_container_width=True):
+        st.caption(
+            "Build several Hilton ancillary months at once. Each month needs "
+            "three source files: current NOR1, current Lobby Add-ons, and "
+            "STLY NOR1. Front Desk Upsell and Expired Revenue cells are built "
+            "into the report but left blank for manual entry in Excel."
+        )
+
+        har_property = st.selectbox(
+            "Hilton Property",
+            list(PORTFOLIO_HOTELS["Hilton"].keys()),
+            key="har_property",
+        )
+
+        today_month = datetime.date.today().replace(day=1)
+        month_options = []
+        cursor = today_month
+        for _ in range(18):
+            month_options.append(cursor)
+            cursor = (
+                cursor.replace(day=1) - datetime.timedelta(days=1)
+            ).replace(day=1)
+
+        default_months = month_options[:3]
+        har_months = st.multiselect(
+            "Months to build",
+            options=month_options,
+            default=default_months,
+            format_func=lambda d: d.strftime("%B %Y"),
+            key="har_months_multi",
+            help=(
+                "Select as many months as you want. The download will contain "
+                "one tab per month."
+            ),
+        )
+
+        month_uploads = []
+        all_ready = bool(har_months)
+
+        for month_date in sorted(har_months):
+            month_dt = datetime.datetime(
+                month_date.year,
+                month_date.month,
+                1,
+            )
+            key_suffix = month_dt.strftime("%Y%m")
+
+            with st.container(border=True):
+                st.markdown(f"**{month_dt:%B %Y}**")
+                c1, c2, c3 = st.columns(3)
+
+                with c1:
+                    nor1_current = st.file_uploader(
+                        f"{month_dt:%b %Y} — Current NOR1",
+                        type=["xlsx"],
+                        key=f"har_nor1_current_{key_suffix}",
+                    )
+
+                with c2:
+                    lobby = st.file_uploader(
+                        f"{month_dt:%b %Y} — Lobby Add-ons",
+                        type=["xlsx"],
+                        key=f"har_lobby_{key_suffix}",
+                    )
+
+                with c3:
+                    nor1_stly = st.file_uploader(
+                        f"{month_dt.year - 1} {month_dt:%b} — STLY NOR1",
+                        type=["xlsx"],
+                        key=f"har_nor1_stly_{key_suffix}",
+                    )
+
+                ready = all([
+                    nor1_current is not None,
+                    lobby is not None,
+                    nor1_stly is not None,
+                ])
+                all_ready = all_ready and ready
+
+                month_uploads.append({
+                    "report_month": month_dt,
+                    "nor1_current_file": nor1_current,
+                    "lobby_file": lobby,
+                    "nor1_stly_file": nor1_stly,
+                })
+
+        if st.button(
+            "Build Hilton Ancillary Workbook",
+            type="primary",
+            key="har_build_multi",
+            disabled=not all_ready,
+            use_container_width=True,
+        ):
             try:
-                with st.spinner("Building Hilton ancillary report..."):
-                    har_output,har_summary=hilton_ancillary_build_report(har_property,har_month_dt,har_nor1_current,har_lobby,har_nor1_stly,har_dashboard,{2024:har_fd_2024,2023:har_fd_2023})
-                    st.session_state["har_output"]=har_output; st.session_state["har_summary"]=har_summary; st.session_state["har_filename"]=f"{har_month_dt.year} {har_property} NOR1 Upsell Report.xlsx"
-                st.success("Hilton report built. Review the totals below before downloading.")
+                with st.spinner("Building Hilton ancillary workbook..."):
+                    har_output, har_summaries = (
+                        hilton_ancillary_build_multi_month_report(
+                            property_name=har_property,
+                            month_inputs=month_uploads,
+                        )
+                    )
+
+                    years = sorted({
+                        item["report_month"].year
+                        for item in month_uploads
+                    })
+                    year_label = (
+                        str(years[0])
+                        if len(years) == 1
+                        else f"{years[0]}-{years[-1]}"
+                    )
+
+                    st.session_state["har_output"] = har_output
+                    st.session_state["har_summaries"] = har_summaries
+                    st.session_state["har_filename"] = (
+                        f"{year_label} {har_property} NOR1 Upsell Report.xlsx"
+                    )
+
+                st.success(
+                    f"Built {len(har_summaries)} Hilton month tab(s). "
+                    "Front Desk and Expired Revenue cells are ready for "
+                    "manual entry in the downloaded workbook."
+                )
             except Exception as e:
-                st.error(f"Hilton ancillary report build error: {e}")
+                st.error(
+                    f"Hilton ancillary report build error: {e}"
+                )
+
         if "har_output" in st.session_state:
-            hs=st.session_state.get("har_summary",{}); m1,m2,m3=st.columns(3)
-            m1.metric("Current Revenue",f"${hs.get('currentTotalRevenue',0):,.2f}"); m2.metric("STLY NOR1 Revenue",f"${hs.get('stlyTotalRevenue',0):,.2f}"); m3.metric("YoY Revenue Variance",f"${hs.get('currentTotalRevenue',0)-hs.get('stlyTotalRevenue',0):,.2f}")
-            ds=hs.get("dashboard",{}); dc=ds.get("current",{}); dl=ds.get("stly",{})
-            st.caption(f"Dashboard check — {har_month_dt.year}: Front Desk ${(dc.get('front_desk') or 0):,.2f}, Expired ${(dc.get('expired') or 0):,.2f}; {har_month_dt.year-1}: Front Desk ${(dl.get('front_desk') or 0):,.2f}, Expired ${(dl.get('expired') or 0):,.2f}.")
-            for warning in hs.get("warnings",[]): st.warning(warning)
-            with st.expander("Preview Hilton current-year rows"):
-                st.dataframe(pd.DataFrame(hs.get("mainRows",[])),use_container_width=True,hide_index=True)
-            with st.expander("Preview Hilton STLY NOR1 rows"):
-                st.dataframe(pd.DataFrame(hs.get("stlyRows",[])),use_container_width=True,hide_index=True)
-            st.download_button("Download Hilton Ancillary Revenue Report",data=st.session_state["har_output"],file_name=st.session_state["har_filename"],mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="har_download",use_container_width=True)
+            summaries = st.session_state.get("har_summaries", [])
+
+            if summaries:
+                preview_rows = []
+                for hs in summaries:
+                    preview_rows.append({
+                        "Month": hs["month"].strftime("%b %Y"),
+                        "Current Revenue": hs.get(
+                            "currentTotalRevenue",
+                            0,
+                        ),
+                        "STLY NOR1 Revenue": hs.get(
+                            "stlyTotalRevenue",
+                            0,
+                        ),
+                        "YoY Revenue Variance": (
+                            hs.get("currentTotalRevenue", 0)
+                            - hs.get("stlyTotalRevenue", 0)
+                        ),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(preview_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                for hs in summaries:
+                    for warning in hs.get("warnings", []):
+                        st.warning(
+                            f"{hs['month']:%b %Y}: {warning}"
+                        )
+
+            st.download_button(
+                "Download Hilton Ancillary Workbook",
+                data=st.session_state["har_output"],
+                file_name=st.session_state["har_filename"],
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key="har_download_multi",
+                use_container_width=True,
+            )
     else:
         st.markdown("### SNT / Independent Hotels")
         st.caption(
