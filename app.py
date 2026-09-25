@@ -5078,14 +5078,9 @@ def drive_download(service, file_id) -> bytes:
 def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     """Overwrite an existing Drive file with new bytes."""
     buf   = io.BytesIO(file_bytes)
-    mime_type = (
-        "application/vnd.ms-excel.sheet.macroenabled.12"
-        if str(file_name or "").lower().endswith(".xlsm")
-        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
     media = MediaIoBaseUpload(
         buf,
-        mimetype=mime_type,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         resumable=True,
     )
     # supportsAllDrives is required here even though drive_download's
@@ -5265,159 +5260,348 @@ def hilton_ancillary_find_drive_report(
     service,
     hotel_id,
     hotel_name,
-    report_year=None,
+    report_month,
 ):
-    """Find a Hilton property's existing NOR1 Upsell Report workbook.
+    """Find the Hilton ancillary workbook without requiring one exact filename.
 
-    Hilton ancillary folders sit beside the monthly Revenue Reports folders,
-    rather than inside them.  Because ``hotel_id`` may itself be one or more
-    Revenue Reports folder IDs, discovery uses the complete visible folder
-    index and matches the ancillary folder using the selected Hilton property's
-    registered Drive aliases and visible parent-folder names.
+    Folder:
+      Ancillary Revenue Reports / Ancillary Revenue Files anywhere under the
+      hotel's Drive tree.
 
-    The target workbook must contain NOR1, UPSELL, and REPORT in its filename.
-    If more than one valid workbook is present, the most recently modified one
-    is used.
+    Workbook selection:
+      1) Prefer Excel files whose names look like an ancillary / NOR1 / upsell
+         report for the hotel.
+      2) If the folder contains exactly one plausible Excel workbook, use it
+         even when the filename is unconventional.
+      3) Ignore obvious raw-source / weekly-report files.
+
+    Returns a target dict even when no workbook exists yet; in that case
+    file_id is None and the caller may create the new Hilton workbook in the
+    resolved ancillary folder.
     """
-    q = "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    folders = []
-    page_token = None
-    while True:
-        resp = service.files().list(
-            q=q,
-            fields="nextPageToken,files(id,name,parents,modifiedTime)",
-            pageSize=1000,
-            pageToken=page_token,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
-        folders.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b").upper()
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
 
-    folder_by_id = {f.get("id"): f for f in folders if f.get("id")}
-    aliases = list(PORTFOLIO_HOTELS.get("Hilton", {}).get(hotel_name, []))
-    aliases.append(hotel_name)
-    alias_norms = {
-        _ancillary_normalize_drive_name(alias)
-        for alias in aliases
-        if _ancillary_normalize_drive_name(alias)
-    }
+    ancillary_folders = []
+    frontier = [(hotel_id, 0)]
+    visited = set()
 
-    # Revenue-report IDs already discovered for the selected property provide
-    # an additional identity signal when folder names are generic.
-    if not hotel_id:
-        selected_ids = set()
-    elif str(hotel_id).startswith(MULTI_ID_PREFIX):
-        selected_ids = set(str(hotel_id)[len(MULTI_ID_PREFIX):].split(","))
-    else:
-        selected_ids = {str(hotel_id)}
-
-    selected_ancillary_folders = []
-    for folder in folders:
-        folder_norm = _ancillary_normalize_drive_name(folder.get("name"))
-        if (
-            "ANCILLARY REVENUE REPORTS" not in folder_norm
-            and "ANCILLARY REVENUE FILES" not in folder_norm
-        ):
+    # Search several levels below the hotel root for the ancillary folder.
+    while frontier:
+        parent_id, depth = frontier.pop(0)
+        if parent_id in visited or depth > 5:
             continue
+        visited.add(parent_id)
 
-        parent_ids = folder.get("parents", [])
-        parent_names = [
-            str(folder_by_id[parent_id].get("name", ""))
-            for parent_id in parent_ids
-            if parent_id in folder_by_id
-        ]
-        haystack = _ancillary_normalize_drive_name(
-            " ".join([str(folder.get("name", ""))] + parent_names)
+        q = (
+            "mimeType='application/vnd.google-apps.folder' "
+            f"and trashed=false and '{parent_id}' in parents"
         )
-
-        alias_match = any(alias in haystack for alias in alias_norms)
-
-        # A generic ancillary folder can still be selected when it shares a
-        # parent with one of the selected property's Revenue Reports folders.
-        selected_parent_ids = set()
-        for selected_id in selected_ids:
-            selected_folder = folder_by_id.get(selected_id, {})
-            selected_parent_ids.update(selected_folder.get("parents", []))
-        sibling_match = bool(set(parent_ids) & selected_parent_ids)
-
-        if alias_match or sibling_match:
-            selected_ancillary_folders.append(folder)
-
-    if not selected_ancillary_folders:
-        return None, (
-            f"No 'Ancillary Revenue Reports' or 'Ancillary Revenue Files' "
-            f"folder was found for {hotel_name}."
-        )
-
-    candidates = []
-    for folder in selected_ancillary_folders:
-        q_files = f"trashed=false and '{folder['id']}' in parents"
         page_token = None
+
         while True:
             resp = service.files().list(
-                q=q_files,
-                fields="nextPageToken,files(id,name,mimeType,modifiedTime)",
+                q=q,
+                fields=(
+                    "nextPageToken,"
+                    "files(id,name,modifiedTime,parents)"
+                ),
                 pageSize=200,
                 pageToken=page_token,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             ).execute()
-            for item in resp.get("files", []):
-                norm = _ancillary_normalize_drive_name(item.get("name"))
-                if not all(word in norm for word in ("NOR1", "UPSELL", "REPORT")):
+
+            for f in resp.get("files", []):
+                fid = f.get("id")
+                if not fid:
                     continue
-                if item.get("mimeType") not in {
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "application/vnd.ms-excel.sheet.macroenabled.12",
-                }:
-                    continue
-                explicit_years = set(re.findall(r"\b20\d{2}\b", norm))
+
+                norm = _ancillary_normalize_drive_name(
+                    f.get("name")
+                )
                 if (
-                    report_year is not None
-                    and explicit_years
-                    and str(report_year) not in explicit_years
+                    "ANCILLARY REVENUE REPORTS" in norm
+                    or "ANCILLARY REVENUE FILES" in norm
                 ):
-                    continue
-                candidates.append({
-                    **item,
-                    "folder_id": folder["id"],
-                    "folder_name": folder.get("name", "Ancillary Revenue Reports"),
-                    "_year_match": bool(
-                        report_year is not None
-                        and str(report_year) in explicit_years
-                    ),
-                })
+                    ancillary_folders.append({
+                        **f,
+                        "_depth": depth + 1,
+                    })
+                else:
+                    frontier.append((fid, depth + 1))
+
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
 
-    if not candidates:
-        folder_names = ", ".join(
-            sorted({f.get("name", "") for f in selected_ancillary_folders})
-        )
+    if not ancillary_folders:
         return None, (
-            f"No Excel workbook containing 'NOR1', 'Upsell', and 'Report' "
-            f"was found in {folder_names}."
+            f"No folder containing 'Ancillary Revenue Reports' or "
+            f"'Ancillary Revenue Files' was found in "
+            f"{hotel_name}'s Drive tree."
         )
 
-    candidates.sort(
-        key=lambda item: (
-            bool(item.get("_year_match")),
-            str(item.get("modifiedTime", "")),
-        ),
+    ancillary_folders.sort(
+        key=lambda f: (
+            f.get("_depth", 99),
+            str(f.get("modifiedTime", "")),
+        )
+    )
+    min_depth = ancillary_folders[0].get("_depth", 99)
+    same_depth = [
+        f for f in ancillary_folders
+        if f.get("_depth", 99) == min_depth
+    ]
+    same_depth.sort(
+        key=lambda f: str(f.get("modifiedTime", "")),
         reverse=True,
     )
-    target = candidates[0]
+    anc_folder = same_depth[0]
+
+    q = f"trashed=false and '{anc_folder['id']}' in parents"
+    files = service.files().list(
+        q=q,
+        fields="files(id,name,mimeType,modifiedTime)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    excel_mimes = {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel.sheet.macroEnabled.12",
+        "application/vnd.google-apps.spreadsheet",
+    }
+    raw_excludes = (
+        "CUSTOM EXPORT",
+        "ADD ONS HOTEL LEVEL",
+        "ADD-ONS HOTEL-LEVEL",
+        "BOOKING REPORT",
+        "DASHBOARD",
+        "SRP",
+        "GROUP WASH",
+        "MCAT",
+        "FORECAST",
+        "STRATEGY",
+        " ROB ",
+    )
+
+    hotel_norm = _ancillary_normalize_drive_name(hotel_name)
+    hotel_tokens = [
+        token for token in hotel_norm.split()
+        if len(token) >= 3
+    ]
+    inn_code = HILTON_INNCODES.get(hotel_name, "")
+    inn_norm = _ancillary_normalize_drive_name(inn_code)
+
+    plausible = []
+    for f in files:
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            continue
+
+        name = str(f.get("name") or "")
+        norm = _ancillary_normalize_drive_name(name)
+        ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+
+        is_excel = (
+            f.get("mimeType") in excel_mimes
+            or ext in ("xlsx", "xlsm")
+        )
+        if not is_excel:
+            continue
+
+        if any(ex in f" {norm} " for ex in raw_excludes):
+            continue
+
+        score = 0
+        if "ANCILLARY" in norm:
+            score += 8
+        if "NOR1" in norm:
+            score += 8
+        if "UPSELL" in norm:
+            score += 7
+        if "REPORT" in norm:
+            score += 4
+        if str(report_month.year) in norm:
+            score += 2
+        if inn_norm and inn_norm in norm:
+            score += 6
+
+        matched_hotel_tokens = sum(
+            1 for token in hotel_tokens
+            if token in norm
+        )
+        score += matched_hotel_tokens * 2
+
+        plausible.append({
+            **f,
+            "_score": score,
+        })
+
+    if not plausible:
+        # Folder is valid but there is no existing workbook yet.
+        return {
+            "file_id": None,
+            "file_name": None,
+            "mime_type": "",
+            "folder_id": anc_folder["id"],
+            "folder_name": anc_folder["name"],
+            "revenue_folder_id": rev_id,
+            "revenue_folder_name": (
+                rev_name
+                or f"{report_month.year} Revenue Reports"
+            ),
+        }, None
+
+    # Strong keyword/name match wins.
+    scored = [f for f in plausible if f["_score"] > 0]
+
+    if scored:
+        scored.sort(
+            key=lambda f: (
+                f["_score"],
+                str(f.get("modifiedTime", "")),
+            ),
+            reverse=True,
+        )
+        target = scored[0]
+    elif len(plausible) == 1:
+        # Safe fallback for unconventional naming: one Excel workbook in the
+        # hotel's ancillary folder is almost certainly the intended report.
+        target = plausible[0]
+    else:
+        names = ", ".join(
+            sorted(str(f.get("name") or "") for f in plausible)[:8]
+        )
+        return None, (
+            f"{anc_folder['name']} contains multiple Excel workbooks, but "
+            f"none can be identified confidently as the Hilton ancillary "
+            f"report. Files found: {names}"
+        )
+
     return {
         "file_id": target["id"],
         "file_name": target["name"],
         "mime_type": target.get("mimeType", ""),
-        "folder_id": target["folder_id"],
-        "folder_name": target["folder_name"],
+        "folder_id": anc_folder["id"],
+        "folder_name": anc_folder["name"],
+        "revenue_folder_id": rev_id,
+        "revenue_folder_name": (
+            rev_name
+            or f"{report_month.year} Revenue Reports"
+        ),
     }, None
+
+
+def hilton_ancillary_merge_month_sheets(
+    destination_bytes,
+    generated_bytes,
+    destination_name="",
+):
+    """Merge every generated Hilton month tab into an existing workbook.
+
+    Existing unrelated tabs are preserved. A matching month tab is replaced in
+    place; a new month tab is inserted before the first Pivot tab when one
+    exists.
+    """
+    keep_vba = str(destination_name or "").lower().endswith(".xlsm")
+
+    dest_wb = openpyxl.load_workbook(
+        io.BytesIO(destination_bytes),
+        data_only=False,
+        keep_vba=keep_vba,
+    )
+    generated_wb = openpyxl.load_workbook(
+        io.BytesIO(generated_bytes),
+        data_only=False,
+    )
+
+    generated_month_tabs = [
+        name for name in generated_wb.sheetnames
+        if re.fullmatch(
+            r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)",
+            str(name).upper(),
+        )
+    ]
+    if not generated_month_tabs:
+        raise ValueError(
+            "Generated Hilton ancillary workbook has no month tabs."
+        )
+
+    inserted = []
+
+    for source_name in generated_month_tabs:
+        month_name = source_name.upper()
+
+        # Reuse a month-specific variant (e.g. AUG 2026) if present.
+        destination_sheet_name = None
+        for existing in dest_wb.sheetnames:
+            norm = _ancillary_normalize_drive_name(existing)
+            if norm == month_name or norm.startswith(month_name + " "):
+                destination_sheet_name = existing
+                break
+
+        if destination_sheet_name:
+            insert_at = dest_wb.sheetnames.index(
+                destination_sheet_name
+            )
+            del dest_wb[destination_sheet_name]
+            final_name = destination_sheet_name
+        else:
+            insert_at = next(
+                (
+                    i for i, name in enumerate(dest_wb.sheetnames)
+                    if "PIVOT" in str(name).upper()
+                ),
+                len(dest_wb.sheetnames),
+            )
+            final_name = month_name
+
+        dst_ws = dest_wb.create_sheet(final_name, insert_at)
+        _ancillary_copy_generated_sheet(
+            generated_wb[source_name],
+            dst_ws,
+        )
+        inserted.append(final_name)
+
+    out = io.BytesIO()
+    dest_wb.save(out)
+    return out.getvalue(), inserted
+
+
+def drive_create_excel_file(
+    service,
+    folder_id,
+    file_bytes,
+    file_name,
+):
+    """Create a new xlsx workbook in an existing Drive folder."""
+    media = MediaIoBaseUpload(
+        io.BytesIO(file_bytes),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        resumable=True,
+    )
+    created = service.files().create(
+        body={
+            "name": file_name,
+            "parents": [folder_id],
+        },
+        media_body=media,
+        fields="id,name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    return created
+
 
 
 def _ancillary_month_sheet_name(wb, report_month):
@@ -5554,65 +5738,6 @@ def ancillary_insert_report_sheet(
     out = io.BytesIO()
     dest_wb.save(out)
     return out.getvalue(), sheet_name
-
-
-def hilton_ancillary_merge_month_sheets(
-    destination_bytes,
-    generated_bytes,
-    report_months,
-    destination_name="",
-):
-    """Replace selected Hilton month tabs inside an existing annual workbook.
-
-    Only the selected month sheets are changed.  Every unselected month and
-    any supporting tabs already in the destination workbook are preserved.
-    """
-    keep_vba = str(destination_name or "").lower().endswith(".xlsm")
-    dest_wb = openpyxl.load_workbook(
-        io.BytesIO(destination_bytes),
-        data_only=False,
-        keep_vba=keep_vba,
-    )
-    generated_wb = openpyxl.load_workbook(
-        io.BytesIO(generated_bytes),
-        data_only=False,
-    )
-
-    written_sheets = []
-    for report_month in sorted(report_months):
-        source_name = report_month.strftime("%b").upper()
-        if source_name not in generated_wb.sheetnames:
-            raise ValueError(
-                f"Generated Hilton workbook has no {source_name} sheet."
-            )
-
-        destination_sheet = _ancillary_month_sheet_name(
-            dest_wb,
-            report_month,
-        )
-        if destination_sheet in dest_wb.sheetnames:
-            insert_at = dest_wb.sheetnames.index(destination_sheet)
-            del dest_wb[destination_sheet]
-        else:
-            insert_at = next(
-                (
-                    i
-                    for i, name in enumerate(dest_wb.sheetnames)
-                    if any(token in name.upper() for token in ("PIVOT", "RAW", "CONTROL"))
-                ),
-                len(dest_wb.sheetnames),
-            )
-
-        dst_ws = dest_wb.create_sheet(destination_sheet, insert_at)
-        _ancillary_copy_generated_sheet(
-            generated_wb[source_name],
-            dst_ws,
-        )
-        written_sheets.append(destination_sheet)
-
-    out = io.BytesIO()
-    dest_wb.save(out)
-    return out.getvalue(), written_sheets
 
 
 def drive_find_month_folder(service, parent_id: str, month_kw: str):
@@ -15368,11 +15493,6 @@ with tab_ancillary:
             "Each file can contain every month selected above. The tool "
             "splits NOR1 by Report Date and Lobby by Stay Date."
         )
-        st.info(
-            "When you run this, the app will update the selected hotel's "
-            "existing NOR1 Upsell Report in its Ancillary Revenue folder. "
-            "Only the selected monthly sheets will be replaced."
-        )
 
         gc1, gc2, gc3 = st.columns(3)
 
@@ -15397,14 +15517,7 @@ with tab_ancillary:
                 key="har_nor1_stly_grouped",
             )
 
-        selected_years = sorted({month.year for month in har_months})
-        if len(selected_years) > 1:
-            st.warning(
-                "Choose months from one calendar year at a time. Each annual "
-                "NOR1 Upsell Report uses month-only sheet names such as JAN and FEB."
-            )
-
-        all_ready = len(selected_years) == 1 and all([
+        all_ready = bool(har_months) and all([
             har_nor1_current is not None,
             har_lobby is not None,
             har_nor1_stly is not None,
@@ -15425,17 +15538,14 @@ with tab_ancillary:
             })
 
         if st.button(
-            "Build and Update Hilton Ancillary Workbook",
+            "Build Hilton Ancillary Workbook",
             type="primary",
             key="har_build_multi",
             disabled=not all_ready,
             use_container_width=True,
         ):
-            har_output = None
             try:
-                with st.spinner(
-                    "Building monthly sheets and updating the Hilton workbook in Drive..."
-                ):
+                with st.spinner("Building Hilton ancillary workbook..."):
                     har_output, har_summaries = (
                         hilton_ancillary_build_multi_month_report(
                             property_name=har_property,
@@ -15459,74 +15569,101 @@ with tab_ancillary:
                         f"{year_label} {har_property} NOR1 Upsell Report.xlsx"
                     )
 
-                    svc = get_drive_service()
-                    discovered = dict(get_hotels_from_drive())
-                    hotel_id = discovered.get(har_property, "")
+                    # Save/merge the generated month tabs into the hotel's
+                    # existing Hilton ancillary workbook in Drive.
+                    drive_status = None
+                    drive_warning = None
+                    try:
+                        svc = get_drive_service()
+                        discovered = dict(get_hotels_from_drive())
+                        hotel_id = discovered.get(har_property, "")
 
-                    target, target_err = hilton_ancillary_find_drive_report(
-                        svc,
-                        hotel_id,
-                        har_property,
-                        report_year=selected_years[0],
-                    )
-                    if target_err or not target:
-                        raise ValueError(
-                            target_err
-                            or "The Hilton NOR1 Upsell Report workbook was not found."
+                        if not hotel_id:
+                            raise ValueError(
+                                f"Could not find {har_property}'s Drive folder "
+                                f"with the current Drive connection."
+                            )
+
+                        reference_month = max(
+                            item["report_month"]
+                            for item in month_uploads
+                        )
+                        target, target_err = (
+                            hilton_ancillary_find_drive_report(
+                                svc,
+                                hotel_id,
+                                har_property,
+                                reference_month,
+                            )
+                        )
+                        if target_err or not target:
+                            raise ValueError(
+                                target_err
+                                or "Hilton ancillary Drive folder not found."
+                            )
+
+                        if target.get("file_id"):
+                            original_bytes = drive_download(
+                                svc,
+                                target["file_id"],
+                            )
+                            merged_bytes, inserted_tabs = (
+                                hilton_ancillary_merge_month_sheets(
+                                    original_bytes,
+                                    har_output,
+                                    destination_name=target["file_name"],
+                                )
+                            )
+                            drive_upload(
+                                svc,
+                                target["file_id"],
+                                merged_bytes,
+                                target["file_name"],
+                            )
+                            drive_status = (
+                                f"Updated **{target['file_name']}** in "
+                                f"**{target['folder_name']}** with "
+                                f"{', '.join(inserted_tabs)}."
+                            )
+                        else:
+                            created = drive_create_excel_file(
+                                svc,
+                                target["folder_id"],
+                                har_output,
+                                st.session_state["har_filename"],
+                            )
+                            drive_status = (
+                                f"Created **{created.get('name', st.session_state['har_filename'])}** "
+                                f"in **{target['folder_name']}**."
+                            )
+
+                    except Exception as drive_exc:
+                        drive_warning = (
+                            "Hilton ancillary report was not updated in Drive: "
+                            f"{drive_exc}\n\n"
+                            "The monthly workbook was still built successfully. "
+                            "You can download it below while the Drive target "
+                            "is corrected."
                         )
 
-                    original_bytes = drive_download(
-                        svc,
-                        target["file_id"],
-                    )
-                    merged_bytes, written_sheets = (
-                        hilton_ancillary_merge_month_sheets(
-                            destination_bytes=original_bytes,
-                            generated_bytes=har_output,
-                            report_months=[
-                                item["report_month"]
-                                for item in month_uploads
-                            ],
-                            destination_name=target["file_name"],
-                        )
-                    )
-
-                    # Retain the original bytes for a one-click rollback.
-                    st.session_state["har_drive_undo"] = {
-                        "file_id": target["file_id"],
-                        "file_name": target["file_name"],
-                        "bytes": original_bytes,
-                    }
-
-                    drive_upload(
-                        svc,
-                        target["file_id"],
-                        merged_bytes,
-                        target["file_name"],
-                    )
-
-                    st.session_state["har_output"] = merged_bytes
-                    st.session_state["har_filename"] = target["file_name"]
-                    st.session_state["har_drive_target"] = {
-                        "file_name": target["file_name"],
-                        "folder_name": target["folder_name"],
-                        "sheets": written_sheets,
-                    }
+                    st.session_state["har_drive_status"] = drive_status
+                    st.session_state["har_drive_warning"] = drive_warning
 
                 st.success(
-                    f"Updated **{target['file_name']}** in "
-                    f"**{target['folder_name']}**. Monthly sheets updated: "
-                    f"**{', '.join(written_sheets)}**."
+                    f"Built {len(har_summaries)} Hilton month tab(s). "
+                    "Front Desk and Expired Revenue cells are ready for "
+                    "manual entry in the downloaded workbook."
                 )
+
+                if st.session_state.get("har_drive_status"):
+                    st.success(st.session_state["har_drive_status"])
+
+                if st.session_state.get("har_drive_warning"):
+                    st.warning(st.session_state["har_drive_warning"])
             except Exception as e:
                 st.error(
-                    f"Hilton ancillary report was not updated in Drive: {e}"
+                    f"Hilton ancillary report build error: {e}"
                 )
-                if har_output is not None:
-                    st.warning(
-                        "The monthly workbook was still built successfully. "
-                        "You can download it below while the Drive target is corrected."
-                    )
 
         if "har_output" in st.session_state:
             summaries = st.session_state.get("har_summaries", [])
@@ -15562,55 +15699,17 @@ with tab_ancillary:
                             f"{hs['month']:%b %Y}: {warning}"
                         )
 
-            download_col, undo_col = st.columns(2)
-            with download_col:
-                st.download_button(
-                    "Download Hilton Ancillary Workbook",
-                    data=st.session_state["har_output"],
-                    file_name=st.session_state["har_filename"],
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet"
-                    ),
-                    key="har_download_multi",
-                    use_container_width=True,
-                )
-
-            with undo_col:
-                if st.button(
-                    "↩ Undo Last Hilton Drive Update",
-                    key="har_undo_drive",
-                    type="secondary",
-                    use_container_width=True,
-                    disabled=not bool(
-                        st.session_state.get("har_drive_undo")
-                    ),
-                ):
-                    try:
-                        undo = st.session_state["har_drive_undo"]
-                        drive_upload(
-                            get_drive_service(),
-                            undo["file_id"],
-                            undo["bytes"],
-                            undo["file_name"],
-                        )
-                        st.session_state.pop("har_drive_undo", None)
-                        st.session_state.pop("har_drive_target", None)
-                        st.success(
-                            "Restored the Hilton ancillary workbook to its previous version."
-                        )
-                        st.rerun()
-                    except Exception as e:
-                        st.error(
-                            f"Could not undo the Hilton Drive update: {e}"
-                        )
-
-            if st.session_state.get("har_drive_target"):
-                target_info = st.session_state["har_drive_target"]
-                st.caption(
-                    f"Last Drive update: **{target_info['file_name']}** → "
-                    f"{', '.join(target_info['sheets'])}"
-                )
+            st.download_button(
+                "Download Hilton Ancillary Workbook",
+                data=st.session_state["har_output"],
+                file_name=st.session_state["har_filename"],
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key="har_download_multi",
+                use_container_width=True,
+            )
     else:
         st.markdown("### SNT / Independent Hotels")
         st.caption(
