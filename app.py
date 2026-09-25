@@ -5262,117 +5262,112 @@ def hilton_ancillary_find_drive_report(
     hotel_name,
     report_month,
 ):
-    """Find the Hilton ancillary workbook without requiring one exact filename.
+    """Find the Hilton ancillary workbook under one or more hotel Drive roots.
 
-    Folder:
-      Ancillary Revenue Reports / Ancillary Revenue Files anywhere under the
-      hotel's Drive tree.
-
-    Workbook selection:
-      1) Prefer Excel files whose names look like an ancillary / NOR1 / upsell
-         report for the hotel.
-      2) If the folder contains exactly one plausible Excel workbook, use it
-         even when the filename is unconventional.
-      3) Ignore obvious raw-source / weekly-report files.
-
-    Returns a target dict even when no workbook exists yet; in that case
-    file_id is None and the caller may create the new Hilton workbook in the
-    resolved ancillary folder.
+    hotel_id may be a normal Drive folder ID or the app's existing
+    MULTI:<id>,<id>,... grouped-folder value. Every real folder ID is searched
+    separately; the MULTI string itself is never sent to Google Drive.
     """
-    year_kw = str(report_month.year)
-    month_kw = report_month.strftime("%b").upper()
-    rev_id, rev_name = _find_rev_reports_folder_for_year(
-        service,
-        hotel_id,
-        year_kw,
-        month_kw,
-    )
+    if str(hotel_id or "").startswith(MULTI_ID_PREFIX):
+        root_ids = [
+            rid.strip()
+            for rid in str(hotel_id)[len(MULTI_ID_PREFIX):].split(",")
+            if rid.strip()
+        ]
+    else:
+        root_ids = [str(hotel_id or "").strip()]
+
+    root_ids = [rid for rid in root_ids if rid]
+    if not root_ids:
+        return None, f"No Drive folder IDs were found for {hotel_name}."
 
     ancillary_folders = []
-    frontier = [(hotel_id, 0)]
-    visited = set()
 
-    # Search several levels below the hotel root for the ancillary folder.
-    while frontier:
-        parent_id, depth = frontier.pop(0)
-        if parent_id in visited or depth > 5:
-            continue
-        visited.add(parent_id)
+    # Search each real hotel root independently. This mirrors the app's
+    # existing MULTI folder handling used by ROB/Forecast/Strategy lookups.
+    for root_id in root_ids:
+        frontier = [(root_id, 0)]
+        visited = set()
 
-        q = (
-            "mimeType='application/vnd.google-apps.folder' "
-            f"and trashed=false and '{parent_id}' in parents"
-        )
-        page_token = None
+        while frontier:
+            parent_id, depth = frontier.pop(0)
+            if parent_id in visited or depth > 5:
+                continue
+            visited.add(parent_id)
 
-        while True:
-            resp = service.files().list(
-                q=q,
-                fields=(
-                    "nextPageToken,"
-                    "files(id,name,modifiedTime,parents)"
-                ),
-                pageSize=200,
-                pageToken=page_token,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute()
+            q = (
+                "mimeType='application/vnd.google-apps.folder' "
+                f"and trashed=false and '{parent_id}' in parents"
+            )
+            page_token = None
 
-            for f in resp.get("files", []):
-                fid = f.get("id")
-                if not fid:
-                    continue
+            try:
+                while True:
+                    resp = service.files().list(
+                        q=q,
+                        fields=(
+                            "nextPageToken,"
+                            "files(id,name,modifiedTime,parents)"
+                        ),
+                        pageSize=200,
+                        pageToken=page_token,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute()
 
-                norm = _ancillary_normalize_drive_name(
-                    f.get("name")
-                )
-                if (
-                    "ANCILLARY REVENUE REPORTS" in norm
-                    or "ANCILLARY REVENUE FILES" in norm
-                ):
-                    ancillary_folders.append({
-                        **f,
-                        "_depth": depth + 1,
-                    })
-                else:
-                    frontier.append((fid, depth + 1))
+                    for f in resp.get("files", []):
+                        fid = f.get("id")
+                        if not fid:
+                            continue
 
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+                        norm = _ancillary_normalize_drive_name(
+                            f.get("name")
+                        )
+                        if (
+                            "ANCILLARY REVENUE REPORTS" in norm
+                            or "ANCILLARY REVENUE FILES" in norm
+                            or (
+                                "ANCILLARY" in norm
+                                and "REVENUE" in norm
+                            )
+                        ):
+                            ancillary_folders.append({
+                                **f,
+                                "_depth": depth + 1,
+                                "_root_id": root_id,
+                            })
+                        else:
+                            frontier.append((fid, depth + 1))
+
+                    page_token = resp.get("nextPageToken")
+                    if not page_token:
+                        break
+            except Exception:
+                # One stale/inaccessible candidate root should not prevent
+                # searching the other roots in a MULTI mapping.
+                continue
 
     if not ancillary_folders:
         return None, (
-            f"No folder containing 'Ancillary Revenue Reports' or "
-            f"'Ancillary Revenue Files' was found in "
-            f"{hotel_name}'s Drive tree."
+            f"No ancillary revenue folder was found in any of "
+            f"{hotel_name}'s Drive locations."
         )
 
+    # Prefer the shallowest ancillary folder; among ties prefer most recently
+    # modified. Then test each candidate until the workbook is found.
     ancillary_folders.sort(
         key=lambda f: (
             f.get("_depth", 99),
-            str(f.get("modifiedTime", "")),
+            -int(
+                re.sub(
+                    r"\D",
+                    "",
+                    str(f.get("modifiedTime", "")),
+                )[:14]
+                or "0"
+            ),
         )
     )
-    min_depth = ancillary_folders[0].get("_depth", 99)
-    same_depth = [
-        f for f in ancillary_folders
-        if f.get("_depth", 99) == min_depth
-    ]
-    same_depth.sort(
-        key=lambda f: str(f.get("modifiedTime", "")),
-        reverse=True,
-    )
-    anc_folder = same_depth[0]
-
-    q = f"trashed=false and '{anc_folder['id']}' in parents"
-    files = service.files().list(
-        q=q,
-        fields="files(id,name,mimeType,modifiedTime)",
-        pageSize=200,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
 
     excel_mimes = {
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5390,7 +5385,6 @@ def hilton_ancillary_find_drive_report(
         "MCAT",
         "FORECAST",
         "STRATEGY",
-        " ROB ",
     )
 
     hotel_norm = _ancillary_normalize_drive_name(hotel_name)
@@ -5401,102 +5395,111 @@ def hilton_ancillary_find_drive_report(
     inn_code = HILTON_INNCODES.get(hotel_name, "")
     inn_norm = _ancillary_normalize_drive_name(inn_code)
 
-    plausible = []
-    for f in files:
-        if f.get("mimeType") == "application/vnd.google-apps.folder":
+    best_candidates = []
+
+    for anc_folder in ancillary_folders:
+        q = f"trashed=false and '{anc_folder['id']}' in parents"
+
+        try:
+            files = service.files().list(
+                q=q,
+                fields="files(id,name,mimeType,modifiedTime)",
+                pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
+        except Exception:
             continue
 
-        name = str(f.get("name") or "")
-        norm = _ancillary_normalize_drive_name(name)
-        ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+        plausible = []
+        for f in files:
+            if f.get("mimeType") == "application/vnd.google-apps.folder":
+                continue
 
-        is_excel = (
-            f.get("mimeType") in excel_mimes
-            or ext in ("xlsx", "xlsm")
-        )
-        if not is_excel:
-            continue
+            name = str(f.get("name") or "")
+            norm = _ancillary_normalize_drive_name(name)
+            ext = (
+                name.lower().rsplit(".", 1)[-1]
+                if "." in name
+                else ""
+            )
 
-        if any(ex in f" {norm} " for ex in raw_excludes):
-            continue
+            is_excel = (
+                f.get("mimeType") in excel_mimes
+                or ext in ("xlsx", "xlsm")
+            )
+            if not is_excel:
+                continue
 
-        score = 0
-        if "ANCILLARY" in norm:
-            score += 8
-        if "NOR1" in norm:
-            score += 8
-        if "UPSELL" in norm:
-            score += 7
-        if "REPORT" in norm:
-            score += 4
-        if str(report_month.year) in norm:
-            score += 2
-        if inn_norm and inn_norm in norm:
-            score += 6
+            if any(ex in norm for ex in raw_excludes):
+                continue
 
-        matched_hotel_tokens = sum(
-            1 for token in hotel_tokens
-            if token in norm
-        )
-        score += matched_hotel_tokens * 2
+            score = 0
 
-        plausible.append({
-            **f,
-            "_score": score,
-        })
+            # Exact known naming pattern gets highest confidence.
+            # Example: "2026 Kansas City NOR1 Upsell report"
+            if "NOR1" in norm:
+                score += 12
+            if "UPSELL" in norm:
+                score += 10
+            if "REPORT" in norm:
+                score += 6
+            if "ANCILLARY" in norm:
+                score += 5
+            if str(report_month.year) in norm:
+                score += 3
+            if inn_norm and inn_norm in norm:
+                score += 8
 
-    if not plausible:
-        # Folder is valid but there is no existing workbook yet.
-        return {
-            "file_id": None,
-            "file_name": None,
-            "mime_type": "",
-            "folder_id": anc_folder["id"],
-            "folder_name": anc_folder["name"],
-            "revenue_folder_id": rev_id,
-            "revenue_folder_name": (
-                rev_name
-                or f"{report_month.year} Revenue Reports"
-            ),
-        }, None
+            matched_hotel_tokens = sum(
+                1 for token in hotel_tokens
+                if token in norm
+            )
+            score += matched_hotel_tokens * 3
 
-    # Strong keyword/name match wins.
-    scored = [f for f in plausible if f["_score"] > 0]
+            plausible.append({
+                **f,
+                "_score": score,
+                "_folder": anc_folder,
+            })
 
-    if scored:
-        scored.sort(
+        if plausible:
+            scored = [f for f in plausible if f["_score"] > 0]
+            if scored:
+                best_candidates.extend(scored)
+            elif len(plausible) == 1:
+                # Unconventional filename, but only one Excel workbook in the
+                # hotel's ancillary folder.
+                best_candidates.append(plausible[0])
+
+    if best_candidates:
+        best_candidates.sort(
             key=lambda f: (
-                f["_score"],
+                f.get("_score", 0),
                 str(f.get("modifiedTime", "")),
             ),
             reverse=True,
         )
-        target = scored[0]
-    elif len(plausible) == 1:
-        # Safe fallback for unconventional naming: one Excel workbook in the
-        # hotel's ancillary folder is almost certainly the intended report.
-        target = plausible[0]
-    else:
-        names = ", ".join(
-            sorted(str(f.get("name") or "") for f in plausible)[:8]
-        )
-        return None, (
-            f"{anc_folder['name']} contains multiple Excel workbooks, but "
-            f"none can be identified confidently as the Hilton ancillary "
-            f"report. Files found: {names}"
-        )
+        target = best_candidates[0]
+        anc_folder = target["_folder"]
 
+        return {
+            "file_id": target["id"],
+            "file_name": target["name"],
+            "mime_type": target.get("mimeType", ""),
+            "folder_id": anc_folder["id"],
+            "folder_name": anc_folder["name"],
+        }, None
+
+    # Ancillary folder exists, but no existing workbook was found. Return the
+    # first valid folder so the caller can create the report there.
+    anc_folder = ancillary_folders[0]
     return {
-        "file_id": target["id"],
-        "file_name": target["name"],
-        "mime_type": target.get("mimeType", ""),
+        "file_id": None,
+        "file_name": None,
+        "mime_type": "",
         "folder_id": anc_folder["id"],
         "folder_name": anc_folder["name"],
-        "revenue_folder_id": rev_id,
-        "revenue_folder_name": (
-            rev_name
-            or f"{report_month.year} Revenue Reports"
-        ),
     }, None
 
 
