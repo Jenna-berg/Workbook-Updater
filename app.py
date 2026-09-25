@@ -10784,6 +10784,19 @@ def _hilton_ancillary_add_month_sheet(
                 wrap_text=True,
             )
 
+    _hilton_apply_existing_report_format(
+        ws=ws,
+        main_rows=main_rows,
+        current_start=current_start,
+        current_total_row=current_total_row,
+        stly_start=stly_start,
+        stly_total_row=stly_total_row,
+        variance_start=variance_start,
+        variance_total_row=variance_total_row,
+        front_desk_years=front_desk_years,
+        parking_row=(p_row if parking else None),
+    )
+
     expected_inn = HILTON_INNCODES.get(property_name)
     warnings = []
     if (
@@ -10809,6 +10822,352 @@ def _hilton_ancillary_add_month_sheet(
         "stlyTotalCount": sum(r["count"] for r in stly_rows),
         "stlyTotalRevenue": sum(r["revenue"] for r in stly_rows),
     }
+
+
+def _hilton_apply_existing_report_format(
+    ws,
+    main_rows,
+    current_start,
+    current_total_row,
+    stly_start,
+    stly_total_row,
+    variance_start,
+    variance_total_row,
+    front_desk_years,
+    parking_row=None,
+):
+    """Match the established Hilton ancillary workbook formatting.
+
+    Calibrated against the existing Kansas City Hilton report tabs:
+      - A1:E1 dark Hilton blue title
+      - A2:E2 red year bar
+      - section titles (STLY / Variance) merged A:E with red fill
+      - header rows dark Hilton blue with centered white text
+      - Lobby item names use lighter blue; NOR1/variance item names dark blue
+      - data cells B:E use light gray fill
+      - totals use dark blue A cell + gray totals cells
+      - Front Desk table begins at H4:I4
+      - no generic borders
+    """
+    from copy import copy
+
+    BLUE = "1155CC"
+    LIGHT_BLUE = "3C78D8"
+    DARK_BLUE = "1C4587"
+    RED = "980000"
+    GRAY = "F3F3F3"
+    GREEN = "B6D7A8"
+    WHITE = "FFFFFF"
+
+    currency_fmt = (
+        '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);'
+        '_("$"* "-"??_);_(@_)'
+    )
+
+    no_border = Border()
+
+    # Column widths from the existing Hilton workbook.
+    widths = {
+        "A": 36.13,
+        "B": 11.13,
+        "C": 12.50,
+        "D": 14.63,
+        "E": 14.50,
+        "F": 12.63,
+        "G": 13.00,
+        "H": 13.00,
+        "I": 22.13,
+        "J": 13.00,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    # Remove all existing merges first, then restore the established layout.
+    for rng in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(rng))
+
+    ws.merge_cells("A1:E1")
+    ws.merge_cells("A2:E2")
+
+    # Find section-title rows by their labels.
+    stly_title_row = None
+    variance_title_row = None
+    for r in range(1, ws.max_row + 1):
+        label = str(ws.cell(r, 1).value or "").strip().upper()
+        if label == "STLY":
+            stly_title_row = r
+        elif label == "VARIANCE":
+            variance_title_row = r
+
+    if stly_title_row:
+        ws.merge_cells(
+            start_row=stly_title_row,
+            start_column=1,
+            end_row=stly_title_row,
+            end_column=5,
+        )
+    if variance_title_row:
+        ws.merge_cells(
+            start_row=variance_title_row,
+            start_column=1,
+            end_row=variance_title_row,
+            end_column=5,
+        )
+
+    # Base body alignment/borders.
+    for row in ws.iter_rows(
+        min_row=1,
+        max_row=ws.max_row,
+        min_col=1,
+        max_col=10,
+    ):
+        for cell in row:
+            cell.border = no_border
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="bottom",
+                wrap_text=False,
+            )
+
+    # Title.
+    for c in range(1, 6):
+        cell = ws.cell(1, c)
+        cell.fill = PatternFill("solid", fgColor=BLUE)
+    ws["A1"].font = Font(
+        name="Calibri",
+        size=11,
+        bold=True,
+        color=WHITE,
+    )
+    ws["A1"].alignment = Alignment(
+        horizontal="center",
+        vertical="bottom",
+    )
+
+    # Year bar.
+    for c in range(1, 6):
+        ws.cell(2, c).fill = PatternFill("solid", fgColor=RED)
+    ws["A2"].font = Font(
+        name="Calibri",
+        size=13,
+        bold=True,
+        color=WHITE,
+    )
+    ws["A2"].alignment = Alignment(
+        horizontal="center",
+        vertical="bottom",
+    )
+
+    # Main/STLY/Variance headers.
+    header_rows = [3]
+    if stly_title_row:
+        header_rows.append(stly_title_row + 1)
+    if variance_title_row:
+        header_rows.append(variance_title_row + 1)
+
+    for r in header_rows:
+        for c in range(1, 6):
+            cell = ws.cell(r, c)
+            cell.fill = PatternFill("solid", fgColor=BLUE)
+            cell.font = Font(
+                name="Calibri",
+                size=11,
+                bold=True,
+                color=WHITE,
+            )
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="bottom",
+            )
+            if c >= 3:
+                cell.number_format = currency_fmt
+
+    # Section bars.
+    for r in (stly_title_row, variance_title_row):
+        if not r:
+            continue
+        for c in range(1, 6):
+            ws.cell(r, c).fill = PatternFill("solid", fgColor=RED)
+        ws.cell(r, 1).font = Font(
+            name="Calibri",
+            size=13,
+            bold=True,
+            color=WHITE,
+        )
+        ws.cell(r, 1).alignment = Alignment(
+            horizontal="center",
+            vertical="bottom",
+        )
+
+    # Current rows: distinguish Lobby from NOR1.
+    for offset, item in enumerate(main_rows):
+        r = current_start + offset
+        source = str(item.get("source") or "").upper()
+        name_fill = LIGHT_BLUE if source == "LOBBY" else DARK_BLUE
+
+        ws.cell(r, 1).fill = PatternFill("solid", fgColor=name_fill)
+        ws.cell(r, 1).font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        ws.cell(r, 1).alignment = Alignment(
+            horizontal="center",
+            vertical="bottom",
+        )
+
+        for c in range(2, 6):
+            cell = ws.cell(r, c)
+            cell.fill = PatternFill("solid", fgColor=GRAY)
+            cell.font = Font(name="Calibri")
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="bottom",
+            )
+
+        ws.cell(r, 2).number_format = "General"
+        for c in (3, 4, 5):
+            ws.cell(r, c).number_format = currency_fmt
+
+    # STLY rows are NOR1 rows.
+    for r in range(stly_start, stly_total_row):
+        ws.cell(r, 1).fill = PatternFill("solid", fgColor=DARK_BLUE)
+        ws.cell(r, 1).font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        for c in range(2, 6):
+            ws.cell(r, c).fill = PatternFill("solid", fgColor=GRAY)
+            ws.cell(r, c).font = Font(name="Calibri")
+        ws.cell(r, 2).number_format = "General"
+        for c in (3, 4, 5):
+            ws.cell(r, c).number_format = currency_fmt
+
+    # Variance rows.
+    for r in range(variance_start, variance_total_row):
+        ws.cell(r, 1).fill = PatternFill("solid", fgColor=DARK_BLUE)
+        ws.cell(r, 1).font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        for c in range(2, 6):
+            ws.cell(r, c).fill = PatternFill("solid", fgColor=GRAY)
+            ws.cell(r, c).font = Font(name="Calibri")
+        ws.cell(r, 2).number_format = "General"
+        for c in (3, 4, 5):
+            ws.cell(r, c).number_format = currency_fmt
+
+    # Totals rows.
+    for r in (current_total_row, stly_total_row, variance_total_row):
+        ws.cell(r, 1).fill = PatternFill("solid", fgColor=DARK_BLUE)
+        ws.cell(r, 1).font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        for c in range(2, 6):
+            ws.cell(r, c).fill = PatternFill("solid", fgColor=GRAY)
+            ws.cell(r, c).font = Font(name="Calibri")
+        ws.cell(r, 2).number_format = "General"
+        for c in (3, 4, 5):
+            ws.cell(r, c).number_format = currency_fmt
+
+    # Variance expired total uses the existing green highlight.
+    ws.cell(variance_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=GREEN,
+    )
+
+    # Move/rebuild Front Desk table to H4:I8 to match existing Hilton tabs.
+    # Clear any generic H3:I8 output first.
+    for r in range(3, 10):
+        for c in (8, 9):
+            ws.cell(r, c).value = None
+            ws.cell(r, c).fill = PatternFill(fill_type=None)
+            ws.cell(r, c).font = Font(name="Arial", size=10)
+            ws.cell(r, c).number_format = "General"
+            ws.cell(r, c).alignment = Alignment()
+
+    ws["H4"] = "Year"
+    ws["I4"] = "Front Desk Upsell Revenue"
+    for coord in ("H4", "I4"):
+        cell = ws[coord]
+        cell.fill = PatternFill("solid", fgColor=BLUE)
+        cell.font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="bottom",
+        )
+        cell.number_format = currency_fmt
+
+    for idx, year in enumerate(front_desk_years, start=5):
+        ws.cell(idx, 8, str(year))
+        ws.cell(idx, 9, None)
+        ws.cell(idx, 8).fill = PatternFill("solid", fgColor=GRAY)
+        ws.cell(idx, 9).fill = PatternFill("solid", fgColor=GRAY)
+        ws.cell(idx, 8).font = Font(name="Calibri")
+        ws.cell(idx, 9).font = Font(name="Calibri")
+        ws.cell(idx, 8).alignment = Alignment(
+            horizontal="center",
+            vertical="bottom",
+        )
+        ws.cell(idx, 9).alignment = Alignment(
+            horizontal="center",
+            vertical="bottom",
+        )
+        ws.cell(idx, 8).number_format = "@"
+        ws.cell(idx, 9).number_format = currency_fmt
+
+    # Keep manually entered Expired Revenue cells visually consistent with
+    # the existing report instead of yellow helper highlighting.
+    ws.cell(current_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=GRAY,
+    )
+    ws.cell(stly_total_row, 5).fill = PatternFill(
+        "solid",
+        fgColor=GRAY,
+    )
+
+    # If Self-Parking is kept as a separate side table, make it look like the
+    # rest of the workbook rather than the generic bordered block.
+    if parking_row:
+        ws.cell(parking_row, 8).fill = PatternFill(
+            "solid",
+            fgColor=LIGHT_BLUE,
+        )
+        ws.cell(parking_row, 8).font = Font(
+            name="Calibri",
+            size=11,
+            bold=True,
+            color=WHITE,
+        )
+        for c in (9, 10):
+            ws.cell(parking_row, c).fill = PatternFill(
+                "solid",
+                fgColor=GRAY,
+            )
+            ws.cell(parking_row, c).font = Font(name="Calibri")
+            ws.cell(parking_row, c).alignment = Alignment(
+                horizontal="center",
+                vertical="bottom",
+            )
+        ws.cell(parking_row, 9).number_format = "General"
+        ws.cell(parking_row, 10).number_format = currency_fmt
+
+    ws.freeze_panes = None
+
 
 
 def hilton_ancillary_build_multi_month_report(
