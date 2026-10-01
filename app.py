@@ -5165,6 +5165,95 @@ def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_mon
     return search_recursive(rev_id)
 
 
+def drive_find_regular_rob_file(
+    service,
+    parent_id,
+    month_date=None,
+):
+    """Find the normal monthly ROB, excluding other tracked-year ROBs.
+
+    Example in an OCT2025 folder:
+      OCT2025 ROB WEIRTON.xlsx       -> normal 2025 ROB
+      2026 ROB OCT2025 WEIRTON.xlsx  -> historical/next-year 2026 ROB
+
+    The generic old lookup could return either one based on Drive list order.
+    """
+    q = (
+        f"'{parent_id}' in parents and trashed = false and "
+        "(mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType = 'application/vnd.ms-excel.sheet.macroenabled.12' "
+        "or mimeType = 'application/vnd.google-apps.spreadsheet')"
+    )
+    files = service.files().list(
+        q=q,
+        fields="files(id,name,modifiedTime)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    target_year = month_date.year if month_date else None
+    month_kw = (
+        month_date.strftime("%b%Y").upper()
+        if month_date else ""
+    )
+
+    candidates = []
+    for f in files:
+        name = str(f.get("name") or "")
+        upper = name.upper()
+
+        if "ROB" not in upper:
+            continue
+        if "MASTER" in upper or "COPY" in upper:
+            continue
+
+        leading = re.match(
+            r"^\s*(20\d{2})\s+ROB\b",
+            upper,
+            flags=re.I,
+        )
+        leading_year = int(leading.group(1)) if leading else None
+
+        # A year-prefixed file for another tracked year is the special
+        # next-year/historical ROB, not the normal ROB for this month.
+        if (
+            target_year is not None
+            and leading_year is not None
+            and leading_year != target_year
+        ):
+            continue
+
+        score = 0
+        if month_kw and upper.startswith(month_kw):
+            score += 100
+        elif month_kw and month_kw in upper:
+            score += 70
+
+        # Prefer the conventional non-year-prefixed monthly ROB.
+        if leading_year is None:
+            score += 20
+        elif leading_year == target_year:
+            score += 10
+
+        candidates.append((
+            score,
+            str(f.get("modifiedTime") or ""),
+            f,
+        ))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(
+        key=lambda x: (x[0], x[1]),
+        reverse=True,
+    )
+    best = candidates[0][2]
+    return best["id"], best["name"]
+
+
+
 def drive_find_file(service, keyword, parent_id):
     """Return (file_id, file_name) for first xlsx whose name contains keyword,
     excluding files whose name also contains 'copy' (to skip backup copies).
@@ -6040,6 +6129,38 @@ def find_rob_master(service, hotel_id: str, target_year=None):
     return best["id"], best["name"]
 
 
+def _set_rob_year_headers(wb, tracked_year):
+    """Set ROB year columns to the correct rolling four-year window."""
+    wk_one_name = ROB_SHEETS[0]
+    if wk_one_name not in wb.sheetnames:
+        return
+
+    wk1 = wb[wk_one_name]
+    years = [
+        tracked_year - 3,
+        tracked_year - 2,
+        tracked_year - 1,
+        tracked_year,
+    ]
+
+    for col, year in zip(range(2, 6), years):
+        if _rob_cell_is_writable(wk1, 3, col):
+            wk1.cell(3, col).value = year
+
+    for sheet_name in ROB_SHEETS[1:]:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for col in range(2, 6):
+            if not _rob_cell_is_writable(ws, 3, col):
+                continue
+            letter = openpyxl.utils.get_column_letter(col)
+            ws.cell(3, col).value = (
+                f"='{wk_one_name}'!{letter}3"
+            )
+
+
+
 def _is_rob_month_blank(ws, block_start):
     """Return True if cols 2,3,4 of the Revenue row are all empty (None, '', or formula)."""
     rev_row = block_start + 1
@@ -6740,6 +6861,52 @@ def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
 
 
 
+def _rob_seed_historical_columns(
+    source_ws,
+    dest_ws,
+):
+    """Copy source C:E into destination B:D for all ROB months.
+
+    A comparable prior-year ROB carries the prior four-year stack. The new
+    month's ROB needs the most recent three historical years, so shifting
+    source C/D/E -> destination B/C/D is deterministic and preserves the
+    remaining months' prior-year totals.
+    """
+    if source_ws is None or dest_ws is None:
+        return 0
+
+    copied = 0
+    source_blocks = rob_month_blocks(source_ws)
+    dest_blocks = rob_month_blocks(dest_ws)
+
+    for month_idx in range(12):
+        src_labels = source_blocks.get(month_idx, {})
+        dst_labels = dest_blocks.get(month_idx, {})
+        if not src_labels or not dst_labels:
+            continue
+
+        for label in _ROB_BASE_METRIC_LABELS:
+            sr = src_labels.get(label)
+            dr = dst_labels.get(label)
+            if not sr or not dr:
+                continue
+
+            for src_col, dst_col in ((3, 2), (4, 3), (5, 4)):
+                value = source_ws.cell(sr, src_col).value
+                if value is None or is_datelike(value):
+                    continue
+                if _rob_set_value(
+                    dest_ws,
+                    dr,
+                    dst_col,
+                    value,
+                ):
+                    copied += 1
+
+    return copied
+
+
+
 def _fill_rob_sheet(
     new_ws,
     prev_ws,
@@ -7050,7 +7217,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # Fast path: skip extra duplicate-file diagnostic Drive query.
     dup_check_warnings = []
 
-    existing_id, existing_name = drive_find_file(service, "ROB", month_id)
+    existing_id, existing_name = drive_find_regular_rob_file(
+        service,
+        month_id,
+        month_date=target_month,
+    )
     is_fresh_copy = False
     if existing_id and "master" not in existing_name.lower():
         new_file_id, new_file_name = existing_id, existing_name
@@ -7082,6 +7253,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
+
+    _set_rob_year_headers(
+        new_wb,
+        target_month.year,
+    )
 
     # Resolution/load failures here used to be swallowed silently — the
     # ROB workbook would just come back with July onward blank and no
@@ -7118,8 +7294,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     ly_wb = None
     if ly_result:
         warnings.append(
-            f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: "
-            f"{ly_result[1]}"
+            f"Last year NORMAL ROB ({ly_month_dt.strftime('%b %Y')}) "
+            f"resolved to: {ly_result[1]}"
         )
         try:
             ly_wb = openpyxl.load_workbook(
@@ -7231,6 +7407,21 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             )
 
     # ── Fill each sheet ───────────────────────────────────────────────────────
+    # First seed the three historical year columns from the NORMAL comparable
+    # prior-year ROB. This guarantees future months (Oct-Dec, etc.) retain their
+    # prior-year totals even if weekly date mapping later crosses into another
+    # prior-year month file.
+    if ly_wb is not None:
+        for _sheet_name in ROB_SHEETS:
+            if (
+                _sheet_name in new_wb.sheetnames
+                and _sheet_name in ly_wb.sheetnames
+            ):
+                _rob_seed_historical_columns(
+                    ly_wb[_sheet_name],
+                    new_wb[_sheet_name],
+                )
+
     # STLY source weeks are selected by actual chronological snapshot dates,
     # not by matching destination/source tab names.
     stly_week_map, stly_map_diag = _rob_build_date_first_stly_map(
@@ -7717,6 +7908,11 @@ def setup_next_year_rob_month(
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
 
+    _set_rob_year_headers(
+        new_wb,
+        tracked_year,
+    )
+
     warnings = [
         f"Tracking year: {tracked_year}",
         f"Report month folder: {month_name}",
@@ -7786,6 +7982,18 @@ def setup_next_year_rob_month(
         warnings.append(
             f"Historical {historical_year} ROB not found: {hist_err}"
         )
+
+    # Seed the full historical stack before week-by-week setup.
+    if hist_wb is not None:
+        for _sheet_name in ROB_SHEETS:
+            if (
+                _sheet_name in new_wb.sheetnames
+                and _sheet_name in hist_wb.sheetnames
+            ):
+                _rob_seed_historical_columns(
+                    hist_wb[_sheet_name],
+                    new_wb[_sheet_name],
+                )
 
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
@@ -8775,7 +8983,19 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         ).execute().get("files", [])
 
     def _find_file_in(folder_id, folder_name):
-        fid, fname = drive_find_file(service, wb_keyword, folder_id)
+        if workbook_type == "ROB":
+            fid, fname = drive_find_regular_rob_file(
+                service,
+                folder_id,
+                month_date=month_date,
+            )
+        else:
+            fid, fname = drive_find_file(
+                service,
+                wb_keyword,
+                folder_id,
+            )
+
         if not fid:
             return None, f"No '{wb_keyword}' workbook found in '{folder_name}'."
         if "master" in fname.lower():
