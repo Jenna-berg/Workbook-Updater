@@ -1310,6 +1310,7 @@ def build_hilton_rob_plan(
     current_month_total=None,
     tracked_year=None,
     wash_days=None,
+    wk1_ws=None,
 ):
     """ROB changes for one Hilton hotel from the two Hilton exports.
 
@@ -1341,6 +1342,25 @@ def build_hilton_rob_plan(
     blocks = rob_month_blocks(ws)
     changes, warns = [], []
 
+    # Hard source-year separation. A 2026 ROB can only consume 2026 source
+    # buckets, and a 2027 ROB can only consume 2027 source buckets.
+    srp_months = {
+        key: value
+        for key, value in (srp_months or {}).items()
+        if isinstance(key, tuple)
+        and len(key) >= 2
+        and key[0] == tracked_year
+    }
+    wash_months = {
+        key: value
+        for key, value in (wash_months or {}).items()
+        if isinstance(key, tuple)
+        and len(key) >= 2
+        and key[0] == tracked_year
+    }
+
+    wk1_blocks = rob_month_blocks(wk1_ws) if wk1_ws is not None else {}
+
     def put(row, col, label, value, month):
         if row is None or value is None:
             return
@@ -1357,9 +1377,66 @@ def build_hilton_rob_plan(
 
     for mi, labels in sorted(blocks.items()):
         month = mi + 1
+
         if tracked_year == as_of.year and month < as_of.month:
-            continue                      # never rewrite a closed month
+            # Closed months must not be re-imported from Hilton source data.
+            # On later week tabs, restore the month-end cells as direct links
+            # to the matching WK1 cells for that month. This keeps historical
+            # month-end totals stable and prevents future-year values from
+            # leaking backward into closed current-year months.
+            if (
+                wk1_ws is not None
+                and ws.title != wk1_ws.title
+                and mi in wk1_blocks
+            ):
+                wk1_labels = wk1_blocks[mi]
+                mirror_labels = (
+                    "revenue",
+                    "room nights",
+                    "group rms sold",
+                    "group rm rev",
+                    "perm rms sold",
+                    "perm rm rev",
+                )
+                for label_name in mirror_labels:
+                    dst_row = labels.get(label_name)
+                    src_row = wk1_labels.get(label_name)
+                    if dst_row is None or src_row is None:
+                        continue
+
+                    for col in (5, 7):
+                        # Column G only applies to Group/Perm rows.
+                        if col == 7 and label_name in (
+                            "revenue",
+                            "room nights",
+                        ):
+                            continue
+
+                        formula = (
+                            f"='{wk1_ws.title}'!"
+                            f"{openpyxl.utils.get_column_letter(col)}{src_row}"
+                        )
+                        changes.append({
+                            "row": dst_row,
+                            "col": col,
+                            "label": (
+                                f"Closed month mirror to WK1 — "
+                                f"{label_name}"
+                            ),
+                            "month": month,
+                            "new_value": formula,
+                            "skip_reason": None,
+                        })
+            continue
+
         key = (tracked_year, month)
+
+        # If this exact tracked-year month is absent from both source files,
+        # leave the workbook untouched. This is especially important for a
+        # prebuilt next-year ROB before that year's booking data exists.
+        if key not in srp_months and key not in wash_months:
+            continue
+
         srp = srp_months.get(key) or {}
         wash = wash_months.get(key) or {}
         tot_rooms, tot_rev = _srp_seg(srp, "TOT")
@@ -1524,7 +1601,9 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
       - Forecast Rooms Sold / Forecast ADR
       - Estimated Pick Up / Est. Group Pick Up
       - Actual Rooms / Actual Revenue
-      - As-of date
+
+    The Forecast as-of date is written explicitly from the selected Hilton
+    report date so the workbook header stays current.
 
     Also restores the weekly Pickup WoW snapshot grid beginning around row 45:
     the current SRP Rooms Sold snapshot is copied into the row belonging to the
@@ -1555,6 +1634,19 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
 
     changes = []
     warns = []
+
+    # Forecast as-of date: row directly above Day of Week.
+    changes.append({
+        "label": "As-of date",
+        "row": rows["as_of_row"],
+        "col": 1,
+        "new_value": as_of,
+        "skip_reason": (
+            "formula"
+            if is_formula(ws.cell(rows["as_of_row"], 1).value)
+            else None
+        ),
+    })
 
     # Repair row-4 dates so the workbook visibly spans the complete month.
     for d, col in sorted(col_map.items()):
@@ -7175,19 +7267,40 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         )
 
     wk_one_name = ROB_SHEETS[0]
+    filled_stly_sheets = set()
+
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
             continue
-        new_ws  = new_wb[sheet_name]
-        prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
+
+        new_ws = new_wb[sheet_name]
+        prev_ws = (
+            prev_wb[sheet_name]
+            if prev_wb and sheet_name in prev_wb.sheetnames
+            else None
+        )
+
         stly_snap = stly_week_map.get(sheet_name)
-        if not stly_snap:
+        ly_ws = stly_snap["worksheet"] if stly_snap else None
+
+        # Current-year ROB setup still needs the historical B:D totals for the
+        # target month and all remaining months even when an exact date-first
+        # STLY week match is unavailable. Fall back only for that missing case:
+        # first to the same-named week tab in the prior-year ROB, then to the
+        # closest later prior-year ROBs already loaded above.
+        if ly_ws is None:
+            for candidate_wb in (ly_wb, next_ly_wb, next2_ly_wb):
+                if candidate_wb and sheet_name in candidate_wb.sheetnames:
+                    ly_ws = candidate_wb[sheet_name]
+                    break
+
+        if ly_ws is None:
             warnings.append(
-                f"{sheet_name}: no date-mapped STLY snapshot; tab left untouched"
+                f"{sheet_name}: no STLY source week was available; "
+                f"historical totals could not be populated"
             )
             continue
 
-        ly_ws = stly_snap["worksheet"]
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(
             new_ws,
@@ -7199,6 +7312,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             tracked_year=target_month.year,
             carry_forward_ws=carry_forward_ws,
         )
+        filled_stly_sheets.add(sheet_name)
 
     # Normalize all ROB date headers to MM/DD/YYYY display.
     for _s in ROB_SHEETS:
@@ -7250,7 +7364,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         apply_rob_pickup_wow_formulas(
             new_wb,
             target_month.year,
-            allowed_sheets=set(stly_week_map.keys()),
+            allowed_sheets=filled_stly_sheets,
         )
     )
 
@@ -7700,8 +7814,11 @@ def setup_next_year_rob_month(
         )
 
     # Normalize ROB date displays.
+    # Next-year ROB setup does not build a date-first stly_week_map; it uses
+    # the dedicated historical workbook directly by matching ROB week tabs.
+    # Normalize every week tab that actually exists in the new workbook.
     for s in ROB_SHEETS:
-        if s not in new_wb.sheetnames or s not in stly_week_map:
+        if s not in new_wb.sheetnames:
             continue
         ws = new_wb[s]
         for row in _rob_month_header_rows(ws).values():
@@ -14072,6 +14189,11 @@ def render_hilton_update(hotels):
                         else hilton_as_of.year
                     ),
                     wash_days=wash.get("days"),
+                    wk1_ws=(
+                        wb[ROB_SHEETS[0]]
+                        if ROB_SHEETS[0] in wb.sheetnames
+                        else None
+                    ),
                 )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
