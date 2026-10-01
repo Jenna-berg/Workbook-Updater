@@ -14753,14 +14753,7 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
 
 
 def render_ihg_update(hotels):
-    """IHG portfolio run.
-
-    One hotel at a time, like Stay In Touch, but fed by the History and
-    Forecast Business Block PDF rather than a CSV. That single report drives
-    both workbooks: the ROB takes its Total row for the current month, and the
-    Forecast takes the daily rows — completed days as actuals, on-the-books
-    days as OTB rooms and rate.
-    """
+    """IHG portfolio run with a guided setup/update workflow."""
     if not hotels:
         st.info("No IHG properties found in Drive.")
         return
@@ -14768,72 +14761,199 @@ def render_ihg_update(hotels):
     hotel_names = [h[0] for h in hotels]
     id_map = {h[0]: h[1] for h in hotels}
 
+    st.markdown("### IHG Report Builder")
     st.caption(
-        "Two PDFs. History and Forecast covers the current month end to end — "
-        "it fills that month of the ROB and the whole Forecast, split into "
-        "actuals and on-the-books at its own Subtotal line. Business on the "
-        "Books starts at the report date and runs a year out, filling every "
-        "later month of the ROB."
+        "Choose the hotel and the report(s) you want to work on. "
+        "Monthly setup tools are separate from the normal weekly update files."
     )
 
     with st.container(border=True):
-        col_h, col_w = st.columns([3, 3])
+        st.markdown("#### 1. Choose hotel and reports")
+
+        col_h, col_w = st.columns([2, 4])
         with col_h:
-            hotel_sel = st.selectbox("Hotel", hotel_names, key="ihg_hotel")
+            hotel_sel = st.selectbox(
+                "Hotel",
+                hotel_names,
+                key="ihg_hotel",
+            )
+
         with col_w:
             ihg_workbooks = portfolio_workbook_options("IHG")
+            ihg_default_workbooks = [
+                w for w in ihg_workbooks
+                if w != NEXT_YEAR_ROB_TYPE
+            ]
             wb_sels = st.pills(
-                "Workbooks to update",
+                "Reports to update",
                 ihg_workbooks,
                 selection_mode="multi",
-                default=ihg_workbooks,
+                default=ihg_default_workbooks,
                 key="ihg_wb",
             ) or []
-        c1, c2 = st.columns(2)
-        with c1:
-            pdf_file = st.file_uploader(
-                "History and Forecast Business Block (PDF)",
-                type=["pdf"], key=f"ihg_pdf_{hotel_sel}")
-        with c2:
-            bob_file = st.file_uploader(
-                "Business on the Books (PDF)",
-                type=["pdf"], key=f"ihg_bob_{hotel_sel}")
-        ihg_next_month = st.checkbox(
-            "Include next month's Forecast",
-            key="ihg_fcst_next",
-            help="Fills next month's Forecast workbook from the Business on the "
-                 "Books daily rows. Needs that PDF.")
+
+        if not wb_sels:
+            st.info("Select at least one report to continue.")
+
+    # ------------------------------------------------------------------
+    # Monthly setup tools
+    # ------------------------------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### 2. Monthly setup tools")
+        st.caption(
+            "Use these only when you need to create or prepare a new month's "
+            "workbook. You do not need to upload the weekly PDFs to run setup."
+        )
+
+        setup_rendered = False
 
         if "ROB" in wb_sels:
+            st.markdown("**Current-Year ROB**")
+            st.caption(
+                "Creates/prepares the new monthly ROB, carries forward the "
+                "historical year columns, and rebuilds Pickup WoW formulas."
+            )
             render_portfolio_rob_month_setup(
                 [(hotel_sel, id_map.get(hotel_sel, ""))],
                 "ihg",
             )
+            setup_rendered = True
 
         if NEXT_YEAR_ROB_TYPE in wb_sels:
+            if setup_rendered:
+                st.divider()
+            st.markdown("**Next-Year ROB**")
+            st.caption(
+                "Creates the separate next-year ROB stored in the selected "
+                "report month's folder, such as 2027 ROB OCT2026."
+            )
             render_portfolio_next_year_rob_month_setup(
                 [(hotel_sel, id_map.get(hotel_sel, ""))],
                 "ihg",
             )
+            setup_rendered = True
 
         if "Strategy Report" in wb_sels:
+            if setup_rendered:
+                st.divider()
+            st.markdown("**Strategy Report**")
             ihg_sr_setup_toggle = st.checkbox(
-                "Set up new month — Strategy Report",
+                "Set up a new Strategy Report month",
                 key="ihg_sr_new_month",
                 help=(
-                    "Show the next-month Strategy setup controls. "
-                    "Leave unchecked for a normal Strategy update."
+                    "Use this only when the next month's Strategy workbook "
+                    "needs to be created/prepared."
                 ),
             )
             if ihg_sr_setup_toggle:
-                st.divider()
                 render_ihg_strategy_month_setup(
                     hotel_sel,
                     id_map.get(hotel_sel, ""),
                 )
+            setup_rendered = True
+
+        if not setup_rendered:
+            st.info(
+                "Select ROB, Next-Year ROB, or Strategy Report above to see "
+                "the available monthly setup tools."
+            )
+
+    # ------------------------------------------------------------------
+    # Weekly update source files
+    # ------------------------------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### 3. Weekly update files")
+
+        needs_history = any(
+            w in wb_sels
+            for w in ("ROB", "Forecast", "Strategy Report", NEXT_YEAR_ROB_TYPE)
+        )
+        needs_bob = any(
+            w in wb_sels
+            for w in ("ROB", "Strategy Report", NEXT_YEAR_ROB_TYPE)
+        )
+
+        if "ROB" in wb_sels:
+            st.markdown(
+                "**ROB:** History & Forecast fills the current month. "
+                "Business on the Books fills future months."
+            )
+
+        if NEXT_YEAR_ROB_TYPE in wb_sels:
+            st.markdown(
+                "**Next-Year ROB:** Business on the Books supplies the "
+                "next-year on-the-books months. The workbook itself is "
+                "created with the setup tool above."
+            )
+
+        if "Forecast" in wb_sels:
+            st.markdown(
+                "**Forecast:** History & Forecast fills the current month's "
+                "daily actual/OTB rows."
+            )
+
+        if "Strategy Report" in wb_sels:
+            st.markdown(
+                "**Strategy Report:** Upload both PDFs so current and future "
+                "dates can be populated."
+            )
+
+        pdf_file = None
+        bob_file = None
+
+        if needs_history:
+            pdf_file = st.file_uploader(
+                "Required — History & Forecast Business Block (PDF)",
+                type=["pdf"],
+                key=f"ihg_pdf_{hotel_sel}",
+                help=(
+                    "Current-month source. Used for the current ROB month, "
+                    "current Forecast, and current-month Strategy data."
+                ),
+            )
+
+        if needs_bob or "Forecast" in wb_sels:
+            bob_label = (
+                "Required — Business on the Books (PDF)"
+                if needs_bob
+                else "Optional — Business on the Books (PDF)"
+            )
+            bob_file = st.file_uploader(
+                bob_label,
+                type=["pdf"],
+                key=f"ihg_bob_{hotel_sel}",
+                help=(
+                    "Future-month source. Required for future ROB months and "
+                    "Strategy. Also needed if you want to fill next month's "
+                    "Forecast."
+                ),
+            )
+
+        ihg_next_month = False
+        if "Forecast" in wb_sels:
+            ihg_next_month = st.checkbox(
+                "Also update next month's Forecast",
+                key="ihg_fcst_next",
+                help=(
+                    "Uses daily rows from Business on the Books. "
+                    "Upload that PDF above if this is selected."
+                ),
+            )
+
+        if needs_history and not pdf_file:
+            st.info(
+                "Upload the **History & Forecast Business Block PDF** when "
+                "you're ready to run the weekly update."
+            )
+
+        if needs_bob and not bob_file:
+            st.info(
+                "Upload the **Business on the Books PDF** to fill future ROB "
+                "months and/or Strategy data."
+            )
 
     if not pdf_file:
-        st.info("Upload the History and Forecast PDF to continue.")
+        st.info("Upload the History & Forecast Business Block PDF to preview the weekly update.")
         return
 
     try:
@@ -14877,7 +14997,16 @@ def render_ihg_update(hotels):
             f"{sum(1 for m in bob['months'].values() if m['rooms'])} with business on them."
         )
     else:
-        st.info("No Business on the Books PDF — only the current month of the ROB will be filled.")
+        if "ROB" in wb_sels:
+            st.info(
+                "Business on the Books was not uploaded, so only the current "
+                "ROB month can be filled."
+            )
+        elif "Strategy Report" in wb_sels:
+            st.info(
+                "Business on the Books was not uploaded, so future Strategy "
+                "dates cannot be filled."
+            )
 
     if st.button("Preview changes", key="ihg_preview", type="primary"):
         svc = get_drive_service()
