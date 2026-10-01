@@ -866,8 +866,15 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None, tracked_year=None):
         for (year, month), m in sorted(bob["months"].items()):
             if year != tracked_year:
                 continue
+
+            # Current-year ROB: past/current handling stays unchanged.
             if tracked_year == as_of.year and month <= as_of.month:
                 continue          # current month comes from H&F; past is closed
+
+            # Next-year ROB follows a rolling 12-month window. For an OCT2026
+            # report, only JAN-SEP2027 are in range; OCT-DEC2027 stay blank.
+            if tracked_year > as_of.year and month >= as_of.month:
+                continue
             labels = blocks.get(month - 1)
             if not labels:
                 continue
@@ -6907,6 +6914,132 @@ def _rob_seed_historical_columns(
 
 
 
+def _rob_seed_next_year_closed_months(
+    current_year_wb,
+    next_year_wb,
+    report_month,
+):
+    """Seed closed months in a next-year ROB from the active current-year ROB.
+
+    Example for an OCT2026 build of the 2027 ROB:
+      Jan-Sep are already closed in 2026. Their 2024/2025/2026 historical
+      totals should come from the completed OCT2026 current-year ROB and be
+      identical across every 2027 week tab.
+
+      Oct-Dec are NOT handled here. Those remain comparable weekly snapshots
+      from the dedicated 2026 historical ROB stored with the OCT2025 files.
+
+    Source C:D:E -> destination B:C:D.
+    """
+    if current_year_wb is None or next_year_wb is None:
+        return 0
+
+    wk_one_name = ROB_SHEETS[0]
+    if wk_one_name not in current_year_wb.sheetnames:
+        return 0
+
+    source_ws = current_year_wb[wk_one_name]
+    source_blocks = rob_month_blocks(source_ws)
+    closed_before = report_month.month - 1
+    copied = 0
+
+    for dest_name in ROB_SHEETS:
+        if dest_name not in next_year_wb.sheetnames:
+            continue
+
+        dest_ws = next_year_wb[dest_name]
+        dest_blocks = rob_month_blocks(dest_ws)
+
+        for month_idx in range(closed_before):
+            src_labels = source_blocks.get(month_idx, {})
+            dst_labels = dest_blocks.get(month_idx, {})
+            if not src_labels or not dst_labels:
+                continue
+
+            for label in _ROB_BASE_METRIC_LABELS:
+                sr = src_labels.get(label)
+                dr = dst_labels.get(label)
+                if not sr or not dr:
+                    continue
+
+                for src_col, dst_col in ((3, 2), (4, 3), (5, 4)):
+                    value = source_ws.cell(sr, src_col).value
+                    if value is None or is_datelike(value):
+                        continue
+                    if _rob_set_value(
+                        dest_ws,
+                        dr,
+                        dst_col,
+                        value,
+                    ):
+                        copied += 1
+
+            # Closed months should not carry live current-year GNPU into the
+            # new tracked year. Preserve historical comparison values only.
+            for label in _ROB_SECONDARY_METRIC_LABELS:
+                dr = dst_labels.get(label)
+                if dr:
+                    _rob_set_value(dest_ws, dr, 7, None)
+
+    return copied
+
+
+def _rob_clear_next_year_outside_horizon(
+    wb,
+    report_month,
+    tracked_year,
+):
+    """Keep the new tracked year blank beyond the rolling 12-month horizon.
+
+    An OCT2026 report tracks through SEP2027. OCT2027-Dec2027 therefore remain
+    blank until later report months bring them inside the one-year window.
+    """
+    if wb is None:
+        return 0
+
+    cleared = 0
+    first_outside_month = report_month.month  # 1-based month number
+
+    for sheet_name in ROB_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        blocks = rob_month_blocks(ws)
+
+        for month_idx in range(12):
+            month_number = month_idx + 1
+            if month_number < first_outside_month:
+                continue
+
+            labels = blocks.get(month_idx, {})
+            if not labels:
+                continue
+
+            # E = tracked-year main values; G = tracked-year GNPU.
+            for label in _ROB_BASE_METRIC_LABELS:
+                row = labels.get(label)
+                if row and _rob_set_value(ws, row, 5, None):
+                    cleared += 1
+
+            for label in _ROB_SECONDARY_METRIC_LABELS:
+                row = labels.get(label)
+                if row and _rob_set_value(ws, row, 7, None):
+                    cleared += 1
+
+            header_row = _rob_month_header_rows(ws).get(month_idx)
+            if header_row:
+                _rob_set_value(
+                    ws,
+                    header_row,
+                    5,
+                    None,
+                    number_format="mm/dd/yyyy",
+                )
+
+    return cleared
+
+
+
 def _fill_rob_sheet(
     new_ws,
     prev_ws,
@@ -7918,6 +8051,35 @@ def setup_next_year_rob_month(
         f"Report month folder: {month_name}",
     ]
 
+    # Active current-year ROB for this report month.
+    # Closed months in the new next-year ROB must use completed month-end
+    # history from this file, not old one-year-ahead booking snapshots.
+    current_result, current_err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        month_date=report_month,
+    )
+    current_year_wb = None
+    if current_result:
+        try:
+            current_year_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, current_result[0])),
+                data_only=True,
+            )
+            warnings.append(
+                f"Current-year ROB month-end source: {current_result[1]}"
+            )
+        except Exception as e:
+            warnings.append(
+                f"Current-year ROB found but failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Current-year ROB source not found: {current_err}"
+        )
+
     # Previous report month's next-year ROB, when one exists.
     prev_report_month = (
         report_month - datetime.timedelta(days=1)
@@ -7983,18 +8145,6 @@ def setup_next_year_rob_month(
             f"Historical {historical_year} ROB not found: {hist_err}"
         )
 
-    # Seed the full historical stack before week-by-week setup.
-    if hist_wb is not None:
-        for _sheet_name in ROB_SHEETS:
-            if (
-                _sheet_name in new_wb.sheetnames
-                and _sheet_name in hist_wb.sheetnames
-            ):
-                _rob_seed_historical_columns(
-                    hist_wb[_sheet_name],
-                    new_wb[_sheet_name],
-                )
-
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
@@ -8020,6 +8170,29 @@ def setup_next_year_rob_month(
             tracked_year=tracked_year,
             carry_forward_ws=None,
         )
+
+    # The historical comparator ROB provides the week-by-week snapshot pattern
+    # for the report month and later months. Closed months are different:
+    # overwrite Jan-through-prior-month with the completed historical stack
+    # from the active current-year ROB.
+    closed_seed_count = _rob_seed_next_year_closed_months(
+        current_year_wb,
+        new_wb,
+        report_month,
+    )
+    if closed_seed_count:
+        warnings.append(
+            f"Closed-month historical values seeded from current-year ROB "
+            f"({closed_seed_count} cells)."
+        )
+
+    # Rolling one-year rule: for an October 2026 build, 2027 is only tracked
+    # through September. October-December 2027 stay blank.
+    _rob_clear_next_year_outside_horizon(
+        new_wb,
+        report_month,
+        tracked_year,
+    )
 
     # Normalize ROB date displays.
     # Next-year ROB setup does not build a date-first stly_week_map; it uses
