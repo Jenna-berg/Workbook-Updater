@@ -7783,45 +7783,45 @@ def resolve_historical_rob_for_future_year(
     report_month,
     historical_year,
 ):
-    """Find the prior-year historical ROB used to seed a future-year ROB.
+    """Find the dedicated historical ROB used to seed a next-year ROB.
 
     Example:
       Building: 2027 ROB for OCT2026
-      Historical source wanted: 2026 ROB from the comparable OCT2025 snapshot.
+      Historical source: OCT2025 folder -> "2026 ROB WEIRTON"
 
-    Hotels may keep that historical ROB in the current Revenue Reports folder
-    alongside the active files, or elsewhere in their hotel Drive tree.
+    The dedicated historical ROB stores the comparable weekly snapshots for
+    the following tracked year. Its C/D/E columns become B/C/D in the new ROB.
 
-    Ranking preference:
-      1. Historical ROB in the current report-month folder
-      2. Filename contains the comparable prior-year month token (e.g. OCT2025)
-      3. Filename begins with the tracked historical year (e.g. 2026 ROB ...)
-      4. Explicit "HIST"/"HISTORICAL" wording
+    Search order:
+      1. Comparable prior-year report-month folder (preferred)
+      2. Comparable prior-year REVENUE REPORTS tree
+      3. Hotel Drive scope fallback
 
-    The active current-month ROB (e.g. OCT2026 ROB ...) is explicitly excluded
-    so it cannot be mistaken for the dedicated historical 2026 ROB.
+    The active current-year monthly ROB (e.g. OCT2026 ROB WEIRTON) is excluded.
     """
-    report_year_kw = str(report_month.year)
-    report_month_kw = report_month.strftime("%b%Y").upper()
+    comparable_month = report_month.replace(
+        year=report_month.year - 1
+    )
+    comparable_year_kw = str(comparable_month.year)
+    comparable_month_kw = comparable_month.strftime("%b%Y").upper()
 
-    comparable_month = report_month.replace(year=report_month.year - 1)
-    comparable_kw = comparable_month.strftime("%b%Y").upper()
-
-    rev_id, _ = _find_rev_reports_folder_for_year(
+    # Resolve the comparable prior-year REVENUE REPORTS area first.
+    prior_rev_id, prior_rev_name = _find_rev_reports_folder_for_year(
         service,
         hotel_id,
-        report_year_kw,
-        report_month_kw,
+        comparable_year_kw,
+        comparable_month_kw,
     )
 
-    month_id = None
-    if rev_id:
-        month_id, _ = _find_month_folder_under_rev(
+    prior_month_id = None
+    prior_month_name = None
+    if prior_rev_id:
+        prior_month_id, prior_month_name = _find_month_folder_under_rev(
             service,
-            rev_id,
-            report_year_kw,
-            report_month_kw,
-            report_month,
+            prior_rev_id,
+            comparable_year_kw,
+            comparable_month_kw,
+            comparable_month,
             hotel_name,
         )
 
@@ -7849,20 +7849,21 @@ def resolve_historical_rob_for_future_year(
         except Exception:
             return []
 
-    def score_candidate(f, in_current_month_folder=False):
+    hotel_tokens = [
+        tok for tok in re.split(r"[^A-Z0-9]+", str(hotel_name).upper())
+        if len(tok) >= 3
+    ]
+
+    def score_candidate(f, location_rank):
         name = str(f.get("name", ""))
-        n = name.upper()
+        n = name.upper().strip()
 
         if "ROB" not in n or "MASTER" in n:
             return None
 
-        # Do not accidentally use the active current-month ROB.
-        if report_month_kw in n and not n.strip().startswith(
-            f"{historical_year} ROB"
-        ):
-            return None
-
-        # Candidate must clearly represent the desired historical year.
+        # Exclude a normal monthly ROB such as OCT2025 ROB WEIRTON.
+        # We want the dedicated year-prefixed historical file such as
+        # "2026 ROB WEIRTON".
         starts_with_year = bool(
             re.match(
                 rf"^\s*{historical_year}\s+ROB\b",
@@ -7870,29 +7871,34 @@ def resolve_historical_rob_for_future_year(
                 flags=re.I,
             )
         )
-        has_comparable_month = comparable_kw in n
-        has_hist_word = "HIST" in n or "HISTORICAL" in n
-
-        if not (
-            starts_with_year
-            or has_comparable_month
-            or has_hist_word
-        ):
+        if not starts_with_year:
             return None
 
-        score = 0
-        if in_current_month_folder:
-            score += 100
-        if has_comparable_month:
-            score += 80
-        if starts_with_year:
-            score += 60
-        if has_hist_word:
-            score += 30
+        score = location_rank
 
-        # Prefer names that explicitly pair the historical year and ROB.
-        if str(historical_year) in n:
-            score += 20
+        # Exact/near-exact dedicated historical filename gets top priority.
+        normalized = re.sub(
+            r"\.(XLSX|XLSM)$",
+            "",
+            n,
+            flags=re.I,
+        ).strip()
+        expected = f"{historical_year} ROB {str(hotel_name).upper()}"
+
+        if normalized == expected:
+            score += 500
+        elif normalized.startswith(f"{historical_year} ROB "):
+            score += 250
+
+        # Reward hotel-name agreement.
+        for token in hotel_tokens:
+            if token in n:
+                score += 20
+
+        # Comparable month token is allowed but not required. The real
+        # historical file may simply be named "2026 ROB WEIRTON".
+        if comparable_month_kw in n:
+            score += 25
 
         return (
             score,
@@ -7900,28 +7906,54 @@ def resolve_historical_rob_for_future_year(
             f,
         )
 
-    # First: current report-month folder, where the user expects the historical
-    # future-year reference ROB to already be stored.
     scored = []
-    if month_id:
-        for f in list_excel_files([month_id]):
-            s = score_candidate(f, in_current_month_folder=True)
+
+    # 1) Exact comparable month folder — this is the expected home.
+    if prior_month_id:
+        for f in list_excel_files([prior_month_id]):
+            s = score_candidate(f, 1000)
             if s:
                 scored.append(s)
 
-    # Fallback: search the hotel's own scoped Drive tree.
+    # 2) Comparable prior-year Revenue Reports root/tree.
+    if prior_rev_id:
+        search_ids = [prior_rev_id]
+        try:
+            search_ids.extend(
+                c["id"]
+                for c in service.files().list(
+                    q=(
+                        "mimeType='application/vnd.google-apps.folder' "
+                        f"and trashed=false and '{prior_rev_id}' in parents"
+                    ),
+                    fields="files(id,name)",
+                    pageSize=200,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute().get("files", [])
+            )
+        except Exception:
+            pass
+
+        for f in list_excel_files(search_ids):
+            s = score_candidate(f, 600)
+            if s:
+                scored.append(s)
+
+    # 3) Hotel-scoped fallback only if comparable-year search fails.
     if not scored:
         scope_ids = _hotel_search_scope_ids(service, hotel_id)
         for f in list_excel_files(scope_ids):
-            s = score_candidate(f, in_current_month_folder=False)
+            s = score_candidate(f, 100)
             if s:
                 scored.append(s)
 
     if not scored:
         return None, (
-            f"Could not find the historical {historical_year} ROB for "
-            f"{hotel_name}. Expected a comparable file such as "
-            f"'{historical_year} ROB {comparable_kw} {hotel_name.upper()}'."
+            f"Could not find the dedicated historical {historical_year} ROB "
+            f"for {hotel_name}. Searched the comparable "
+            f"{comparable_month:%B %Y} folder first and expected a file like "
+            f"'{historical_year} ROB {hotel_name.upper()}'."
         )
 
     scored.sort(
@@ -7929,8 +7961,18 @@ def resolve_historical_rob_for_future_year(
         reverse=True,
     )
     best = scored[0][2]
-    return (best["id"], best["name"]), None
 
+    source_note = (
+        prior_month_name
+        if prior_month_id and prior_month_id in (best.get("parents") or [])
+        else prior_rev_name or "hotel Drive scope"
+    )
+
+    return (
+        best["id"],
+        best["name"],
+        source_note,
+    ), None
 
 
 def setup_next_year_rob_month(
@@ -8051,35 +8093,6 @@ def setup_next_year_rob_month(
         f"Report month folder: {month_name}",
     ]
 
-    # Active current-year ROB for this report month.
-    # Closed months in the new next-year ROB must use completed month-end
-    # history from this file, not old one-year-ahead booking snapshots.
-    current_result, current_err = resolve_drive_workbook(
-        service,
-        hotel_id,
-        hotel_name,
-        "ROB",
-        month_date=report_month,
-    )
-    current_year_wb = None
-    if current_result:
-        try:
-            current_year_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, current_result[0])),
-                data_only=True,
-            )
-            warnings.append(
-                f"Current-year ROB month-end source: {current_result[1]}"
-            )
-        except Exception as e:
-            warnings.append(
-                f"Current-year ROB found but failed to load: {e}"
-            )
-    else:
-        warnings.append(
-            f"Current-year ROB source not found: {current_err}"
-        )
-
     # Previous report month's next-year ROB, when one exists.
     prev_report_month = (
         report_month - datetime.timedelta(days=1)
@@ -8133,8 +8146,14 @@ def setup_next_year_rob_month(
                 io.BytesIO(drive_download(service, hist_result[0])),
                 data_only=True,
             )
+            hist_source_note = (
+                hist_result[2]
+                if len(hist_result) > 2
+                else "comparable prior-year folder"
+            )
             warnings.append(
-                f"Historical {historical_year} ROB: {hist_result[1]}"
+                f"Historical {historical_year} ROB: {hist_result[1]} "
+                f"(source: {hist_source_note})"
             )
         except Exception as e:
             warnings.append(
@@ -8144,6 +8163,20 @@ def setup_next_year_rob_month(
         warnings.append(
             f"Historical {historical_year} ROB not found: {hist_err}"
         )
+
+    # Preserve the dedicated historical ROB exactly by week tab.
+    # Source C/D/E (2024/2025/2026 in a 2026 historical ROB)
+    # becomes destination B/C/D in the new 2027 ROB.
+    if hist_wb is not None:
+        for _sheet_name in ROB_SHEETS:
+            if (
+                _sheet_name in new_wb.sheetnames
+                and _sheet_name in hist_wb.sheetnames
+            ):
+                _rob_seed_historical_columns(
+                    hist_wb[_sheet_name],
+                    new_wb[_sheet_name],
+                )
 
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
@@ -8169,21 +8202,6 @@ def setup_next_year_rob_month(
             wk_one_name,
             tracked_year=tracked_year,
             carry_forward_ws=None,
-        )
-
-    # The historical comparator ROB provides the week-by-week snapshot pattern
-    # for the report month and later months. Closed months are different:
-    # overwrite Jan-through-prior-month with the completed historical stack
-    # from the active current-year ROB.
-    closed_seed_count = _rob_seed_next_year_closed_months(
-        current_year_wb,
-        new_wb,
-        report_month,
-    )
-    if closed_seed_count:
-        warnings.append(
-            f"Closed-month historical values seeded from current-year ROB "
-            f"({closed_seed_count} cells)."
         )
 
     # Rolling one-year rule: for an October 2026 build, 2027 is only tracked
