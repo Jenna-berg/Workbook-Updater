@@ -2343,27 +2343,22 @@ def _kw_matches(cell_val, keyword, r3_val, r4_val):
 def detect_strategy_columns(ws):
     """Scan the Strategy multi-row header and return field -> column.
 
-    SNT templates do not always split the labels across the same rows.
-    Brass Key, for example, can place the year/category on row 2, the
-    TY/LY family on row 3, and the metric name on row 4. Treat rows 2-4 as
-    one logical header so paired LY columns are detected reliably.
+    SNT templates do not always split labels across the same rows. Treat
+    rows 2-4 as one logical header so paired TY / LY columns are detected
+    consistently across properties such as Brass Key.
     """
     max_col = ws.max_column
-
     headers = {}
     for c in range(1, max_col + 1):
         r2_val = str(ws.cell(2, c).value or "").strip()
         r3_val = str(ws.cell(3, c).value or "").strip()
         r4_val = str(ws.cell(4, c).value or "").strip()
 
-        # Use a single combined header string for pattern matching while
-        # retaining r3/r4 separately for the existing exclusion logic.
         logical = " ".join(
             part for part in (r2_val, r3_val, r4_val)
             if part and part != "None"
         ).strip()
 
-        # Preserve the old inference fallback for sparse templates.
         inferred_r4 = r4_val
         if (not inferred_r4 or inferred_r4 == "None") and logical:
             up = logical.upper()
@@ -6875,6 +6870,109 @@ def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
 
 
 
+def _rob_build_next_year_historical_map(
+    new_wb,
+    cadence_prev_wb,
+    target_month,
+    historical_wb,
+):
+    """Map next-year ROB week tabs from the historical current-year ROB.
+
+    The historical ROB must continue from the last reporting snapshot already
+    consumed in the previous month's NORMAL current-year ROB.
+
+    Example:
+      Building OCT2026 -> 2027 ROB.
+      If SEP2026's last completed week already carries a 10/01/2026 reporting
+      date, then OCT's new WK1 must use the next historical snapshot after
+      10/01 — never copy historical WK1 blindly and reuse 10/01.
+
+    Returns {destination_sheet: source_worksheet}, diagnostics.
+    """
+    diagnostics = []
+    if historical_wb is None:
+        return {}, ["No historical ROB workbook was available."]
+
+    snapshots = []
+    for sheet_name in ROB_SHEETS:
+        if sheet_name not in historical_wb.sheetnames:
+            continue
+        ws = historical_wb[sheet_name]
+        source_date = _rob_valid_date(ws.cell(4, 5).value)
+        if source_date is None:
+            continue
+        snapshots.append(
+            {
+                "date": source_date,
+                "sheet_name": sheet_name,
+                "worksheet": ws,
+            }
+        )
+
+    snapshots.sort(
+        key=lambda item: (
+            item["date"],
+            ROB_SHEETS.index(item["sheet_name"])
+            if item["sheet_name"] in ROB_SHEETS else 999,
+        )
+    )
+
+    if not snapshots:
+        return {}, ["Historical ROB contained no dated week snapshots."]
+
+    # Cadence anchor = last actually-filled week of the previous NORMAL ROB.
+    anchor_sheet = _rob_last_completed_week(
+        cadence_prev_wb,
+        target_month,
+    )
+    anchor_date = None
+    if (
+        cadence_prev_wb is not None
+        and anchor_sheet
+        and anchor_sheet in cadence_prev_wb.sheetnames
+    ):
+        anchor_date = _rob_valid_date(
+            cadence_prev_wb[anchor_sheet].cell(4, 5).value
+        )
+
+    if anchor_date is not None:
+        diagnostics.append(
+            f"Previous-month cadence anchor: {anchor_sheet} "
+            f"({anchor_date:%m/%d/%Y})"
+        )
+        snapshots = [
+            snap for snap in snapshots
+            if snap["date"] > anchor_date
+        ]
+    else:
+        diagnostics.append(
+            "Previous-month cadence anchor was unavailable; "
+            "historical snapshots start from the earliest dated week."
+        )
+
+    dest_sheets = [
+        s for s in ROB_SHEETS
+        if s in new_wb.sheetnames
+    ]
+
+    mapping = {}
+    for dest_sheet, snap in zip(dest_sheets, snapshots):
+        mapping[dest_sheet] = snap["worksheet"]
+        diagnostics.append(
+            f"{dest_sheet} <- {snap['sheet_name']} "
+            f"({snap['date']:%m/%d/%Y})"
+        )
+
+    if len(mapping) < min(4, len(dest_sheets)):
+        diagnostics.append(
+            f"WARNING: only {len(mapping)} next-year week tabs mapped "
+            f"after the prior-month cadence anchor."
+        )
+
+    return mapping, diagnostics
+
+
+
 def _rob_seed_historical_columns(
     source_ws,
     dest_ws,
@@ -8214,10 +8312,45 @@ def setup_next_year_rob_month(
         f"Report month folder: {month_name}",
     ]
 
-    # Previous report month's next-year ROB, when one exists.
+    # Previous NORMAL current-year ROB controls the weekly cadence.
+    # This is intentionally separate from the previous next-year ROB.
     prev_report_month = (
         report_month - datetime.timedelta(days=1)
     ).replace(day=1)
+
+    cadence_prev_result, cadence_prev_err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        month_date=prev_report_month,
+    )
+    cadence_prev_wb = None
+    if cadence_prev_result:
+        try:
+            cadence_prev_bytes = drive_download(
+                service,
+                cadence_prev_result[0],
+            )
+            cadence_prev_wb = openpyxl.load_workbook(
+                io.BytesIO(cadence_prev_bytes),
+                data_only=True,
+            )
+            warnings.append(
+                f"Previous normal ROB cadence source: "
+                f"{cadence_prev_result[1]}"
+            )
+        except Exception as e:
+            warnings.append(
+                f"Previous normal ROB cadence source failed to load: {e}"
+            )
+    else:
+        warnings.append(
+            f"Previous normal ROB cadence source not found: "
+            f"{cadence_prev_err}"
+        )
+
+    # Previous report month's next-year ROB, when one exists.
     prev_result, prev_err = resolve_next_year_rob_workbook(
         service,
         hotel_id,
@@ -8318,19 +8451,22 @@ def setup_next_year_rob_month(
             None,
         )
 
-    # Preserve the dedicated historical ROB exactly by week tab.
-    # Source C/D/E (2024/2025/2026 in a 2026 historical ROB)
-    # becomes destination B/C/D in the new 2027 ROB.
-    if hist_wb is not None:
-        for _sheet_name in ROB_SHEETS:
-            if (
-                _sheet_name in new_wb.sheetnames
-                and _sheet_name in hist_wb.sheetnames
-            ):
-                _rob_seed_historical_columns(
-                    hist_wb[_sheet_name],
-                    new_wb[_sheet_name],
-                )
+    # Map historical weeks by the reporting cadence already consumed in the
+    # previous month's NORMAL ROB. Never assume historical WK1 belongs in new
+    # WK1 — the prior month may already have consumed that snapshot.
+    historical_week_map, historical_map_diag = (
+        _rob_build_next_year_historical_map(
+            new_wb,
+            cadence_prev_wb,
+            report_month,
+            hist_wb,
+        )
+    )
+    if historical_map_diag:
+        warnings.append(
+            "Next-year historical week map — "
+            + " | ".join(historical_map_diag)
+        )
 
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
@@ -8342,11 +8478,14 @@ def setup_next_year_rob_month(
             if prev_wb and sheet_name in prev_wb.sheetnames
             else None
         )
-        hist_ws = (
-            hist_wb[sheet_name]
-            if hist_wb and sheet_name in hist_wb.sheetnames
-            else None
-        )
+        hist_ws = historical_week_map.get(sheet_name)
+        if hist_ws is None:
+            warnings.append(
+                f"{sheet_name}: no historical week remained after cadence "
+                f"mapping; tab left untouched."
+            )
+            continue
+
         _fill_rob_sheet(
             new_ws,
             prev_ws,
@@ -16387,29 +16526,10 @@ with tab_weekly:
         prev_month_sr_wb = None
         ly_sr_wb         = None
         if "Strategy Report" in wb_sels:
-            prev_month_dt = (
-                current_month - datetime.timedelta(days=1)
-            ).replace(day=1)
-            ly_month_dt = current_month.replace(
-                year=current_month.year - 1
-            )
-
-            prev_month_sr_wb = _load_wb_from_drive(
-                svc,
-                hotel_id,
-                hotel_sel,
-                "Strategy Report",
-                prev_month_dt,
-                data_only=False,
-            )
-            ly_sr_wb = _load_wb_from_drive(
-                svc,
-                hotel_id,
-                hotel_sel,
-                "Strategy Report",
-                ly_month_dt,
-                data_only=False,
-            )
+            prev_month_dt = (current_month - datetime.timedelta(days=1)).replace(day=1)
+            ly_month_dt   = current_month.replace(year=current_month.year - 1)
+            prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+            ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
             # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
             # not found, those fields silently produce nothing (no warning previously),
             # which looked like "dates transferred but no text" with no explanation why.
@@ -16501,9 +16621,6 @@ with tab_weekly:
                     )
 
                 # Carry prior-year Strategy data during normal SNT uploads too.
-                # This fills OTB LY, Group LY, LY revenue/ADR and other paired
-                # historical fields from the comparable prior-year Strategy
-                # workbook instead of leaving them blank.
                 changes = build_strategy_change_plan(
                     df,
                     wb,
