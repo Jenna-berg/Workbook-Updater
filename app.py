@@ -8667,6 +8667,8 @@ def setup_next_year_rob_month(
     )
 
 
+
+
 def _historical_rob_snapshot_dates_from_bytes(raw):
     """Return dated ROB week snapshots found in column E / row 4."""
     try:
@@ -8762,34 +8764,37 @@ def resolve_hilton_historical_rob_for_next_year(
     report_month,
     historical_year,
 ):
-    """Resolve Hilton historical ROB by the workbook's internal week dates.
+    """Resolve Hilton historical ROB within this hotel's own Drive structure.
+
+    The Northbrook folder example established the important naming rule:
+    historical source workbooks are year-prefixed files such as
+    `2026 ROB NORTHBROOK`.
+
+    Folder nesting varies by property, so this resolver searches the hotel's
+    own visible Drive tree for matching year-prefixed ROB files. It then uses
+    the workbook's internal weekly snapshot dates to choose the candidate that
+    corresponds to the comparable prior-year report month.
 
     Example:
-      Build: 2027 ROB OCT2026
-      Desired historical source: a valid 2026 ROB whose week snapshot dates
-      correspond to OCT2025.
-
-    Folder layout is deliberately not trusted. Hilton properties store these
-    historical ROBs differently, so the resolver searches the hotel's visible
-    Drive scope and ranks valid 2026 ROBs by their actual snapshot dates.
+      2027 ROB OCT2026
+        -> search Northbrook's own Drive tree
+        -> find `2026 ROB NORTHBROOK`
+        -> prefer the workbook whose internal snapshot dates match OCT2025
     """
     comparable_month = report_month.replace(
         year=report_month.year - 1
     )
 
+    normalized_hotel = str(hotel_name or "").strip().upper()
     hotel_tokens = [
-        tok for tok in re.split(
-            r"[^A-Z0-9]+",
-            str(hotel_name).upper(),
-        )
+        tok
+        for tok in re.split(r"[^A-Z0-9]+", normalized_hotel)
         if len(tok) >= 3
     ]
 
     def child_folders(parent_ids):
         parent_ids = list(
-            dict.fromkeys(
-                pid for pid in parent_ids if pid
-            )
+            dict.fromkeys(pid for pid in parent_ids if pid)
         )
         if not parent_ids:
             return []
@@ -8818,15 +8823,11 @@ def resolve_hilton_historical_rob_for_next_year(
             except Exception:
                 continue
 
-        return list(
-            {f["id"]: f for f in out}.values()
-        )
+        return list({f["id"]: f for f in out}.values())
 
     def excel_files(parent_ids):
         parent_ids = list(
-            dict.fromkeys(
-                pid for pid in parent_ids if pid
-            )
+            dict.fromkeys(pid for pid in parent_ids if pid)
         )
         if not parent_ids:
             return []
@@ -8856,16 +8857,14 @@ def resolve_hilton_historical_rob_for_next_year(
             except Exception:
                 continue
 
-        return list(
-            {f["id"]: f for f in out}.values()
-        )
+        return list({f["id"]: f for f in out}.values())
 
-    # Search the whole hotel tree rather than assuming a Revenue Reports layout.
+    # Search this hotel's own folder tree.
     scope = []
     frontier = [hotel_id]
     seen = set()
 
-    for _depth in range(8):
+    for _depth in range(10):
         current = [
             pid for pid in frontier
             if pid and pid not in seen
@@ -8881,8 +8880,7 @@ def resolve_hilton_historical_rob_for_next_year(
             f["id"] for f in children
         ]
 
-    # Existing search scopes can include Revenue Reports roots that are shared
-    # directly rather than nested under the hotel's top-level folder.
+    # Include any already-known Revenue Reports/search roots for this hotel.
     try:
         scope.extend(
             _hotel_search_scope_ids(
@@ -8899,16 +8897,14 @@ def resolve_hilton_historical_rob_for_next_year(
     candidates = []
 
     for f in files:
-        name = str(
-            f.get("name", "")
-        )
+        name = str(f.get("name", ""))
         up = name.upper().strip()
 
         if "MASTER" in up:
             continue
 
-        # Historical source is specifically the year-prefixed ROB, e.g.
-        # "2026 ROB NORTHBROOK".
+        # Historical Hilton source must follow the year-prefixed naming rule
+        # observed in the actual Drive examples: `2026 ROB <HOTEL>`.
         if not re.match(
             rf"^\s*{historical_year}\s+ROB\b",
             up,
@@ -8916,45 +8912,40 @@ def resolve_hilton_historical_rob_for_next_year(
         ):
             continue
 
-        # Hotel-name agreement is preferred but not required because several
-        # folders/files use abbreviated property names.
         filename_score = 0
         for token in hotel_tokens:
             if token in up:
-                filename_score += 25
+                filename_score += 50
 
-        valid, raw = (
-            _historical_rob_has_required_year(
-                service,
-                f["id"],
-                historical_year,
-                return_bytes=True,
-            )
+        # Require at least one meaningful property-name token when possible.
+        if hotel_tokens and filename_score == 0:
+            continue
+
+        valid, raw = _historical_rob_has_required_year(
+            service,
+            f["id"],
+            historical_year,
+            return_bytes=True,
         )
         if not valid or raw is None:
             continue
 
-        snapshot_dates = (
-            _historical_rob_snapshot_dates_from_bytes(
-                raw
-            )
+        snapshot_dates = _historical_rob_snapshot_dates_from_bytes(
+            raw
         )
-        month_score = (
-            _hilton_historical_month_match_score(
-                snapshot_dates,
-                comparable_month,
-            )
+        month_score = _hilton_historical_month_match_score(
+            snapshot_dates,
+            comparable_month,
         )
 
-        if month_score <= 0:
-            continue
-
+        # Keep candidates even when their internal dates do not create an
+        # exact month match. Some historical ROBs are stored as one rolling
+        # year file rather than one file per report month. The month score
+        # still ranks exact/close matches first.
         candidates.append(
             {
-                "score": (
-                    month_score
-                    + filename_score
-                ),
+                "score": month_score + filename_score,
+                "month_score": month_score,
                 "file": f,
                 "raw": raw,
                 "snapshot_dates": snapshot_dates,
@@ -8963,20 +8954,17 @@ def resolve_hilton_historical_rob_for_next_year(
 
     if not candidates:
         return None, (
-            f"No valid {historical_year} ROB with "
-            f"{comparable_month:%B %Y} snapshot dates was found "
-            f"in the visible Drive scope for {hotel_name}."
+            f"No valid {historical_year} ROB for {hotel_name} was found "
+            f"in that hotel's visible Drive folders."
         )
 
+    # Exact internal-date match wins. If none exists, prefer the strongest
+    # hotel-name match and most recently modified valid year-prefixed ROB.
     candidates.sort(
         key=lambda item: (
+            item["month_score"] > 0,
             item["score"],
-            str(
-                item["file"].get(
-                    "modifiedTime",
-                    "",
-                )
-            ),
+            str(item["file"].get("modifiedTime", "")),
         ),
         reverse=True,
     )
@@ -8984,20 +8972,27 @@ def resolve_hilton_historical_rob_for_next_year(
     best = candidates[0]
     best_file = best["file"]
 
-    date_desc = ", ".join(
-        f"{sheet} {d:%m/%d/%Y}"
-        for sheet, d
-        in best["snapshot_dates"]
+    if best["snapshot_dates"]:
+        date_desc = ", ".join(
+            f"{sheet} {d:%m/%d/%Y}"
+            for sheet, d in best["snapshot_dates"]
+        )
+    else:
+        date_desc = "no readable weekly snapshot dates"
+
+    match_note = (
+        f"internal snapshot match for {comparable_month:%B %Y}"
+        if best["month_score"] > 0
+        else (
+            f"valid {historical_year} ROB fallback; "
+            f"no exact {comparable_month:%B %Y} snapshot match"
+        )
     )
 
     return (
         best_file["id"],
         best_file["name"],
-        (
-            f"internal snapshot match for "
-            f"{comparable_month:%B %Y}: "
-            f"{date_desc}"
-        ),
+        f"{match_note}: {date_desc}",
         best["raw"],
     ), None
 
@@ -9371,11 +9366,10 @@ def render_hilton_next_year_rob_month_setup(
         )
 
         st.caption(
-            f"Source mapping: find this hotel's **{tracked_year - 1} ROB** "
-            f"whose internal weekly snapshot dates match "
-            f"**{source_month:%B %Y}** → "
-            f"**{tracked_year} ROB {report_month:%B %Y}**. "
-            f"Drive folder naming does not control the match."
+            f"Source mapping: search this hotel's own Drive folders for its "
+            f"**{tracked_year - 1} ROB**. Internal weekly snapshot dates are "
+            f"used to prefer the **{source_month:%B %Y}** source → "
+            f"**{tracked_year} ROB {report_month:%B %Y}**."
         )
 
         if st.button(
