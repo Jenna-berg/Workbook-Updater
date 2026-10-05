@@ -7458,7 +7458,18 @@ def apply_rob_pickup_wow_formulas(wb, target_year, allowed_sheets=None):
     return [] if refs else ['Pickup WoW formulas: WK1 previous table could not be mapped; WK1 formulas left unchanged.']
 
 
-def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+def _emit_rob_setup_progress(progress_callback, value, message):
+    """Best-effort progress reporting for ROB setup without changing logic."""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(max(0.0, min(1.0, float(value))), str(message))
+    except Exception:
+        pass
+
+
+
+def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
     `original_bytes` is the file's content exactly as it was before this
@@ -7466,6 +7477,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     to offer an "undo"/reset-to-original for this setup, the same way the
     Strategy Report setup already does.
     """
+    _emit_rob_setup_progress(progress_callback, 0.03, "Locating Revenue Reports folder...")
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
@@ -7479,6 +7491,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
     # Diagnostic: which folders are being used
     folder_diagnostic = f"Revenue Reports folder: {rev_name}; Month folder: {month_name}"
+
+    _emit_rob_setup_progress(progress_callback, 0.12, "Locating or creating the ROB workbook...")
 
     # ── Find or copy the file ─────────────────────────────────────────────────
     # Fast path: skip extra duplicate-file diagnostic Drive query.
@@ -7515,6 +7529,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         hotel_id, hotel_name, "ROB", target_month, new_file_id, new_file_name
     )
 
+    _emit_rob_setup_progress(progress_callback, 0.22, "Opening the new ROB workbook...")
+
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
@@ -7537,6 +7553,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         f"Folder placement: {folder_diagnostic}",
     ] + dup_check_warnings
 
+    _emit_rob_setup_progress(progress_callback, 0.32, "Loading previous-month ROB...")
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
     prev_result, prev_err = _resolve_drive_workbook_session_cached(
         service, hotel_id, hotel_name, "ROB", prev_month_dt
@@ -7554,6 +7571,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     else:
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
 
+    _emit_rob_setup_progress(progress_callback, 0.44, "Loading comparable prior-year ROBs...")
     ly_month_dt = target_month.replace(year=target_month.year - 1)
     ly_result, ly_err = _resolve_drive_workbook_session_cached(
         service, hotel_id, hotel_name, "ROB", ly_month_dt
@@ -7672,6 +7690,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 f"{label} workbook is missing tabs: {missing} — "
                 f"actual tabs: {wb_obj.sheetnames}"
             )
+
+    _emit_rob_setup_progress(progress_callback, 0.64, "Mapping reporting weeks and historical snapshots...")
 
     # ── Fill each sheet ───────────────────────────────────────────────────────
     # First seed the three historical year columns from the NORMAL comparable
@@ -7812,6 +7832,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         f"{target_block_start + 1}, col B) per tab after fill: {readback!r}"
     )
 
+    _emit_rob_setup_progress(progress_callback, 0.82, "Rebuilding ROB formulas and previous-week references...")
+
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
     if prev_wb and wk_one_name in new_wb.sheetnames:
         err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month, tracked_year=target_month.year)
@@ -7826,10 +7848,12 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         )
     )
 
+    _emit_rob_setup_progress(progress_callback, 0.93, "Saving and uploading workbook...")
     strip_tables(new_wb)
     out = io.BytesIO()
     new_wb.save(out)
     drive_upload(service, new_file_id, out.getvalue(), new_file_name)
+    _emit_rob_setup_progress(progress_callback, 1.0, "ROB setup complete.")
     warn_str = "; ".join(warnings) if warnings else None
     return new_file_name, warn_str, new_file_id, new_wb_bytes
 
@@ -7914,13 +7938,9 @@ def _historical_rob_has_required_year(
     service,
     file_id,
     historical_year,
+    return_bytes=False,
 ):
-    """Return True only if the candidate ROB really carries historical_year.
-
-    A valid source for a 2027 ROB must include 2026 as its latest historical
-    year in the main ROB year headers. This prevents a normal 2025 ROB from
-    being accepted just because its filename contains ROB.
-    """
+    """Validate a historical ROB and optionally return its already-downloaded bytes."""
     try:
         raw = drive_download(service, file_id)
         wb = openpyxl.load_workbook(
@@ -7929,8 +7949,9 @@ def _historical_rob_has_required_year(
             read_only=True,
         )
     except Exception:
-        return False
+        return (False, None) if return_bytes else False
 
+    valid = False
     try:
         for sheet_name in ROB_SHEETS:
             if sheet_name not in wb.sheetnames:
@@ -7947,15 +7968,17 @@ def _historical_rob_has_required_year(
                     years.append(year)
 
             if historical_year in years:
-                return True
+                valid = True
+                break
     finally:
         try:
             wb.close()
         except Exception:
             pass
 
-    return False
-
+    if return_bytes:
+        return valid, (raw if valid else None)
+    return valid
 
 
 def resolve_historical_rob_for_future_year(
@@ -7965,18 +7988,7 @@ def resolve_historical_rob_for_future_year(
     report_month,
     historical_year,
 ):
-    """Find a valid historical ROB for the next-year builder.
-
-    Preferred example for OCT2026 -> 2027:
-      comparable OCT2025 area -> "2026 ROB WEIRTON"
-
-    Stay In Touch properties do not always use the exact same folder nesting,
-    so the resolver first searches the comparable prior-year folder structure,
-    then recursively searches the hotel's own visible Drive scope.
-
-    A candidate is accepted only if its workbook actually contains the
-    requested historical year in the ROB year headers.
-    """
+    """Find a valid historical ROB, using fast preferred-folder-first search."""
     comparable_month = report_month.replace(
         year=report_month.year - 1
     )
@@ -8037,10 +8049,7 @@ def resolve_historical_rob_for_future_year(
             except Exception:
                 continue
 
-        deduped = {}
-        for f in out:
-            deduped[f["id"]] = f
-        return list(deduped.values())
+        return list({f["id"]: f for f in out}.values())
 
     def child_folders(parent_ids):
         parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
@@ -8070,40 +8079,7 @@ def resolve_historical_rob_for_future_year(
             except Exception:
                 continue
 
-        deduped = {}
-        for f in out:
-            deduped[f["id"]] = f
-        return list(deduped.values())
-
-    # Build a bounded recursive hotel scope. This is important for Stay In Touch,
-    # where the comparable year's ROB may be nested differently than IHG.
-    recursive_scope = []
-    frontier = [hotel_id]
-    seen = set()
-
-    for _depth in range(6):
-        current = [
-            pid for pid in frontier
-            if pid and pid not in seen
-        ]
-        if not current:
-            break
-
-        seen.update(current)
-        recursive_scope.extend(current)
-
-        children = child_folders(current)
-        frontier = [f["id"] for f in children]
-
-    # Also include the app's existing scoped IDs.
-    try:
-        recursive_scope.extend(
-            _hotel_search_scope_ids(service, hotel_id)
-        )
-    except Exception:
-        pass
-
-    recursive_scope = list(dict.fromkeys(recursive_scope))
+        return list({f["id"]: f for f in out}.values())
 
     def score_candidate(f, location_rank):
         name = str(f.get("name", ""))
@@ -8120,20 +8096,15 @@ def resolve_historical_rob_for_future_year(
         leading_year = int(leading.group(1)) if leading else None
 
         score = location_rank
-
-        # Dedicated historical naming is strongly preferred.
         if leading_year == historical_year:
             score += 500
         elif str(historical_year) in n:
             score += 100
-
         if comparable_month_kw in n:
             score += 80
-
         for token in hotel_tokens:
             if token in n:
                 score += 25
-
         if "HIST" in n:
             score += 50
 
@@ -8143,16 +8114,51 @@ def resolve_historical_rob_for_future_year(
             f,
         )
 
-    scored = []
+    def validate_best(files, location_rank, source_note):
+        scored = []
+        for f in files:
+            item = score_candidate(f, location_rank)
+            if item:
+                scored.append(item)
 
-    # Preferred comparable month folder.
+        scored.sort(
+            key=lambda x: (x[0], x[1]),
+            reverse=True,
+        )
+
+        rejected = []
+        for _score, _modified, candidate in scored:
+            valid, raw = _historical_rob_has_required_year(
+                service,
+                candidate["id"],
+                historical_year,
+                return_bytes=True,
+            )
+            if valid:
+                return (
+                    candidate["id"],
+                    candidate["name"],
+                    source_note,
+                    raw,
+                ), rejected
+            rejected.append(candidate["name"])
+
+        return None, rejected
+
+    rejected_all = []
+
+    # FAST PATH: comparable prior-year month folder.
     if prior_month_id:
-        for f in list_excel_files([prior_month_id]):
-            s = score_candidate(f, 1000)
-            if s:
-                scored.append(s)
+        result, rejected = validate_best(
+            list_excel_files([prior_month_id]),
+            1000,
+            prior_month_name or comparable_month_kw,
+        )
+        rejected_all.extend(rejected)
+        if result:
+            return result, None
 
-    # Comparable Revenue Reports tree.
+    # Second path: comparable prior-year Revenue Reports tree.
     if prior_rev_id:
         prior_tree = [prior_rev_id]
         frontier = [prior_rev_id]
@@ -8170,57 +8176,112 @@ def resolve_historical_rob_for_future_year(
             prior_tree.extend(f["id"] for f in children)
             frontier = [f["id"] for f in children]
 
-        for f in list_excel_files(prior_tree):
-            s = score_candidate(f, 700)
-            if s:
-                scored.append(s)
+        result, rejected = validate_best(
+            list_excel_files(prior_tree),
+            700,
+            prior_rev_name or f"{comparable_year_kw} Revenue Reports",
+        )
+        rejected_all.extend(rejected)
+        if result:
+            return result, None
 
-    # Broad hotel-scope fallback for SNT/nonstandard folder layouts.
-    for f in list_excel_files(recursive_scope):
-        s = score_candidate(f, 100)
-        if s:
-            scored.append(s)
+    # Slow fallback only when the preferred prior-year area did not work.
+    recursive_scope = []
+    frontier = [hotel_id]
+    seen = set()
 
-    if not scored:
+    for _depth in range(6):
+        current = [
+            pid for pid in frontier
+            if pid and pid not in seen
+        ]
+        if not current:
+            break
+        seen.update(current)
+        recursive_scope.extend(current)
+        children = child_folders(current)
+        frontier = [f["id"] for f in children]
+
+    try:
+        recursive_scope.extend(
+            _hotel_search_scope_ids(service, hotel_id)
+        )
+    except Exception:
+        pass
+
+    recursive_scope = list(dict.fromkeys(recursive_scope))
+
+    result, rejected = validate_best(
+        list_excel_files(recursive_scope),
+        100,
+        "hotel Drive fallback",
+    )
+    rejected_all.extend(rejected)
+    if result:
+        return result, None
+
+    if rejected_all:
         return None, (
-            f"Could not find any ROB candidate for historical "
-            f"{historical_year} under {hotel_name}'s Drive folders."
+            f"Found ROB files for {hotel_name}, but none contained "
+            f"{historical_year} in the ROB year headers. Rejected: "
+            + "; ".join(rejected_all[:8])
         )
 
-    scored.sort(
-        key=lambda x: (x[0], x[1]),
-        reverse=True,
-    )
-
-    # Do not trust filename alone. Validate workbook year headers.
-    rejected = []
-    for _score, _modified, candidate in scored:
-        if _historical_rob_has_required_year(
-            service,
-            candidate["id"],
-            historical_year,
-        ):
-            parents = candidate.get("parents") or []
-            if prior_month_id and prior_month_id in parents:
-                source_note = prior_month_name or comparable_month_kw
-            elif prior_rev_id and prior_rev_id in parents:
-                source_note = prior_rev_name or f"{comparable_year_kw} Revenue Reports"
-            else:
-                source_note = "hotel Drive fallback"
-
-            return (
-                candidate["id"],
-                candidate["name"],
-                source_note,
-            ), None
-
-        rejected.append(candidate["name"])
-
     return None, (
-        f"Found ROB files for {hotel_name}, but none contained "
-        f"{historical_year} in the ROB year headers. Rejected: "
-        + "; ".join(rejected[:8])
+        f"Could not find any ROB candidate for historical "
+        f"{historical_year} under {hotel_name}'s Drive folders."
     )
+
+
+def _resolve_next_year_rob_workbook_session_cached(
+    svc,
+    hotel_id,
+    hotel_name,
+    report_month,
+    tracked_year,
+    force_refresh=False,
+):
+    cache_key = (
+        "next_year_rob",
+        str(hotel_id),
+        str(hotel_name),
+        report_month.strftime("%Y-%m"),
+        int(tracked_year),
+    )
+
+    cache = None
+    try:
+        cache = st.session_state.setdefault(
+            "_drive_workbook_resolution_cache",
+            {},
+        )
+        if not force_refresh and cache_key in cache:
+            item = cache[cache_key]
+            result = (
+                tuple(item["result"])
+                if item.get("result")
+                else None
+            )
+            return result, item.get("error")
+    except Exception:
+        pass
+
+    result, err = resolve_next_year_rob_workbook(
+        svc,
+        hotel_id,
+        hotel_name,
+        report_month=report_month,
+        tracked_year=tracked_year,
+    )
+
+    if cache is not None:
+        cache[cache_key] = {
+            "result": list(result) if result else None,
+            "error": err,
+        }
+
+    return result, err
+
 
 
 def setup_next_year_rob_month(
@@ -8229,6 +8290,7 @@ def setup_next_year_rob_month(
     hotel_name,
     report_month,
     tracked_year=None,
+    progress_callback=None,
 ):
     """Create/prepare the separate next-year ROB.
 
@@ -8243,6 +8305,7 @@ def setup_next_year_rob_month(
     Later report months also carry forward from the previous report month's
     next-year ROB.
     """
+    _emit_rob_setup_progress(progress_callback, 0.03, "Locating report-month folder...")
     tracked_year = tracked_year or (report_month.year + 1)
     year_kw = str(report_month.year)
     month_kw = report_month.strftime("%b%Y").upper()
@@ -8266,7 +8329,8 @@ def setup_next_year_rob_month(
             f"Could not find the {month_kw} folder for {hotel_name}."
         ), None, None
 
-    existing, _ = resolve_next_year_rob_workbook(
+    _emit_rob_setup_progress(progress_callback, 0.12, "Locating or creating next-year ROB...")
+    existing, _ = _resolve_next_year_rob_workbook_session_cached(
         service,
         hotel_id,
         hotel_name,
@@ -8323,6 +8387,7 @@ def setup_next_year_rob_month(
         except Exception as e:
             return None, str(e), None, None
 
+    _emit_rob_setup_progress(progress_callback, 0.24, "Opening next-year ROB...")
     original_bytes = drive_download(service, new_file_id)
     new_wb = openpyxl.load_workbook(
         io.BytesIO(original_bytes),
@@ -8347,7 +8412,8 @@ def setup_next_year_rob_month(
         report_month - datetime.timedelta(days=1)
     ).replace(day=1)
 
-    cadence_prev_result, cadence_prev_err = resolve_drive_workbook(
+    _emit_rob_setup_progress(progress_callback, 0.34, "Loading previous-month cadence source...")
+    cadence_prev_result, cadence_prev_err = _resolve_drive_workbook_session_cached(
         service,
         hotel_id,
         hotel_name,
@@ -8380,7 +8446,7 @@ def setup_next_year_rob_month(
         )
 
     # Previous report month's next-year ROB, when one exists.
-    prev_result, prev_err = resolve_next_year_rob_workbook(
+    prev_result, prev_err = _resolve_next_year_rob_workbook_session_cached(
         service,
         hotel_id,
         hotel_name,
@@ -8413,6 +8479,7 @@ def setup_next_year_rob_month(
     # current-year ROB. Example: a 2027 ROB uses the historical 2026 ROB,
     # which already carries the 2023/2024/2025/2026 stack; shifting that
     # forward yields 2024/2025/2026 in the new 2027 ROB.
+    _emit_rob_setup_progress(progress_callback, 0.50, "Finding historical ROB source...")
     historical_year = tracked_year - 1
     hist_result, hist_err = resolve_historical_rob_for_future_year(
         service,
@@ -8425,8 +8492,13 @@ def setup_next_year_rob_month(
     hist_wb = None
     if hist_result:
         try:
+            hist_bytes = (
+                hist_result[3]
+                if len(hist_result) > 3 and hist_result[3] is not None
+                else drive_download(service, hist_result[0])
+            )
             hist_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, hist_result[0])),
+                io.BytesIO(hist_bytes),
                 data_only=True,
             )
             hist_source_note = (
@@ -8480,6 +8552,8 @@ def setup_next_year_rob_month(
             None,
         )
 
+    _emit_rob_setup_progress(progress_callback, 0.68, "Mapping historical reporting weeks...")
+
     # Map historical weeks by the reporting cadence already consumed in the
     # previous month's NORMAL ROB. Never assume historical WK1 belongs in new
     # WK1 — the prior month may already have consumed that snapshot.
@@ -8526,6 +8600,8 @@ def setup_next_year_rob_month(
             carry_forward_ws=None,
         )
 
+    _emit_rob_setup_progress(progress_callback, 0.82, "Rebuilding year columns and formulas...")
+
     # Rolling one-year rule: for an October 2026 build, 2027 is only tracked
     # through September. October-December 2027 stay blank.
     _rob_clear_next_year_outside_horizon(
@@ -8562,6 +8638,7 @@ def setup_next_year_rob_month(
         apply_rob_pickup_wow_formulas(new_wb, tracked_year, allowed_sheets=None)
     )
 
+    _emit_rob_setup_progress(progress_callback, 0.94, "Saving and uploading next-year ROB...")
     strip_tables(new_wb)
     out = io.BytesIO()
     new_wb.save(out)
@@ -8581,12 +8658,659 @@ def setup_next_year_rob_month(
         new_file_name,
     )
 
+    _emit_rob_setup_progress(progress_callback, 1.0, "Next-year ROB setup complete.")
     return (
         new_file_name,
         "; ".join(warnings) if warnings else None,
         new_file_id,
         original_bytes,
     )
+
+
+def resolve_hilton_historical_rob_for_next_year(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+    historical_year,
+):
+    """Resolve Hilton's exact historical source by comparable month.
+
+    Example:
+      Build: 2027 ROB OCT2026
+      Source folder: OCT2025
+      Source workbook: 2026 ROB <HOTEL>
+
+    This intentionally rejects November/December sources for an October build.
+    """
+    comparable_month = report_month.replace(
+        year=report_month.year - 1
+    )
+    year_kw = str(comparable_month.year)
+    month_kw = comparable_month.strftime("%b%Y").upper()
+
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
+    if not rev_id:
+        return None, (
+            f"Could not find {year_kw} REVENUE REPORTS for "
+            f"{hotel_name}."
+        )
+
+    month_id, month_name = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        comparable_month,
+        hotel_name,
+    )
+    if not month_id:
+        return None, (
+            f"Could not find the comparable {comparable_month:%B %Y} "
+            f"folder for {hotel_name}."
+        )
+
+    q = (
+        f"trashed=false and '{month_id}' in parents and "
+        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+    )
+
+    try:
+        files = service.files().list(
+            q=q,
+            fields="files(id,name,modifiedTime)",
+            pageSize=200,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute().get("files", [])
+    except Exception as e:
+        return None, (
+            f"Could not list files in {month_name or month_kw}: {e}"
+        )
+
+    hotel_tokens = [
+        tok for tok in re.split(
+            r"[^A-Z0-9]+",
+            str(hotel_name).upper(),
+        )
+        if len(tok) >= 3
+    ]
+
+    candidates = []
+    for f in files:
+        name = str(f.get("name", ""))
+        up = name.upper().strip()
+
+        # Exact year-prefixed historical ROB only.
+        if not re.match(
+            rf"^\s*{historical_year}\s+ROB\b",
+            up,
+            flags=re.I,
+        ):
+            continue
+        if "MASTER" in up:
+            continue
+
+        score = 0
+        for token in hotel_tokens:
+            if token in up:
+                score += 20
+
+        # Prefer a plain "2026 ROB HOTEL" file over month-suffixed variants.
+        normalized = re.sub(
+            r"(?i)\.(xlsx|xlsm)$",
+            "",
+            up,
+        ).strip()
+        expected = f"{historical_year} ROB {str(hotel_name).upper()}"
+        if normalized == expected:
+            score += 500
+        else:
+            score += 200
+
+        candidates.append(
+            (
+                score,
+                str(f.get("modifiedTime", "")),
+                f,
+            )
+        )
+
+    if not candidates:
+        return None, (
+            f"No {historical_year} ROB was found in the exact "
+            f"{comparable_month:%B %Y} folder for {hotel_name}."
+        )
+
+    candidates.sort(
+        key=lambda x: (x[0], x[1]),
+        reverse=True,
+    )
+
+    # Validate that the workbook itself carries the expected historical year.
+    rejected = []
+    for _score, _modified, candidate in candidates:
+        valid, raw = _historical_rob_has_required_year(
+            service,
+            candidate["id"],
+            historical_year,
+            return_bytes=True,
+        )
+        if valid:
+            return (
+                candidate["id"],
+                candidate["name"],
+                month_name or month_kw,
+                raw,
+            ), None
+        rejected.append(candidate["name"])
+
+    return None, (
+        f"Found {historical_year} ROB file(s) in "
+        f"{comparable_month:%B %Y}, but none had valid "
+        f"{historical_year} ROB year headers: "
+        + "; ".join(rejected[:6])
+    )
+
+
+def setup_hilton_next_year_rob_month(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+    tracked_year=None,
+    progress_callback=None,
+):
+    """Prepare Hilton next-year ROB from the exact comparable prior-year month.
+
+    OCT2026 -> historical source is the 2026 ROB stored in OCT2025.
+    NOV2026 -> historical source is the 2026 ROB stored in NOV2025.
+    DEC2026 -> historical source is the 2026 ROB stored in DEC2025.
+
+    The historical source's C/D/E columns become B/C/D in the new ROB.
+    The tracked-year E/G cells remain blank until Hilton SRP + Group Wash
+    populate them through the normal Hilton preview/apply flow.
+    """
+    tracked_year = tracked_year or (report_month.year + 1)
+    historical_year = tracked_year - 1
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.05,
+        "Locating report-month folder...",
+    )
+
+    year_kw = str(report_month.year)
+    month_kw = report_month.strftime("%b%Y").upper()
+
+    rev_id, _ = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder.", None, None
+
+    month_id, month_name = _find_month_folder_under_rev(
+        service,
+        rev_id,
+        year_kw,
+        month_kw,
+        report_month,
+        hotel_name,
+    )
+    if not month_id:
+        return None, (
+            f"Could not find the {month_kw} folder for {hotel_name}."
+        ), None, None
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.18,
+        f"Finding {historical_year} ROB in "
+        f"{report_month.replace(year=report_month.year - 1):%B %Y}...",
+    )
+
+    hist_result, hist_err = (
+        resolve_hilton_historical_rob_for_next_year(
+            service,
+            hotel_id,
+            hotel_name,
+            report_month,
+            historical_year,
+        )
+    )
+    if hist_err or not hist_result:
+        return None, hist_err, None, None
+
+    hist_id, hist_name, hist_folder_name, hist_bytes = hist_result
+
+    try:
+        hist_wb = openpyxl.load_workbook(
+            io.BytesIO(hist_bytes),
+            data_only=True,
+        )
+    except Exception as e:
+        return None, (
+            f"Could not open historical source {hist_name}: {e}"
+        ), None, None
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.32,
+        "Locating or creating next-year ROB...",
+    )
+
+    existing, _ = _resolve_next_year_rob_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month=report_month,
+        tracked_year=tracked_year,
+    )
+    is_fresh_copy = not bool(existing)
+
+    if existing:
+        new_file_id, new_file_name = existing
+    else:
+        master_id, master_name = find_rob_master(
+            service,
+            hotel_id,
+            tracked_year,
+        )
+        if not master_id:
+            return None, master_name, None, None
+
+        hotel_suffix = hotel_name.upper()
+        name_upper = master_name.upper()
+        if "ROB" in name_upper:
+            after = master_name[
+                name_upper.find("ROB") + 3:
+            ].strip()
+            after = re.sub(
+                r"(?i)\.(xlsx|xlsm)$",
+                "",
+                after,
+            ).strip()
+            after = re.sub(
+                rf"^\s*{tracked_year}\s*",
+                "",
+                after,
+                flags=re.I,
+            ).strip()
+            if after:
+                hotel_suffix = after
+
+        ext = (
+            ".xlsm"
+            if master_name.lower().endswith(".xlsm")
+            else ".xlsx"
+        )
+        new_file_name = (
+            f"{tracked_year} ROB {month_kw} {hotel_suffix}{ext}"
+        )
+
+        try:
+            new_file_id, new_file_name = drive_copy_file(
+                service,
+                master_id,
+                new_file_name,
+                month_id,
+            )
+        except Exception as e:
+            return None, str(e), None, None
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.46,
+        "Opening next-year ROB...",
+    )
+
+    original_bytes = drive_download(
+        service,
+        new_file_id,
+    )
+    keep_vba = str(new_file_name).lower().endswith(".xlsm")
+    new_wb = openpyxl.load_workbook(
+        io.BytesIO(original_bytes),
+        data_only=False,
+        keep_vba=keep_vba,
+    )
+
+    if is_fresh_copy:
+        clear_tab_colors(
+            new_wb,
+            ROB_SHEETS,
+        )
+
+    _set_rob_year_headers(
+        new_wb,
+        tracked_year,
+    )
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.62,
+        "Copying historical year columns...",
+    )
+
+    copied = 0
+    for sheet_name in ROB_SHEETS:
+        if (
+            sheet_name not in new_wb.sheetnames
+            or sheet_name not in hist_wb.sheetnames
+        ):
+            continue
+
+        copied += _rob_seed_historical_columns(
+            hist_wb[sheet_name],
+            new_wb[sheet_name],
+        )
+
+        dst_ws = new_wb[sheet_name]
+        dst_blocks = rob_month_blocks(dst_ws)
+
+        # New tracked-year cells start blank.
+        for month_idx in range(12):
+            labels = dst_blocks.get(month_idx, {})
+            if not labels:
+                continue
+
+            for label in _ROB_BASE_METRIC_LABELS:
+                row = labels.get(label)
+                if row:
+                    _rob_set_value(
+                        dst_ws,
+                        row,
+                        5,
+                        None,
+                    )
+
+            for label in _ROB_SECONDARY_METRIC_LABELS:
+                row = labels.get(label)
+                if row:
+                    _rob_set_value(
+                        dst_ws,
+                        row,
+                        7,
+                        None,
+                    )
+
+            header_row = _rob_month_header_rows(
+                dst_ws
+            ).get(month_idx)
+            if header_row:
+                _rob_set_value(
+                    dst_ws,
+                    header_row,
+                    5,
+                    None,
+                    number_format="mm/dd/yyyy",
+                )
+
+    if copied == 0:
+        try:
+            drive_upload(
+                service,
+                new_file_id,
+                original_bytes,
+                new_file_name,
+            )
+        except Exception:
+            pass
+        return None, (
+            f"No historical cells could be copied from "
+            f"{hist_name}. No {tracked_year} ROB changes were saved."
+        ), None, None
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.80,
+        "Applying one-year tracking window...",
+    )
+
+    _rob_clear_next_year_outside_horizon(
+        new_wb,
+        report_month,
+        tracked_year,
+    )
+
+    warnings = apply_rob_pickup_wow_formulas(
+        new_wb,
+        tracked_year,
+        allowed_sheets=None,
+    )
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        0.94,
+        "Saving and uploading next-year ROB...",
+    )
+
+    strip_tables(new_wb)
+    out = io.BytesIO()
+    new_wb.save(out)
+
+    drive_upload(
+        service,
+        new_file_id,
+        out.getvalue(),
+        new_file_name,
+    )
+
+    _cache_drive_workbook_resolution(
+        hotel_id,
+        hotel_name,
+        NEXT_YEAR_ROB_TYPE,
+        report_month,
+        new_file_id,
+        new_file_name,
+    )
+
+    _emit_rob_setup_progress(
+        progress_callback,
+        1.0,
+        "Hilton next-year ROB setup complete.",
+    )
+
+    note = (
+        f"Historical source: {hist_name} "
+        f"from {hist_folder_name}; "
+        f"{copied} historical cells copied."
+    )
+    if warnings:
+        note += " " + "; ".join(warnings)
+
+    return (
+        new_file_name,
+        note,
+        new_file_id,
+        original_bytes,
+    )
+
+
+def render_hilton_next_year_rob_month_setup(
+    selected_hotels,
+):
+    """Hilton-specific next-year ROB setup with exact prior-year month mapping."""
+    if not selected_hotels or not next_year_rob_enabled():
+        return
+
+    toggle = st.checkbox(
+        "Set up next month — Next-Year ROB",
+        key="hil_next_year_rob_setup_toggle",
+        help=(
+            "For an October 2026 build, this uses the 2026 ROB "
+            "stored in October 2025. November maps to November, "
+            "December maps to December."
+        ),
+    )
+    if not toggle:
+        return
+
+    today = datetime.date.today()
+    cur_month = today.replace(day=1)
+    next_month = (
+        cur_month + datetime.timedelta(days=32)
+    ).replace(day=1)
+
+    with st.container(border=True):
+        options = {
+            cur_month.strftime("%B %Y"): cur_month,
+            next_month.strftime("%B %Y"): next_month,
+        }
+        labels = list(options.keys())
+        default_dt = (
+            next_month
+            if today.day >= 22
+            else cur_month
+        )
+
+        sel = st.selectbox(
+            "Report month for Next-Year ROB",
+            labels,
+            index=labels.index(
+                default_dt.strftime("%B %Y")
+            ),
+            key="hil_next_year_rob_setup_month",
+        )
+        report_month = options[sel]
+        tracked_year = report_month.year + 1
+        source_month = report_month.replace(
+            year=report_month.year - 1
+        )
+
+        st.caption(
+            f"Source mapping: **{tracked_year - 1} ROB** from "
+            f"**{source_month:%B %Y}** → "
+            f"**{tracked_year} ROB {report_month:%B %Y}**."
+        )
+
+        if st.button(
+            f"Set Up {tracked_year} Hilton ROB",
+            key="hil_next_year_rob_setup_btn",
+            type="primary",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            undo_items = []
+
+            for hotel_name, hotel_id in selected_hotels:
+                if not hotel_id:
+                    st.error(
+                        f"{hotel_name}: no Drive folder found."
+                    )
+                    continue
+
+                progress = st.progress(
+                    0,
+                    text=(
+                        f"{hotel_name}: starting "
+                        f"{tracked_year} ROB setup..."
+                    ),
+                )
+
+                def _progress_cb(
+                    value,
+                    message,
+                    _bar=progress,
+                    _hotel=hotel_name,
+                ):
+                    _bar.progress(
+                        int(round(value * 100)),
+                        text=f"{_hotel}: {message}",
+                    )
+
+                try:
+                    name, err, fid, original = (
+                        setup_hilton_next_year_rob_month(
+                            svc,
+                            hotel_id,
+                            hotel_name,
+                            report_month,
+                            tracked_year=tracked_year,
+                            progress_callback=_progress_cb,
+                        )
+                    )
+                except Exception as e:
+                    st.error(
+                        f"{hotel_name}: Hilton next-year ROB "
+                        f"setup error — {e}"
+                    )
+                    continue
+
+                if err and not name:
+                    st.error(
+                        f"{hotel_name}: {err}"
+                    )
+                    continue
+
+                if err:
+                    st.info(
+                        f"{hotel_name}: {err}"
+                    )
+
+                if fid and original is not None:
+                    undo_items.append(
+                        {
+                            "file_id": fid,
+                            "file_name": name,
+                            "bytes": original,
+                        }
+                    )
+
+                st.success(
+                    f"{hotel_name}: **{name}** ready."
+                )
+
+            if undo_items:
+                st.session_state[
+                    "hil_next_year_setup_undo"
+                ] = undo_items
+
+    if "hil_next_year_setup_undo" in st.session_state:
+        if st.button(
+            "↩ Reset Hilton Next-Year ROB setup",
+            key="hil_next_year_setup_reset",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            errors = []
+
+            for item in st.session_state[
+                "hil_next_year_setup_undo"
+            ]:
+                try:
+                    drive_upload(
+                        svc,
+                        item["file_id"],
+                        item["bytes"],
+                        item["file_name"],
+                    )
+                except Exception as e:
+                    errors.append(
+                        f"{item['file_name']}: {e}"
+                    )
+
+            if errors:
+                for err in errors:
+                    st.error(err)
+            else:
+                st.session_state.pop(
+                    "hil_next_year_setup_undo",
+                    None,
+                )
+                st.success(
+                    "Hilton next-year ROB setup restored."
+                )
+
 
 
 def render_portfolio_next_year_rob_month_setup(
@@ -8651,16 +9375,29 @@ def render_portfolio_next_year_rob_month_setup(
                     st.error(f"{hotel_name}: no Drive folder found.")
                     continue
                 try:
-                    with st.spinner(
-                        f"Setting up {hotel_name} {tracked_year} ROB..."
-                    ):
-                        name, err, fid, original = setup_next_year_rob_month(
-                            svc,
-                            hotel_id,
-                            hotel_name,
-                            report_month,
-                            tracked_year=tracked_year,
+                    progress = st.progress(
+                        0,
+                        text=f"{hotel_name}: starting {tracked_year} ROB setup...",
+                    )
+
+                    def _progress_cb(value, message, _bar=progress, _hotel=hotel_name):
+                        _bar.progress(
+                            int(round(value * 100)),
+                            text=f"{_hotel}: {message}",
                         )
+
+                    name, err, fid, original = setup_next_year_rob_month(
+                        svc,
+                        hotel_id,
+                        hotel_name,
+                        report_month,
+                        tracked_year=tracked_year,
+                        progress_callback=_progress_cb,
+                    )
+                    progress.progress(
+                        100,
+                        text=f"{hotel_name}: complete",
+                    )
 
                     if err and not name:
                         st.error(f"{hotel_name}: {err}")
@@ -14440,10 +15177,28 @@ def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
                     st.error(f"{hotel_name}: no Drive folder found.")
                     continue
                 try:
-                    with st.spinner(f"Setting up {hotel_name} ROB..."):
-                        name, err, file_id, original = setup_new_rob_month(
-                            svc, hotel_id, hotel_name, target_month
+                    progress = st.progress(
+                        0,
+                        text=f"{hotel_name}: starting ROB setup...",
+                    )
+
+                    def _progress_cb(value, message, _bar=progress, _hotel=hotel_name):
+                        _bar.progress(
+                            int(round(value * 100)),
+                            text=f"{_hotel}: {message}",
                         )
+
+                    name, err, file_id, original = setup_new_rob_month(
+                        svc,
+                        hotel_id,
+                        hotel_name,
+                        target_month,
+                        progress_callback=_progress_cb,
+                    )
+                    progress.progress(
+                        100,
+                        text=f"{hotel_name}: complete",
+                    )
 
                     if err and not name:
                         st.error(f"{hotel_name}: {err}")
@@ -14583,9 +15338,8 @@ def render_hilton_update(hotels):
             render_portfolio_rob_month_setup(selected, "hil")
 
         if NEXT_YEAR_ROB_TYPE in wb_sels and selected:
-            render_portfolio_next_year_rob_month_setup(
+            render_hilton_next_year_rob_month_setup(
                 selected,
-                "hil",
             )
 
         srp_file = st.file_uploader(
@@ -14930,6 +15684,23 @@ def render_hilton_update(hotels):
                 )
                 for w in rob_warns:
                     problems.append(f"{name} — ROB ({file_name}): {w}")
+
+                writable_changes = [
+                    c for c in changes
+                    if not c.get("skip_reason")
+                ]
+                if (
+                    wb_type == NEXT_YEAR_ROB_TYPE
+                    and not writable_changes
+                ):
+                    problems.append(
+                        f"{name} — {report_month.year + 1} ROB: "
+                        f"the SRP / Group Wash exports contain no writable "
+                        f"next-year values. The workbook was not queued for "
+                        f"saving, preventing a blank Hilton ROB update."
+                    )
+                    continue
+
                 note = f"  ·  InnCode {inn}"
                 if current_month_total is not None:
                     note += (
@@ -16376,9 +17147,28 @@ with tab_weekly:
                     try:
                         svc         = get_drive_service()
                         hotel_id_nm = hotel_id_map.get(hotel_sel, "")
-                        with st.spinner("Setting up ROB — this may take a moment..."):
-                            rob_name, rob_err, rob_file_id, rob_orig_bytes = setup_new_rob_month(
-                                svc, hotel_id_nm, hotel_sel, setup_month_dt)
+                        progress = st.progress(
+                            0,
+                            text=f"{hotel_sel}: starting ROB setup...",
+                        )
+
+                        def _snt_progress_cb(value, message):
+                            progress.progress(
+                                int(round(value * 100)),
+                                text=f"{hotel_sel}: {message}",
+                            )
+
+                        rob_name, rob_err, rob_file_id, rob_orig_bytes = setup_new_rob_month(
+                            svc,
+                            hotel_id_nm,
+                            hotel_sel,
+                            setup_month_dt,
+                            progress_callback=_snt_progress_cb,
+                        )
+                        progress.progress(
+                            100,
+                            text=f"{hotel_sel}: complete",
+                        )
                         if rob_err and not rob_name:
                             if "storageQuotaExceeded" in str(rob_err):
                                 _, master_name = find_rob_master(svc, hotel_id_nm, target_month.year)
