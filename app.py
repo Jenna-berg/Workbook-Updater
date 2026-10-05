@@ -2341,33 +2341,40 @@ def _kw_matches(cell_val, keyword, r3_val, r4_val):
 
 
 def detect_strategy_columns(ws):
-    """Scan rows 3+4 of THIS sheet and return {field_key: col_index} for each
-    field. Every sheet is re-scanned independently — never assume two sheets
-    (even in the same workbook/hotel) share column positions. Week-1 vs
-    week-2+ tabs can differ (e.g. an extra pickup-tracking column shifts
-    everything after it), so a value pinned from one sheet can silently be
-    wrong on another.
+    """Scan the Strategy multi-row header and return field -> column.
 
-    If row 4 is blank under a TY/LY column, infer it from context (e.g., blank
-    under "OTB TY" → assume "TRANS", blank under "GRP PU TY" → assume "TY").
+    SNT templates do not always split the labels across the same rows.
+    Brass Key, for example, can place the year/category on row 2, the
+    TY/LY family on row 3, and the metric name on row 4. Treat rows 2-4 as
+    one logical header so paired LY columns are detected reliably.
     """
     max_col = ws.max_column
-    # Build lookup: col → (r3_text, r4_text)
+
     headers = {}
     for c in range(1, max_col + 1):
+        r2_val = str(ws.cell(2, c).value or "").strip()
         r3_val = str(ws.cell(3, c).value or "").strip()
         r4_val = str(ws.cell(4, c).value or "").strip()
 
-        # If row 4 is blank or "None", infer from row 3 context
-        if (not r4_val or r4_val == "None") and r3_val:
-            if "OTB TY" in r3_val:
-                r4_val = "TRANS"  # OTB TY column always has TRANS
-            elif "TY" in r3_val and "LY" not in r3_val:
-                r4_val = "TY"  # Other TY columns infer "TY"
-            elif "LY" in r3_val:
-                r4_val = "LY"  # LY columns infer "LY"
+        # Use a single combined header string for pattern matching while
+        # retaining r3/r4 separately for the existing exclusion logic.
+        logical = " ".join(
+            part for part in (r2_val, r3_val, r4_val)
+            if part and part != "None"
+        ).strip()
 
-        headers[c] = (r3_val, r4_val)
+        # Preserve the old inference fallback for sparse templates.
+        inferred_r4 = r4_val
+        if (not inferred_r4 or inferred_r4 == "None") and logical:
+            up = logical.upper()
+            if "OTB TY" in up:
+                inferred_r4 = "TRANS"
+            elif "TY" in up and "LY" not in up:
+                inferred_r4 = "TY"
+            elif "LY" in up:
+                inferred_r4 = "LY"
+
+        headers[c] = (logical, inferred_r4)
 
     col_map = {}
     for field, patterns in STRATEGY_FIELD_PATTERNS.items():
@@ -8891,7 +8898,7 @@ def setup_new_forecast_month(
     target_month: datetime.date,
 ):
     """
-    Set up next month's Forecast.
+    Set up a future month's Forecast.
 
     Normal properties:
       Forecast master -> target month Forecast.
@@ -16142,10 +16149,23 @@ with tab_weekly:
                 type=["xlsx"], key=f"drive_npu_compare_{hotel_sel}", width=500)
 
         opt_col1, opt_col2 = st.columns(2)
-        forecast_next_month = False
+        forecast_months_out = 0
         if "Forecast" in (wb_sels or []):
             with opt_col1:
-                forecast_next_month = st.checkbox("Include next month's Forecast", key="drive_fcst_next")
+                forecast_months_out = st.number_input(
+                    "Future Forecast months to include",
+                    min_value=0,
+                    max_value=12,
+                    value=1,
+                    step=1,
+                    key="drive_fcst_months_out",
+                    help=(
+                        "0 updates only the current Forecast. "
+                        "Choose 1 for next month, 2 for the next two months, etc. "
+                        "For October, choose 2 to include November and December. "
+                        "Missing Forecast workbooks are created automatically."
+                    ),
+                )
         with opt_col2:
             start_new_month = st.checkbox("Set up new month", key="drive_new_month")
     if (
@@ -16353,7 +16373,7 @@ with tab_weekly:
         wb_sels,
         df,
         rate_df,
-        forecast_next_month=False,
+        forecast_months_out=0,
         npu_compare_df=None,
         lighthouse_data=None,
     ):
@@ -16367,10 +16387,29 @@ with tab_weekly:
         prev_month_sr_wb = None
         ly_sr_wb         = None
         if "Strategy Report" in wb_sels:
-            prev_month_dt = (current_month - datetime.timedelta(days=1)).replace(day=1)
-            ly_month_dt   = current_month.replace(year=current_month.year - 1)
-            prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
-            ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
+            prev_month_dt = (
+                current_month - datetime.timedelta(days=1)
+            ).replace(day=1)
+            ly_month_dt = current_month.replace(
+                year=current_month.year - 1
+            )
+
+            prev_month_sr_wb = _load_wb_from_drive(
+                svc,
+                hotel_id,
+                hotel_sel,
+                "Strategy Report",
+                prev_month_dt,
+                data_only=False,
+            )
+            ly_sr_wb = _load_wb_from_drive(
+                svc,
+                hotel_id,
+                hotel_sel,
+                "Strategy Report",
+                ly_month_dt,
+                data_only=False,
+            )
             # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
             # not found, those fields silently produce nothing (no warning previously),
             # which looked like "dates transferred but no text" with no explanation why.
@@ -16461,11 +16500,17 @@ with tab_weekly:
                         f"so daily Strategy values may not populate."
                     )
 
-                # Only extract LY data during month setup, not on regular CSV uploads
-                # (ly_sr_wb is already cleared of blanking logic if ly_data is empty)
-                changes  = build_strategy_change_plan(df, wb, sheet,
-                                                       prev_month_wb=prev_month_sr_wb,
-                                                       ly_wb=None)
+                # Carry prior-year Strategy data during normal SNT uploads too.
+                # This fills OTB LY, Group LY, LY revenue/ADR and other paired
+                # historical fields from the comparable prior-year Strategy
+                # workbook instead of leaving them blank.
+                changes = build_strategy_change_plan(
+                    df,
+                    wb,
+                    sheet,
+                    prev_month_wb=prev_month_sr_wb,
+                    ly_wb=ly_sr_wb,
+                )
                 warnings = []
                 if rate_df is not None:
                     rate_changes, rate_warnings = build_rates_change_plan(
@@ -16494,60 +16539,136 @@ with tab_weekly:
                 "warnings":  warnings,
             }
 
-        # Next-month Forecast: only when checkbox is ticked
-        if "Forecast" in wb_sels and forecast_next_month:
-            next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-            nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
-            if nm_err:
-                # Workbook not found — auto-create from master
-                st.info(f"Next month Forecast not found — creating from master...")
-                created_name, setup_err = setup_new_forecast_month(svc, hotel_id, hotel_sel, next_month_dt)
-                if setup_err and not created_name:
-                    st.warning(f"Next month Forecast: {setup_err}")
-                    nm_result = None
-                else:
-                    if setup_err:
-                        st.warning(setup_err)
-                    else:
-                        st.success(f"Created **{created_name}** for {next_month_dt.strftime('%B %Y')}.")
-                    nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
-                    if nm_err:
-                        st.warning(f"Still could not find next month Forecast after creation: {nm_err}")
-                        nm_result = None
+        # Future Forecast months: build/update as many months out as selected.
+        if "Forecast" in wb_sels and int(forecast_months_out or 0) > 0:
+            base_month = datetime.date.today().replace(day=1)
 
-            # Populate week 3/4's data into next month's WK1 regardless of
-            # whether the file already existed or was just created above —
-            # this used to live in the sibling `else` of `if nm_err`, so on
-            # the very run that created the file, population never ran at
-            # all (the new copy was created with dates only, no OTB data).
-            if nm_result:
-                nm_file_id, nm_file_name = nm_result
-                nm_bytes = drive_download(svc, nm_file_id)
-                nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
-                nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
-                nm_auto  = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
-                nm_sheet = nm_auto or nm_avail[0]
-                nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
-                # Month Ending Forecast table — fill Budget + LY from next month's ROB
-                nm_is_wk1 = (nm_sheet == FORECAST_SHEETS[0])
-                if nm_is_wk1:
-                    nm_rob_result, _ = resolve_drive_workbook(svc, hotel_id, hotel_sel, "ROB",
-                                                               month_date=next_month_dt)
-                    if nm_rob_result:
-                        nm_rob_wb = openpyxl.load_workbook(
-                            io.BytesIO(drive_download(svc, nm_rob_result[0])), data_only=True)
+            for offset in range(1, int(forecast_months_out or 0) + 1):
+                absolute = (
+                    base_month.year * 12
+                    + (base_month.month - 1)
+                    + offset
+                )
+                target_year, target_month0 = divmod(absolute, 12)
+                future_month_dt = datetime.date(
+                    target_year,
+                    target_month0 + 1,
+                    1,
+                )
+
+                fm_result, fm_err = resolve_drive_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_sel,
+                    "Forecast",
+                    month_date=future_month_dt,
+                )
+
+                if fm_err:
+                    st.info(
+                        f"{future_month_dt:%B %Y} Forecast not found — "
+                        f"creating from Forecast template..."
+                    )
+                    created_name, setup_err = setup_new_forecast_month(
+                        svc,
+                        hotel_id,
+                        hotel_sel,
+                        future_month_dt,
+                    )
+
+                    if setup_err and not created_name:
+                        st.warning(
+                            f"{future_month_dt:%B %Y} Forecast: {setup_err}"
+                        )
+                        fm_result = None
+                    else:
+                        if setup_err:
+                            st.warning(setup_err)
+                        else:
+                            st.success(
+                                f"Created **{created_name}** for "
+                                f"{future_month_dt:%B %Y}."
+                            )
+
+                        fm_result, fm_err = resolve_drive_workbook(
+                            svc,
+                            hotel_id,
+                            hotel_sel,
+                            "Forecast",
+                            month_date=future_month_dt,
+                        )
+                        if fm_err:
+                            st.warning(
+                                f"Still could not find "
+                                f"{future_month_dt:%B %Y} Forecast after "
+                                f"creation: {fm_err}"
+                            )
+                            fm_result = None
+
+                if not fm_result:
+                    continue
+
+                fm_file_id, fm_file_name = fm_result
+                fm_bytes = drive_download(svc, fm_file_id)
+                fm_wb = openpyxl.load_workbook(
+                    io.BytesIO(fm_bytes),
+                    data_only=False,
+                )
+                fm_avail = [
+                    s for s in FORECAST_SHEETS
+                    if s in fm_wb.sheetnames
+                ]
+                fm_auto = first_unhighlighted_forecast_sheet(
+                    fm_wb,
+                    fm_avail,
+                )
+                fm_sheet = fm_auto or fm_avail[0]
+
+                fm_changes, fm_warnings = build_next_month_forecast_plan(
+                    df,
+                    fm_wb[fm_sheet],
+                )
+
+                # Month Ending Forecast table — use the matching target month.
+                fm_is_wk1 = (fm_sheet == FORECAST_SHEETS[0])
+                if fm_is_wk1:
+                    fm_rob_result, _ = resolve_drive_workbook(
+                        svc,
+                        hotel_id,
+                        hotel_sel,
+                        "ROB",
+                        month_date=future_month_dt,
+                    )
+
+                    if fm_rob_result:
+                        fm_rob_wb = openpyxl.load_workbook(
+                            io.BytesIO(
+                                drive_download(svc, fm_rob_result[0])
+                            ),
+                            data_only=True,
+                        )
                         extra, extra_warn = build_forecast_change_plan(
-                            df, nm_wb[nm_sheet], rob_wb=nm_rob_wb, is_wk1=True)
-                        # Only keep the Month Ending Forecast entries from extra
-                        nm_changes += [c for c in extra if "Month End Forecast" in c.get("label", "")]
-                        nm_warnings += extra_warn
-                all_plans["Forecast (next month)"] = {
-                    "file_id":   nm_file_id,
-                    "file_name": nm_file_name,
-                    "wb_bytes":  nm_bytes,
-                    "sheet":     nm_sheet,
-                    "changes":   nm_changes,
-                    "warnings":  nm_warnings,
+                            df,
+                            fm_wb[fm_sheet],
+                            rob_wb=fm_rob_wb,
+                            is_wk1=True,
+                        )
+                        fm_changes += [
+                            c for c in extra
+                            if "Month End Forecast"
+                            in c.get("label", "")
+                        ]
+                        fm_warnings += extra_warn
+
+                all_plans[
+                    f"Forecast ({future_month_dt:%b %Y})"
+                ] = {
+                    "file_id": fm_file_id,
+                    "file_name": fm_file_name,
+                    "wb_bytes": fm_bytes,
+                    "sheet": fm_sheet,
+                    "changes": fm_changes,
+                    "warnings": fm_warnings,
                 }
 
         return all_plans
@@ -16637,7 +16758,7 @@ with tab_weekly:
                 npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
                 st.session_state["drive_plans"] = build_all_plans(
                     svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
-                    df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                    df, rate_df, forecast_months_out, npu_compare_df, lighthouse_data
                 )
                 st.session_state["drive_hotel_sel"] = hotel_sel
             except Exception as e:
@@ -16688,7 +16809,7 @@ with tab_weekly:
                 with st.spinner("Updating workbooks in Google Drive..."):
                     all_plans = build_all_plans(
                         svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels,
-                        df, rate_df, forecast_next_month, npu_compare_df, lighthouse_data
+                        df, rate_df, forecast_months_out, npu_compare_df, lighthouse_data
                     )
                     saved, errors = apply_and_upload(svc, all_plans)
                 for name in saved:
