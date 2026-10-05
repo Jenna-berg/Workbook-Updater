@@ -7776,6 +7776,54 @@ def resolve_next_year_rob_workbook(
     return (best["id"], best["name"]), None
 
 
+def _historical_rob_has_required_year(
+    service,
+    file_id,
+    historical_year,
+):
+    """Return True only if the candidate ROB really carries historical_year.
+
+    A valid source for a 2027 ROB must include 2026 as its latest historical
+    year in the main ROB year headers. This prevents a normal 2025 ROB from
+    being accepted just because its filename contains ROB.
+    """
+    try:
+        raw = drive_download(service, file_id)
+        wb = openpyxl.load_workbook(
+            io.BytesIO(raw),
+            data_only=False,
+            read_only=True,
+        )
+    except Exception:
+        return False
+
+    try:
+        for sheet_name in ROB_SHEETS:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            years = []
+            for col in range(2, 6):
+                value = ws.cell(3, col).value
+                try:
+                    year = int(float(value))
+                except Exception:
+                    continue
+                if 2000 <= year <= 2100:
+                    years.append(year)
+
+            if historical_year in years:
+                return True
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return False
+
+
+
 def resolve_historical_rob_for_future_year(
     service,
     hotel_id,
@@ -7783,21 +7831,17 @@ def resolve_historical_rob_for_future_year(
     report_month,
     historical_year,
 ):
-    """Find the dedicated historical ROB used to seed a next-year ROB.
+    """Find a valid historical ROB for the next-year builder.
 
-    Example:
-      Building: 2027 ROB for OCT2026
-      Historical source: OCT2025 folder -> "2026 ROB WEIRTON"
+    Preferred example for OCT2026 -> 2027:
+      comparable OCT2025 area -> "2026 ROB WEIRTON"
 
-    The dedicated historical ROB stores the comparable weekly snapshots for
-    the following tracked year. Its C/D/E columns become B/C/D in the new ROB.
+    Stay In Touch properties do not always use the exact same folder nesting,
+    so the resolver first searches the comparable prior-year folder structure,
+    then recursively searches the hotel's own visible Drive scope.
 
-    Search order:
-      1. Comparable prior-year report-month folder (preferred)
-      2. Comparable prior-year REVENUE REPORTS tree
-      3. Hotel Drive scope fallback
-
-    The active current-year monthly ROB (e.g. OCT2026 ROB WEIRTON) is excluded.
+    A candidate is accepted only if its workbook actually contains the
+    requested historical year in the ROB year headers.
     """
     comparable_month = report_month.replace(
         year=report_month.year - 1
@@ -7805,7 +7849,6 @@ def resolve_historical_rob_for_future_year(
     comparable_year_kw = str(comparable_month.year)
     comparable_month_kw = comparable_month.strftime("%b%Y").upper()
 
-    # Resolve the comparable prior-year REVENUE REPORTS area first.
     prior_rev_id, prior_rev_name = _find_rev_reports_folder_for_year(
         service,
         hotel_id,
@@ -7825,34 +7868,108 @@ def resolve_historical_rob_for_future_year(
             hotel_name,
         )
 
+    hotel_tokens = [
+        tok
+        for tok in re.split(r"[^A-Z0-9]+", str(hotel_name).upper())
+        if len(tok) >= 3
+    ]
+
     def list_excel_files(parent_ids):
-        parent_ids = [pid for pid in parent_ids if pid]
+        parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
         if not parent_ids:
             return []
 
-        parent_clause = " or ".join(
-            f"'{pid}' in parents" for pid in parent_ids
-        )
-        q = (
-            f"trashed=false and ({parent_clause}) and "
-            "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-            "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
-        )
-        try:
-            return service.files().list(
-                q=q,
-                fields="files(id,name,parents,modifiedTime)",
-                pageSize=200,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute().get("files", [])
-        except Exception:
+        out = []
+        for i in range(0, len(parent_ids), 20):
+            batch = parent_ids[i:i + 20]
+            parent_clause = " or ".join(
+                f"'{pid}' in parents" for pid in batch
+            )
+            q = (
+                f"trashed=false and ({parent_clause}) and "
+                "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+                "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+            )
+            try:
+                out.extend(
+                    service.files().list(
+                        q=q,
+                        fields="files(id,name,parents,modifiedTime)",
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute().get("files", [])
+                )
+            except Exception:
+                continue
+
+        deduped = {}
+        for f in out:
+            deduped[f["id"]] = f
+        return list(deduped.values())
+
+    def child_folders(parent_ids):
+        parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
+        if not parent_ids:
             return []
 
-    hotel_tokens = [
-        tok for tok in re.split(r"[^A-Z0-9]+", str(hotel_name).upper())
-        if len(tok) >= 3
-    ]
+        out = []
+        for i in range(0, len(parent_ids), 20):
+            batch = parent_ids[i:i + 20]
+            parent_clause = " or ".join(
+                f"'{pid}' in parents" for pid in batch
+            )
+            q = (
+                "mimeType='application/vnd.google-apps.folder' "
+                f"and trashed=false and ({parent_clause})"
+            )
+            try:
+                out.extend(
+                    service.files().list(
+                        q=q,
+                        fields="files(id,name,parents)",
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute().get("files", [])
+                )
+            except Exception:
+                continue
+
+        deduped = {}
+        for f in out:
+            deduped[f["id"]] = f
+        return list(deduped.values())
+
+    # Build a bounded recursive hotel scope. This is important for Stay In Touch,
+    # where the comparable year's ROB may be nested differently than IHG.
+    recursive_scope = []
+    frontier = [hotel_id]
+    seen = set()
+
+    for _depth in range(6):
+        current = [
+            pid for pid in frontier
+            if pid and pid not in seen
+        ]
+        if not current:
+            break
+
+        seen.update(current)
+        recursive_scope.extend(current)
+
+        children = child_folders(current)
+        frontier = [f["id"] for f in children]
+
+    # Also include the app's existing scoped IDs.
+    try:
+        recursive_scope.extend(
+            _hotel_search_scope_ids(service, hotel_id)
+        )
+    except Exception:
+        pass
+
+    recursive_scope = list(dict.fromkeys(recursive_scope))
 
     def score_candidate(f, location_rank):
         name = str(f.get("name", ""))
@@ -7861,44 +7978,30 @@ def resolve_historical_rob_for_future_year(
         if "ROB" not in n or "MASTER" in n:
             return None
 
-        # Exclude a normal monthly ROB such as OCT2025 ROB WEIRTON.
-        # We want the dedicated year-prefixed historical file such as
-        # "2026 ROB WEIRTON".
-        starts_with_year = bool(
-            re.match(
-                rf"^\s*{historical_year}\s+ROB\b",
-                n,
-                flags=re.I,
-            )
+        leading = re.match(
+            r"^\s*(20\d{2})\s+ROB\b",
+            n,
+            flags=re.I,
         )
-        if not starts_with_year:
-            return None
+        leading_year = int(leading.group(1)) if leading else None
 
         score = location_rank
 
-        # Exact/near-exact dedicated historical filename gets top priority.
-        normalized = re.sub(
-            r"\.(XLSX|XLSM)$",
-            "",
-            n,
-            flags=re.I,
-        ).strip()
-        expected = f"{historical_year} ROB {str(hotel_name).upper()}"
-
-        if normalized == expected:
+        # Dedicated historical naming is strongly preferred.
+        if leading_year == historical_year:
             score += 500
-        elif normalized.startswith(f"{historical_year} ROB "):
-            score += 250
+        elif str(historical_year) in n:
+            score += 100
 
-        # Reward hotel-name agreement.
+        if comparable_month_kw in n:
+            score += 80
+
         for token in hotel_tokens:
             if token in n:
-                score += 20
+                score += 25
 
-        # Comparable month token is allowed but not required. The real
-        # historical file may simply be named "2026 ROB WEIRTON".
-        if comparable_month_kw in n:
-            score += 25
+        if "HIST" in n:
+            score += 50
 
         return (
             score,
@@ -7908,71 +8011,82 @@ def resolve_historical_rob_for_future_year(
 
     scored = []
 
-    # 1) Exact comparable month folder — this is the expected home.
+    # Preferred comparable month folder.
     if prior_month_id:
         for f in list_excel_files([prior_month_id]):
             s = score_candidate(f, 1000)
             if s:
                 scored.append(s)
 
-    # 2) Comparable prior-year Revenue Reports root/tree.
+    # Comparable Revenue Reports tree.
     if prior_rev_id:
-        search_ids = [prior_rev_id]
-        try:
-            search_ids.extend(
-                c["id"]
-                for c in service.files().list(
-                    q=(
-                        "mimeType='application/vnd.google-apps.folder' "
-                        f"and trashed=false and '{prior_rev_id}' in parents"
-                    ),
-                    fields="files(id,name)",
-                    pageSize=200,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                ).execute().get("files", [])
-            )
-        except Exception:
-            pass
+        prior_tree = [prior_rev_id]
+        frontier = [prior_rev_id]
+        seen_prior = set()
 
-        for f in list_excel_files(search_ids):
-            s = score_candidate(f, 600)
+        for _depth in range(5):
+            current = [
+                pid for pid in frontier
+                if pid and pid not in seen_prior
+            ]
+            if not current:
+                break
+            seen_prior.update(current)
+            children = child_folders(current)
+            prior_tree.extend(f["id"] for f in children)
+            frontier = [f["id"] for f in children]
+
+        for f in list_excel_files(prior_tree):
+            s = score_candidate(f, 700)
             if s:
                 scored.append(s)
 
-    # 3) Hotel-scoped fallback only if comparable-year search fails.
-    if not scored:
-        scope_ids = _hotel_search_scope_ids(service, hotel_id)
-        for f in list_excel_files(scope_ids):
-            s = score_candidate(f, 100)
-            if s:
-                scored.append(s)
+    # Broad hotel-scope fallback for SNT/nonstandard folder layouts.
+    for f in list_excel_files(recursive_scope):
+        s = score_candidate(f, 100)
+        if s:
+            scored.append(s)
 
     if not scored:
         return None, (
-            f"Could not find the dedicated historical {historical_year} ROB "
-            f"for {hotel_name}. Searched the comparable "
-            f"{comparable_month:%B %Y} folder first and expected a file like "
-            f"'{historical_year} ROB {hotel_name.upper()}'."
+            f"Could not find any ROB candidate for historical "
+            f"{historical_year} under {hotel_name}'s Drive folders."
         )
 
     scored.sort(
         key=lambda x: (x[0], x[1]),
         reverse=True,
     )
-    best = scored[0][2]
 
-    source_note = (
-        prior_month_name
-        if prior_month_id and prior_month_id in (best.get("parents") or [])
-        else prior_rev_name or "hotel Drive scope"
+    # Do not trust filename alone. Validate workbook year headers.
+    rejected = []
+    for _score, _modified, candidate in scored:
+        if _historical_rob_has_required_year(
+            service,
+            candidate["id"],
+            historical_year,
+        ):
+            parents = candidate.get("parents") or []
+            if prior_month_id and prior_month_id in parents:
+                source_note = prior_month_name or comparable_month_kw
+            elif prior_rev_id and prior_rev_id in parents:
+                source_note = prior_rev_name or f"{comparable_year_kw} Revenue Reports"
+            else:
+                source_note = "hotel Drive fallback"
+
+            return (
+                candidate["id"],
+                candidate["name"],
+                source_note,
+            ), None
+
+        rejected.append(candidate["name"])
+
+    return None, (
+        f"Found ROB files for {hotel_name}, but none contained "
+        f"{historical_year} in the ROB year headers. Rejected: "
+        + "; ".join(rejected[:8])
     )
-
-    return (
-        best["id"],
-        best["name"],
-        source_note,
-    ), None
 
 
 def setup_next_year_rob_month(
@@ -8156,12 +8270,45 @@ def setup_next_year_rob_month(
                 f"(source: {hist_source_note})"
             )
         except Exception as e:
-            warnings.append(
-                f"Historical {historical_year} ROB found but failed to load: {e}"
+            try:
+                drive_upload(
+                    service,
+                    new_file_id,
+                    original_bytes,
+                    new_file_name,
+                )
+            except Exception:
+                pass
+            return (
+                None,
+                (
+                    f"Historical {historical_year} ROB was found but could not "
+                    f"be loaded: {e}. No 2027 ROB changes were saved."
+                ),
+                None,
+                None,
             )
     else:
-        warnings.append(
-            f"Historical {historical_year} ROB not found: {hist_err}"
+        # A next-year ROB without historical data is not a valid setup.
+        # Do not continue and save a blank master/template.
+        try:
+            drive_upload(
+                service,
+                new_file_id,
+                original_bytes,
+                new_file_name,
+            )
+        except Exception:
+            pass
+
+        return (
+            None,
+            (
+                f"Historical {historical_year} ROB not found or not valid: "
+                f"{hist_err}. No 2027 ROB changes were saved."
+            ),
+            None,
+            None,
         )
 
     # Preserve the dedicated historical ROB exactly by week tab.
