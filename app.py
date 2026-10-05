@@ -5034,6 +5034,77 @@ def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     return None
 
 @st.cache_data(ttl=600, show_spinner=False)
+def _drive_folder_children_cached(service, parent_id):
+    """Cache direct child-folder metadata for one parent during the session."""
+    key = str(parent_id)
+    try:
+        cache = st.session_state.setdefault(
+            "_drive_folder_children_cache_v1",
+            {},
+        )
+        if key in cache:
+            return [dict(x) for x in cache[key]]
+    except Exception:
+        cache = None
+
+    q = (
+        "mimeType='application/vnd.google-apps.folder' "
+        "and trashed=false and "
+        f"'{parent_id}' in parents"
+    )
+    rows = service.files().list(
+        q=q,
+        fields="files(id,name,parents,modifiedTime,mimeType)",
+        pageSize=1000,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    if cache is not None:
+        cache[key] = tuple(dict(r) for r in rows)
+
+    return rows
+
+
+def _drive_excel_children_cached(service, parent_id, include_google_sheets=False):
+    """Cache direct child spreadsheet metadata for one parent."""
+    key = (str(parent_id), bool(include_google_sheets))
+    try:
+        cache = st.session_state.setdefault(
+            "_drive_excel_children_cache_v1",
+            {},
+        )
+        if key in cache:
+            return [dict(x) for x in cache[key]]
+    except Exception:
+        cache = None
+
+    mime_parts = [
+        "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'",
+        "mimeType='application/vnd.ms-excel.sheet.macroenabled.12'",
+    ]
+    if include_google_sheets:
+        mime_parts.append("mimeType='application/vnd.google-apps.spreadsheet'")
+
+    q = (
+        f"'{parent_id}' in parents and trashed=false and ("
+        + " or ".join(mime_parts)
+        + ")"
+    )
+    rows = service.files().list(
+        q=q,
+        fields="files(id,name,parents,modifiedTime,mimeType)",
+        pageSize=1000,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+
+    if cache is not None:
+        cache[key] = tuple(dict(r) for r in rows)
+
+    return rows
+
+
 def _find_rev_reports_folder_for_year(_service, hotel_id, year_kw, month_kw=None):
     """Find the REVENUE REPORTS folder to use for a given year (and,
     preferably, the specific target month — see _pick_rev_reports_candidate
@@ -5060,12 +5131,10 @@ def _find_rev_reports_folder_for_year(_service, hotel_id, year_kw, month_kw=None
             return best["id"], best["name"]
         return None, None
 
-    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
-         "and '%s' in parents") % hotel_id
-    children = _service.files().list(
-        q=q, fields="files(id, name)", pageSize=100,
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
+    children = _drive_folder_children_cached(
+        _service,
+        hotel_id,
+    )
     # Match "revenue reports", "rev reports", or just "revenue" in folder name
     candidates = [f for f in children
                   if any(kw in f["name"].lower() for kw in ["revenue reports", "rev reports", "revenue"])]
@@ -5123,12 +5192,10 @@ def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_mon
     if month_id:
         return month_id, month_name
 
-    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
-         "and '%s' in parents") % rev_id
-    siblings = _service.files().list(
-        q=q, fields="files(id, name)", pageSize=100,
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
+    siblings = _drive_folder_children_cached(
+        _service,
+        rev_id,
+    )
     year_id = None
     for f in siblings:
         name_upper = f["name"].upper()
@@ -5144,12 +5211,10 @@ def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_mon
         if depth > 3:  # Prevent infinite recursion
             return None, None
         try:
-            q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
-                 "and '%s' in parents") % parent_id
-            children = _service.files().list(
-                q=q, fields="files(id, name)", pageSize=100,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute().get("files", [])
+            children = _drive_folder_children_cached(
+                _service,
+                parent_id,
+            )
 
             best_match = None
             for child in children:
@@ -5187,19 +5252,11 @@ def drive_find_regular_rob_file(
 
     The generic old lookup could return either one based on Drive list order.
     """
-    q = (
-        f"'{parent_id}' in parents and trashed = false and "
-        "(mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-        "or mimeType = 'application/vnd.ms-excel.sheet.macroenabled.12' "
-        "or mimeType = 'application/vnd.google-apps.spreadsheet')"
+    files = _drive_excel_children_cached(
+        service,
+        parent_id,
+        include_google_sheets=True,
     )
-    files = service.files().list(
-        q=q,
-        fields="files(id,name,modifiedTime)",
-        pageSize=200,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
 
     target_year = month_date.year if month_date else None
     month_kw = (
@@ -5339,7 +5396,31 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     # Shared Drive file (Hyannis Anchor In) 404'd on update() alone, for
     # every workbook type, despite the same file_id having just been read
     # successfully moments earlier.
-    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+    service.files().update(
+        fileId=file_id,
+        media_body=media,
+        supportsAllDrives=True,
+    ).execute()
+
+    # This file changed on Drive, so any session-cached bytes/validation are stale.
+    try:
+        byte_cache = st.session_state.get(
+            "_workbook_bytes_cache_v1",
+            {},
+        )
+        byte_cache.pop(str(file_id), None)
+    except Exception:
+        pass
+
+    try:
+        hist_cache = st.session_state.get(
+            "_hilton_historical_candidate_cache_v1",
+            {},
+        )
+        hist_cache.pop(str(file_id), None)
+        hist_cache.pop(file_id, None)
+    except Exception:
+        pass
 
 
 def _ancillary_normalize_drive_name(value):
@@ -6024,6 +6105,16 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
         fileId=source_file_id, body=body, fields="id,name",
         supportsAllDrives=True,
     ).execute()
+    try:
+        excel_cache = st.session_state.get(
+            "_drive_excel_children_cache_v1",
+            {},
+        )
+        excel_cache.pop((str(parent_id), False), None)
+        excel_cache.pop((str(parent_id), True), None)
+    except Exception:
+        pass
+
     return copied["id"], copied["name"]
 
 
@@ -6046,13 +6137,11 @@ def _hotel_search_scope_ids(_service, hotel_id):
 
     scope_ids = list(root_ids)
     for rid in root_ids:
-        q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
-             "and '%s' in parents") % rid
         try:
-            children = _service.files().list(
-                q=q, fields="files(id)", pageSize=100,
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute().get("files", [])
+            children = _drive_folder_children_cached(
+                _service,
+                rid,
+            )
         except Exception:
             children = []
         scope_ids.extend(c["id"] for c in children)
@@ -7563,9 +7652,16 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     if prev_result:
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) resolved to: {prev_result[1]}")
         try:
-            prev_bytes = drive_download(service, prev_result[0])
-            prev_wb = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=True)
-            prev_wb_formulas = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=False)
+            prev_wb = _get_openpyxl_workbook_cached(
+                service,
+                prev_result[0],
+                data_only=True,
+            )
+            prev_wb_formulas = _get_openpyxl_workbook_cached(
+                service,
+                prev_result[0],
+                data_only=False,
+            )
         except Exception as e:
             warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
     else:
@@ -7583,8 +7679,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             f"resolved to: {ly_result[1]}"
         )
         try:
-            ly_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, ly_result[0])),
+            ly_wb = _get_openpyxl_workbook_cached(
+                service,
+                ly_result[0],
                 data_only=True,
             )
         except Exception as e:
@@ -7617,8 +7714,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             f"resolved to: {next_ly_result[1]}"
         )
         try:
-            next_ly_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, next_ly_result[0])),
+            next_ly_wb = _get_openpyxl_workbook_cached(
+                service,
+                next_ly_result[0],
                 data_only=True,
             )
         except Exception as e:
@@ -7652,8 +7750,9 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             f"{next2_ly_result[1]}"
         )
         try:
-            next2_ly_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, next2_ly_result[0])),
+            next2_ly_wb = _get_openpyxl_workbook_cached(
+                service,
+                next2_ly_result[0],
                 data_only=True,
             )
         except Exception as e:
@@ -8022,63 +8121,33 @@ def resolve_historical_rob_for_future_year(
 
     def list_excel_files(parent_ids):
         parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
-        if not parent_ids:
-            return []
-
         out = []
-        for i in range(0, len(parent_ids), 20):
-            batch = parent_ids[i:i + 20]
-            parent_clause = " or ".join(
-                f"'{pid}' in parents" for pid in batch
-            )
-            q = (
-                f"trashed=false and ({parent_clause}) and "
-                "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-                "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
-            )
+        for pid in parent_ids:
             try:
                 out.extend(
-                    service.files().list(
-                        q=q,
-                        fields="files(id,name,parents,modifiedTime)",
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    ).execute().get("files", [])
+                    _drive_excel_children_cached(
+                        service,
+                        pid,
+                        include_google_sheets=False,
+                    )
                 )
             except Exception:
                 continue
-
         return list({f["id"]: f for f in out}.values())
 
     def child_folders(parent_ids):
         parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
-        if not parent_ids:
-            return []
-
         out = []
-        for i in range(0, len(parent_ids), 20):
-            batch = parent_ids[i:i + 20]
-            parent_clause = " or ".join(
-                f"'{pid}' in parents" for pid in batch
-            )
-            q = (
-                "mimeType='application/vnd.google-apps.folder' "
-                f"and trashed=false and ({parent_clause})"
-            )
+        for pid in parent_ids:
             try:
                 out.extend(
-                    service.files().list(
-                        q=q,
-                        fields="files(id,name,parents)",
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    ).execute().get("files", [])
+                    _drive_folder_children_cached(
+                        service,
+                        pid,
+                    )
                 )
             except Exception:
                 continue
-
         return list({f["id"]: f for f in out}.values())
 
     def score_candidate(f, location_rank):
@@ -8423,12 +8492,9 @@ def setup_next_year_rob_month(
     cadence_prev_wb = None
     if cadence_prev_result:
         try:
-            cadence_prev_bytes = drive_download(
+            cadence_prev_wb = _get_openpyxl_workbook_cached(
                 service,
                 cadence_prev_result[0],
-            )
-            cadence_prev_wb = openpyxl.load_workbook(
-                io.BytesIO(cadence_prev_bytes),
                 data_only=True,
             )
             warnings.append(
@@ -8457,13 +8523,14 @@ def setup_next_year_rob_month(
     prev_wb_formulas = None
     if prev_result:
         try:
-            prev_bytes = drive_download(service, prev_result[0])
-            prev_wb = openpyxl.load_workbook(
-                io.BytesIO(prev_bytes),
+            prev_wb = _get_openpyxl_workbook_cached(
+                service,
+                prev_result[0],
                 data_only=True,
             )
-            prev_wb_formulas = openpyxl.load_workbook(
-                io.BytesIO(prev_bytes),
+            prev_wb_formulas = _get_openpyxl_workbook_cached(
+                service,
+                prev_result[0],
                 data_only=False,
             )
             warnings.append(
@@ -8820,10 +8887,12 @@ def _validate_hilton_historical_rob_bytes(raw):
 
                     for col in (2, 3, 4, 5):
                         value = ws.cell(row, col).value
-                        if (
-                            value is not None
-                            and not is_formula(value)
-                        ):
+
+                        # Hilton historical ROBs can be heavily formula-driven.
+                        # A populated formula cell is still valid historical ROB
+                        # content and must not be rejected merely because it is
+                        # not a literal number.
+                        if value is not None:
                             usable_cells += 1
                             if usable_cells >= 3:
                                 break
@@ -8848,7 +8917,7 @@ def _validate_hilton_historical_rob_bytes(raw):
             return (
                 False,
                 snapshot_dates,
-                "ROB structure was found but no usable historical values were present",
+                "ROB structure was found but no populated historical cells were present",
             )
 
         return True, snapshot_dates, None
@@ -8861,6 +8930,170 @@ def _validate_hilton_historical_rob_bytes(raw):
 
 
 
+def _get_visible_excel_index(service, cache_key, force_refresh=False):
+    """Build one cached list of visible Excel files for a workflow/session."""
+    if not force_refresh:
+        try:
+            cached = st.session_state.get(cache_key)
+            if cached:
+                return cached
+        except Exception:
+            pass
+
+    q = (
+        "trashed=false and "
+        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+    )
+
+    files = []
+    page_token = None
+
+    while True:
+        resp = service.files().list(
+            q=q,
+            fields=(
+                "nextPageToken,"
+                "files(id,name,parents,modifiedTime)"
+            ),
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    try:
+        st.session_state[cache_key] = files
+    except Exception:
+        pass
+
+    return files
+
+
+def _get_workbook_bytes_cached(service, file_id, cache_name="_workbook_bytes_cache_v1"):
+    """Download workbook bytes once per session and reuse them safely."""
+    key = str(file_id)
+
+    try:
+        cache = st.session_state.setdefault(cache_name, {})
+        if key in cache:
+            return cache[key]
+    except Exception:
+        cache = None
+
+    raw = drive_download(service, file_id)
+
+    if cache is not None:
+        cache[key] = raw
+
+    return raw
+
+
+def _get_openpyxl_workbook_cached(
+    service,
+    file_id,
+    *,
+    data_only,
+    keep_vba=False,
+    cache_name="_openpyxl_workbook_cache_v1",
+):
+    """Return a fresh workbook object from session-cached file bytes.
+
+    Workbook objects are mutable, so caching them could leak in-memory changes
+    from one hotel/PMS workflow into another. The network download is cached,
+    but each caller gets a fresh openpyxl workbook built from pristine bytes.
+    """
+    raw = _get_workbook_bytes_cached(
+        service,
+        file_id,
+    )
+    return openpyxl.load_workbook(
+        io.BytesIO(raw),
+        data_only=data_only,
+        keep_vba=keep_vba,
+    )
+
+
+def _get_prev_rob_cadence_wb_cached(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+    *,
+    cache_prefix,
+):
+    """Shared cached previous-month normal ROB for date cadence."""
+    prev_report_month = (
+        report_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+
+    cache_key = (
+        cache_prefix,
+        str(hotel_id),
+        prev_report_month.strftime("%Y-%m"),
+    )
+
+    try:
+        cache = st.session_state.setdefault(
+            "_prev_rob_cadence_cache_v2",
+            {},
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+    except Exception:
+        cache = None
+
+    result, _err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "ROB",
+        month_date=prev_report_month,
+    )
+
+    wb = None
+    if result:
+        try:
+            wb = _get_openpyxl_workbook_cached(
+                service,
+                result[0],
+                data_only=True,
+            )
+        except Exception:
+            wb = None
+
+    if cache is not None:
+        cache[cache_key] = wb
+
+    return wb
+
+
+
+def _get_hilton_visible_excel_index(service, force_refresh=False):
+    return _get_visible_excel_index(
+        service,
+        "_hilton_visible_excel_index_v2",
+        force_refresh=force_refresh,
+    )
+
+
+def _get_hilton_historical_candidate_cache():
+    """Per-session cache for downloaded/validated historical Hilton ROBs."""
+    try:
+        return st.session_state.setdefault(
+            "_hilton_historical_candidate_cache_v1",
+            {},
+        )
+    except Exception:
+        return {}
+
+
+
 def resolve_hilton_historical_rob_for_next_year(
     service,
     hotel_id,
@@ -8868,29 +9101,27 @@ def resolve_hilton_historical_rob_for_next_year(
     report_month,
     historical_year,
 ):
-    """Resolve Hilton historical ROB by visible-file search, not folder ancestry.
+    """Resolve Hilton historical ROB by visible-file search and real filename pattern.
 
-    Hilton historical ROBs are not stored consistently beneath each hotel's
-    live Drive folder. Search all spreadsheet files visible to the service
-    account for the year-prefixed ROB, filter to the property name, validate
-    the workbook's historical-year headers, then prefer the candidate whose
-    internal weekly snapshot dates best match the comparable prior-year month.
+    Confirmed historical naming example:
+      `2026 OCT2025 ROB ANDOVER.xlsx`
 
-    Example:
-      2027 ROB OCT2026
-        -> visible-file search for 2026 ROB
-        -> match NORTHBROOK / ANDOVER / ANN ARBOR etc.
-        -> validate workbook contains 2026 in ROB year headers
-        -> prefer internal weekly dates corresponding to OCT2025
+    For an OCT2026 -> 2027 build, prefer:
+      historical year 2026
+      report-month token OCT2025
+      ROB
+      hotel name
+
+    A plain `2026 ROB ANDOVER` remains a fallback only if no month-specific
+    candidate exists.
     """
     comparable_month = report_month.replace(
         year=report_month.year - 1
     )
+    month_token = comparable_month.strftime("%b%Y").upper()
 
     normalized_hotel = str(hotel_name or "").strip().upper()
 
-    # Property aliases cover the Hilton portfolio names that commonly differ
-    # between the app's display name and historical workbook filename.
     alias_map = {
         "NORTHBROOK": ["NORTHBROOK"],
         "ANDOVER": ["ANDOVER"],
@@ -8937,117 +9168,107 @@ def resolve_hilton_historical_rob_for_next_year(
 
         return False
 
-    # Drive-wide search among files visible to the service account.
-    # We deliberately do not require parent-folder ancestry here.
-    q = (
-        "trashed=false and "
-        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
-    )
-
-    files = []
-    page_token = None
-
     try:
-        while True:
-            resp = service.files().list(
-                q=q,
-                fields=(
-                    "nextPageToken,"
-                    "files(id,name,parents,modifiedTime)"
-                ),
-                pageSize=1000,
-                pageToken=page_token,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute()
-
-            files.extend(
-                resp.get("files", [])
-            )
-
-            page_token = resp.get(
-                "nextPageToken"
-            )
-            if not page_token:
-                break
+        files = _get_hilton_visible_excel_index(
+            service
+        )
     except Exception as e:
         return None, (
             f"Could not search visible Drive files for "
             f"{historical_year} ROB {hotel_name}: {e}"
         )
 
-    # Pass 1: strict year-prefixed filename + hotel name match.
     raw_candidates = []
 
     for f in files:
-        name = str(
-            f.get("name", "")
-        )
+        name = str(f.get("name", ""))
         up = name.upper().strip()
 
         if "MASTER" in up:
             continue
-
-        if not re.match(
-            rf"^\s*{historical_year}\s+ROB\b",
-            up,
-            flags=re.I,
-        ):
+        if str(historical_year) not in up:
             continue
-
+        if "ROB" not in up:
+            continue
         if not filename_matches_hotel(name):
             continue
 
-        raw_candidates.append(f)
+        # Confirmed preferred format:
+        #   2026 OCT2025 ROB ANDOVER
+        exact_month_pattern = re.search(
+            rf"\b{historical_year}\b.*\b{re.escape(month_token)}\b.*\bROB\b",
+            up,
+            flags=re.I,
+        )
 
-    # Pass 2 fallback: some Hilton historical files may contain extra text
-    # before the year. Still require both the target year and ROB plus a hotel
-    # match, but only use this if the strict pass found nothing.
-    if not raw_candidates:
-        for f in files:
-            name = str(
-                f.get("name", "")
-            )
-            up = name.upper().strip()
+        # Fallback legacy format:
+        #   2026 ROB ANDOVER
+        plain_year_rob_pattern = re.search(
+            rf"\b{historical_year}\b.*\bROB\b",
+            up,
+            flags=re.I,
+        )
 
-            if "MASTER" in up:
-                continue
-            if str(historical_year) not in up:
-                continue
-            if "ROB" not in up:
-                continue
-            if not filename_matches_hotel(name):
-                continue
+        if not (
+            exact_month_pattern
+            or plain_year_rob_pattern
+        ):
+            continue
 
-            raw_candidates.append(f)
+        raw_candidates.append(
+            {
+                "file": f,
+                "month_named": bool(exact_month_pattern),
+            }
+        )
 
     if not raw_candidates:
         return None, (
             f"No visible Drive file matching "
-            f"{historical_year} ROB {hotel_name} was found."
+            f"{historical_year} {month_token} ROB {hotel_name} "
+            f"or fallback {historical_year} ROB {hotel_name} was found."
         )
 
     validated = []
     rejected = []
+    candidate_cache = _get_hilton_historical_candidate_cache()
 
-    for candidate in raw_candidates:
-        try:
-            raw = drive_download(
-                service,
-                candidate["id"],
-            )
-        except Exception as e:
-            rejected.append(
-                f"{candidate['name']} (download failed: {e})"
-            )
-            continue
+    for item in raw_candidates:
+        candidate = item["file"]
+        candidate_id = candidate["id"]
 
-        valid, snapshot_dates, invalid_reason = (
-            _validate_hilton_historical_rob_bytes(
-                raw
+        cached = candidate_cache.get(candidate_id)
+
+        if cached is None:
+            try:
+                raw = drive_download(
+                    service,
+                    candidate_id,
+                )
+            except Exception as e:
+                rejected.append(
+                    f"{candidate['name']} (download failed: {e})"
+                )
+                continue
+
+            valid, snapshot_dates, invalid_reason = (
+                _validate_hilton_historical_rob_bytes(
+                    raw
+                )
             )
-        )
+
+            cached = {
+                "raw": raw,
+                "valid": valid,
+                "snapshot_dates": snapshot_dates,
+                "invalid_reason": invalid_reason,
+            }
+            candidate_cache[candidate_id] = cached
+        else:
+            raw = cached["raw"]
+            valid = cached["valid"]
+            snapshot_dates = cached["snapshot_dates"]
+            invalid_reason = cached["invalid_reason"]
 
         if not valid:
             rejected.append(
@@ -9062,28 +9283,35 @@ def resolve_hilton_historical_rob_for_next_year(
             )
         )
 
-        # Prefer exact-looking filenames too.
-        name_up = candidate["name"].upper()
         filename_score = 0
 
-        if re.match(
-            rf"^\s*{historical_year}\s+ROB\b",
-            name_up,
-            flags=re.I,
-        ):
-            filename_score += 500
+        # Huge preference for the confirmed month-specific naming convention.
+        if item["month_named"]:
+            filename_score += 5000
+
+        name_up = candidate["name"].upper()
 
         for alias in aliases:
             if str(alias).upper() in name_up:
                 filename_score += 100
 
+        # Plain historical ROB is only a fallback.
+        if re.search(
+            rf"\b{historical_year}\b.*\bROB\b",
+            name_up,
+            flags=re.I,
+        ):
+            filename_score += 100
+
         validated.append(
             {
-                "score": month_score + filename_score,
+                "score": filename_score + month_score,
+                "filename_score": filename_score,
                 "month_score": month_score,
                 "file": candidate,
                 "raw": raw,
                 "snapshot_dates": snapshot_dates,
+                "month_named": item["month_named"],
             }
         )
 
@@ -9096,6 +9324,7 @@ def resolve_hilton_historical_rob_for_next_year(
 
     validated.sort(
         key=lambda item: (
+            item["month_named"],
             item["month_score"] > 0,
             item["score"],
             str(
@@ -9122,10 +9351,9 @@ def resolve_hilton_historical_rob_for_next_year(
         )
 
     source_note = (
-        f"Drive-wide Hilton historical search; "
         f"selected {best_file['name']}; "
-        f"comparable target {comparable_month:%B %Y}; "
-        f"{date_desc}"
+        f"preferred filename token {month_token}; "
+        f"snapshot dates: {date_desc}"
     )
 
     return (
@@ -9134,6 +9362,21 @@ def resolve_hilton_historical_rob_for_next_year(
         source_note,
         best["raw"],
     ), None
+
+
+def _get_hilton_prev_rob_cadence_wb(
+    service,
+    hotel_id,
+    hotel_name,
+    report_month,
+):
+    return _get_prev_rob_cadence_wb_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month,
+        cache_prefix="hilton",
+    )
 
 
 def setup_hilton_next_year_rob_month(
@@ -9218,6 +9461,17 @@ def setup_hilton_next_year_rob_month(
         return None, (
             f"Could not open historical source {hist_name}: {e}"
         ), None, None
+
+    # Load the previous month's NORMAL ROB so Hilton uses the same
+    # date-first week cadence as the current-year builder. This is what
+    # determines that, for example, OCT2026's new 2027 WK1 should begin
+    # with the historical snapshot AFTER the one September already used.
+    cadence_prev_wb = _get_hilton_prev_rob_cadence_wb(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month,
+    )
 
     _emit_rob_setup_progress(
         progress_callback,
@@ -9315,34 +9569,79 @@ def setup_hilton_next_year_rob_month(
     _emit_rob_setup_progress(
         progress_callback,
         0.62,
-        "Copying historical year columns...",
+        "Mapping historical reporting weeks...",
+    )
+
+    # Use the exact same date-first mapping logic as the current-year ROB
+    # builder. Confirmed against the supplied Andover files:
+    #
+    #   2027 OCT2026 WK1 <- 2026 OCT2025 WK2 (10/08/2025)
+    #   2027 OCT2026 WK2 <- 2026 OCT2025 WK3 (10/15/2025)
+    #   2027 OCT2026 WK3 <- 2026 OCT2025 WK4 (10/22/2025)
+    #   2027 OCT2026 WK4 <- 2026 OCT2025 WK5 (10/29/2025)
+    #
+    # WK1 from the historical source (10/01/2025) is skipped because that
+    # snapshot was already consumed by the prior reporting cadence.
+    historical_week_map, historical_map_diag = (
+        _rob_build_date_first_stly_map(
+            new_wb,
+            cadence_prev_wb,
+            report_month,
+            [
+                (
+                    hist_name,
+                    hist_wb,
+                )
+            ],
+        )
     )
 
     copied = 0
+
     for sheet_name in ROB_SHEETS:
-        if (
-            sheet_name not in new_wb.sheetnames
-            or sheet_name not in hist_wb.sheetnames
-        ):
+        if sheet_name not in new_wb.sheetnames:
             continue
 
-        copied += _rob_seed_historical_columns(
-            hist_wb[sheet_name],
-            new_wb[sheet_name],
+        dst_ws = new_wb[sheet_name]
+        mapped = historical_week_map.get(
+            sheet_name
         )
 
-        dst_ws = new_wb[sheet_name]
+        # Only mapped weeks receive shifted historical values.
+        # Unmapped weeks retain the master/template formulas exactly as they
+        # are. This is required for the supplied correct Andover file, where
+        # WK5 keeps its WK1-linked formulas and WK6 stays blank.
+        if mapped is not None:
+            src_ws = mapped["worksheet"]
+
+            copied += _rob_seed_historical_columns_hilton(
+                src_ws,
+                dst_ws,
+            )
+
         dst_blocks = rob_month_blocks(dst_ws)
 
-        # New tracked-year cells start blank.
+        # Reset only literal tracked-year data. Preserve formulas already
+        # present in the 2027 template (e.g. WK2-WK5 E-column links to WK1).
         for month_idx in range(12):
-            labels = dst_blocks.get(month_idx, {})
+            labels = dst_blocks.get(
+                month_idx,
+                {},
+            )
             if not labels:
                 continue
 
             for label in _ROB_BASE_METRIC_LABELS:
                 row = labels.get(label)
-                if row:
+                if not row:
+                    continue
+
+                current = dst_ws.cell(
+                    row,
+                    5,
+                ).value
+
+                if not is_formula(current):
                     _rob_set_value(
                         dst_ws,
                         row,
@@ -9352,7 +9651,15 @@ def setup_hilton_next_year_rob_month(
 
             for label in _ROB_SECONDARY_METRIC_LABELS:
                 row = labels.get(label)
-                if row:
+                if not row:
+                    continue
+
+                current = dst_ws.cell(
+                    row,
+                    7,
+                ).value
+
+                if not is_formula(current):
                     _rob_set_value(
                         dst_ws,
                         row,
@@ -9363,14 +9670,24 @@ def setup_hilton_next_year_rob_month(
             header_row = _rob_month_header_rows(
                 dst_ws
             ).get(month_idx)
+
             if header_row:
-                _rob_set_value(
-                    dst_ws,
+                current_header = dst_ws.cell(
                     header_row,
                     5,
-                    None,
-                    number_format="mm/dd/yyyy",
-                )
+                ).value
+
+                # Preserve linked header formulas such as =E4. Literal
+                # tracked-year header cells in the confirmed correct Hilton
+                # workbook are zero before weekly updates begin.
+                if not is_formula(current_header):
+                    _rob_set_value(
+                        dst_ws,
+                        header_row,
+                        5,
+                        0.0,
+                        number_format="mm/dd/yyyy",
+                    )
 
     if copied == 0:
         try:
@@ -9414,10 +9731,7 @@ def setup_hilton_next_year_rob_month(
                         _row,
                         _col,
                     ).value
-                    if (
-                        _value is not None
-                        and not is_formula(_value)
-                    ):
+                    if _value is not None:
                         historical_readback_found = True
                         break
 
@@ -9497,10 +9811,15 @@ def setup_hilton_next_year_rob_month(
         "Hilton next-year ROB setup complete.",
     )
 
+    map_note = " | ".join(
+        historical_map_diag
+    ) if historical_map_diag else "no mapping diagnostics"
+
     note = (
         f"Historical source selected: {hist_name}. "
         f"Match details: {hist_folder_name}. "
-        f"{copied} historical cells copied."
+        f"{copied} historical cells copied. "
+        f"Week mapping: {map_note}"
     )
     if warnings:
         note += " " + "; ".join(warnings)
@@ -9565,9 +9884,9 @@ def render_hilton_next_year_rob_month_setup(
         )
 
         st.caption(
-            f"Source mapping: search visible Drive files for this hotel's "
-            f"**{tracked_year - 1} ROB**. Internal weekly snapshot dates "
-            f"prefer the **{source_month:%B %Y}** source → "
+            f"Source mapping: prefer files named like "
+            f"**{tracked_year - 1} {source_month:%b%Y} ROB <HOTEL>** "
+            f"(for example, `2026 OCT2025 ROB ANDOVER`) → "
             f"**{tracked_year} ROB {report_month:%B %Y}**."
         )
 
@@ -9579,6 +9898,24 @@ def render_hilton_next_year_rob_month_setup(
         ):
             svc = get_drive_service()
             undo_items = []
+
+            index_progress = st.progress(
+                0,
+                text="Indexing visible Drive files once for this Hilton run...",
+            )
+            try:
+                _get_hilton_visible_excel_index(
+                    svc
+                )
+                index_progress.progress(
+                    100,
+                    text="Drive index ready.",
+                )
+            except Exception as e:
+                st.error(
+                    f"Could not build Hilton Drive index: {e}"
+                )
+                return
 
             for hotel_name, hotel_id in selected_hotels:
                 if not hotel_id:
@@ -9747,6 +10084,7 @@ def render_portfolio_next_year_rob_month_setup(
             svc = get_drive_service()
             undo_items = []
             successes = 0
+
 
             for hotel_name, hotel_id in selected_hotels:
                 if not hotel_id:
