@@ -8674,20 +8674,25 @@ def resolve_hilton_historical_rob_for_next_year(
     report_month,
     historical_year,
 ):
-    """Resolve Hilton's exact historical source by comparable month.
+    """Resolve Hilton historical ROB from the comparable prior-year tree.
 
     Example:
       Build: 2027 ROB OCT2026
-      Source folder: OCT2025
-      Source workbook: 2026 ROB <HOTEL>
+      Search tree: hotel's 2025 REVENUE REPORTS
+      Preferred source path: an October 2025 folder/subfolder
+      Preferred workbook: 2026 ROB <HOTEL>
 
-    This intentionally rejects November/December sources for an October build.
+    The search is recursive because Hilton hotel folders are not all nested
+    identically. Month matching is based on the candidate file's ancestor
+    folder path, not on one assumed direct-parent structure.
     """
     comparable_month = report_month.replace(
         year=report_month.year - 1
     )
     year_kw = str(comparable_month.year)
     month_kw = comparable_month.strftime("%b%Y").upper()
+    month_name_full = comparable_month.strftime("%B").upper()
+    month_abbr = comparable_month.strftime("%b").upper()
 
     rev_id, rev_name = _find_rev_reports_folder_for_year(
         service,
@@ -8701,38 +8706,101 @@ def resolve_hilton_historical_rob_for_next_year(
             f"{hotel_name}."
         )
 
-    month_id, month_name = _find_month_folder_under_rev(
-        service,
-        rev_id,
-        year_kw,
-        month_kw,
-        comparable_month,
-        hotel_name,
-    )
-    if not month_id:
-        return None, (
-            f"Could not find the comparable {comparable_month:%B %Y} "
-            f"folder for {hotel_name}."
-        )
+    def list_child_folders(parent_ids):
+        parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
+        if not parent_ids:
+            return []
 
-    q = (
-        f"trashed=false and '{month_id}' in parents and "
-        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
-    )
+        out = []
+        for i in range(0, len(parent_ids), 20):
+            batch = parent_ids[i:i + 20]
+            parent_clause = " or ".join(
+                f"'{pid}' in parents" for pid in batch
+            )
+            q = (
+                "mimeType='application/vnd.google-apps.folder' "
+                f"and trashed=false and ({parent_clause})"
+            )
+            try:
+                out.extend(
+                    service.files().list(
+                        q=q,
+                        fields="files(id,name,parents)",
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute().get("files", [])
+                )
+            except Exception:
+                continue
+        return list({f["id"]: f for f in out}.values())
 
-    try:
-        files = service.files().list(
-            q=q,
-            fields="files(id,name,modifiedTime)",
-            pageSize=200,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute().get("files", [])
-    except Exception as e:
-        return None, (
-            f"Could not list files in {month_name or month_kw}: {e}"
-        )
+    def list_excel_files(parent_ids):
+        parent_ids = list(dict.fromkeys(pid for pid in parent_ids if pid))
+        if not parent_ids:
+            return []
+
+        out = []
+        for i in range(0, len(parent_ids), 20):
+            batch = parent_ids[i:i + 20]
+            parent_clause = " or ".join(
+                f"'{pid}' in parents" for pid in batch
+            )
+            q = (
+                f"trashed=false and ({parent_clause}) and "
+                "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+                "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+            )
+            try:
+                out.extend(
+                    service.files().list(
+                        q=q,
+                        fields="files(id,name,parents,modifiedTime)",
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute().get("files", [])
+                )
+            except Exception:
+                continue
+        return list({f["id"]: f for f in out}.values())
+
+    # Traverse the full 2025 Revenue Reports tree while retaining each folder's path.
+    folder_paths = {
+        rev_id: str(rev_name or f"{year_kw} REVENUE REPORTS")
+    }
+    frontier = [rev_id]
+    seen = set()
+
+    for _depth in range(8):
+        current = [
+            pid for pid in frontier
+            if pid and pid not in seen
+        ]
+        if not current:
+            break
+
+        seen.update(current)
+        children = list_child_folders(current)
+        next_frontier = []
+
+        for child in children:
+            child_id = child["id"]
+            parents = child.get("parents") or []
+            parent_id = parents[0] if parents else None
+            parent_path = folder_paths.get(
+                parent_id,
+                str(rev_name or f"{year_kw} REVENUE REPORTS"),
+            )
+            folder_paths[child_id] = (
+                f"{parent_path} / {child.get('name', '')}"
+            )
+            next_frontier.append(child_id)
+
+        frontier = next_frontier
+
+    all_folder_ids = list(folder_paths.keys())
+    files = list_excel_files(all_folder_ids)
 
     hotel_tokens = [
         tok for tok in re.split(
@@ -8742,12 +8810,44 @@ def resolve_hilton_historical_rob_for_next_year(
         if len(tok) >= 3
     ]
 
+    def path_for_file(f):
+        parents = f.get("parents") or []
+        if not parents:
+            return ""
+        return folder_paths.get(parents[0], "")
+
+    def month_path_score(path_text):
+        up = str(path_text or "").upper()
+
+        # Strongest: explicit OCT2025 / OCT 2025 / OCTOBER 2025 wording.
+        if month_kw in up:
+            return 500
+
+        compact = re.sub(r"[^A-Z0-9]+", "", up)
+        if f"{month_abbr}{year_kw}" in compact:
+            return 475
+        if f"{month_name_full}{year_kw}" in compact:
+            return 475
+
+        # Also accept month name + year appearing separately in the path.
+        if (
+            year_kw in up
+            and (
+                re.search(rf"\b{month_abbr}\b", up)
+                or re.search(rf"\b{month_name_full}\b", up)
+            )
+        ):
+            return 425
+
+        return 0
+
     candidates = []
+
     for f in files:
         name = str(f.get("name", ""))
         up = name.upper().strip()
 
-        # Exact year-prefixed historical ROB only.
+        # Historical Hilton source must be the year-prefixed ROB.
         if not re.match(
             rf"^\s*{historical_year}\s+ROB\b",
             up,
@@ -8757,45 +8857,72 @@ def resolve_hilton_historical_rob_for_next_year(
         if "MASTER" in up:
             continue
 
-        score = 0
-        for token in hotel_tokens:
-            if token in up:
-                score += 20
+        path_text = path_for_file(f)
+        path_score = month_path_score(path_text)
 
-        # Prefer a plain "2026 ROB HOTEL" file over month-suffixed variants.
+        score = path_score
+
         normalized = re.sub(
             r"(?i)\.(xlsx|xlsm)$",
             "",
             up,
         ).strip()
-        expected = f"{historical_year} ROB {str(hotel_name).upper()}"
+
+        expected = (
+            f"{historical_year} ROB "
+            f"{str(hotel_name).upper()}"
+        )
         if normalized == expected:
             score += 500
         else:
             score += 200
 
+        for token in hotel_tokens:
+            if token in up:
+                score += 25
+
+        # Filename month token is a useful secondary hint.
+        if month_kw in up:
+            score += 100
+
         candidates.append(
             (
                 score,
+                path_score,
                 str(f.get("modifiedTime", "")),
                 f,
+                path_text,
             )
         )
 
     if not candidates:
         return None, (
-            f"No {historical_year} ROB was found in the exact "
-            f"{comparable_month:%B %Y} folder for {hotel_name}."
+            f"No {historical_year} ROB was found anywhere under "
+            f"{rev_name or year_kw + ' REVENUE REPORTS'} for "
+            f"{hotel_name}."
         )
 
+    # Prefer candidates actually stored in the comparable month path.
     candidates.sort(
-        key=lambda x: (x[0], x[1]),
+        key=lambda x: (
+            x[1] > 0,   # matching month path first
+            x[0],
+            x[2],
+        ),
         reverse=True,
     )
 
-    # Validate that the workbook itself carries the expected historical year.
     rejected = []
-    for _score, _modified, candidate in candidates:
+
+    for _score, path_score, _modified, candidate, path_text in candidates:
+        # Never silently take a different report month if a month-specific
+        # source exists. A December source must not win an October build.
+        if path_score <= 0:
+            rejected.append(
+                f"{candidate['name']} [{path_text or 'unknown path'}]"
+            )
+            continue
+
         valid, raw = _historical_rob_has_required_year(
             service,
             candidate["id"],
@@ -8806,16 +8933,18 @@ def resolve_hilton_historical_rob_for_next_year(
             return (
                 candidate["id"],
                 candidate["name"],
-                month_name or month_kw,
+                path_text,
                 raw,
             ), None
-        rejected.append(candidate["name"])
+
+        rejected.append(
+            f"{candidate['name']} [{path_text or 'unknown path'}]"
+        )
 
     return None, (
-        f"Found {historical_year} ROB file(s) in "
-        f"{comparable_month:%B %Y}, but none had valid "
-        f"{historical_year} ROB year headers: "
-        + "; ".join(rejected[:6])
+        f"Found {historical_year} ROB file(s) for {hotel_name}, but none "
+        f"were valid in the comparable {comparable_month:%B %Y} path. "
+        f"Checked: " + "; ".join(rejected[:10])
     )
 
 
@@ -9188,8 +9317,9 @@ def render_hilton_next_year_rob_month_setup(
         )
 
         st.caption(
-            f"Source mapping: **{tracked_year - 1} ROB** from "
-            f"**{source_month:%B %Y}** → "
+            f"Source mapping: search this hotel's **{source_month.year} "
+            f"Revenue Reports** tree for the **{tracked_year - 1} ROB** "
+            f"stored under the **{source_month:%B %Y}** path → "
             f"**{tracked_year} ROB {report_month:%B %Y}**."
         )
 
