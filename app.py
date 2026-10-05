@@ -8764,147 +8764,127 @@ def resolve_hilton_historical_rob_for_next_year(
     report_month,
     historical_year,
 ):
-    """Resolve Hilton historical ROB within this hotel's own Drive structure.
+    """Resolve Hilton historical ROB by visible-file search, not folder ancestry.
 
-    The Northbrook folder example established the important naming rule:
-    historical source workbooks are year-prefixed files such as
-    `2026 ROB NORTHBROOK`.
-
-    Folder nesting varies by property, so this resolver searches the hotel's
-    own visible Drive tree for matching year-prefixed ROB files. It then uses
-    the workbook's internal weekly snapshot dates to choose the candidate that
-    corresponds to the comparable prior-year report month.
+    Hilton historical ROBs are not stored consistently beneath each hotel's
+    live Drive folder. Search all spreadsheet files visible to the service
+    account for the year-prefixed ROB, filter to the property name, validate
+    the workbook's historical-year headers, then prefer the candidate whose
+    internal weekly snapshot dates best match the comparable prior-year month.
 
     Example:
       2027 ROB OCT2026
-        -> search Northbrook's own Drive tree
-        -> find `2026 ROB NORTHBROOK`
-        -> prefer the workbook whose internal snapshot dates match OCT2025
+        -> visible-file search for 2026 ROB
+        -> match NORTHBROOK / ANDOVER / ANN ARBOR etc.
+        -> validate workbook contains 2026 in ROB year headers
+        -> prefer internal weekly dates corresponding to OCT2025
     """
     comparable_month = report_month.replace(
         year=report_month.year - 1
     )
 
     normalized_hotel = str(hotel_name or "").strip().upper()
-    hotel_tokens = [
-        tok
-        for tok in re.split(r"[^A-Z0-9]+", normalized_hotel)
-        if len(tok) >= 3
-    ]
 
-    def child_folders(parent_ids):
-        parent_ids = list(
-            dict.fromkeys(pid for pid in parent_ids if pid)
-        )
-        if not parent_ids:
-            return []
+    # Property aliases cover the Hilton portfolio names that commonly differ
+    # between the app's display name and historical workbook filename.
+    alias_map = {
+        "NORTHBROOK": ["NORTHBROOK"],
+        "ANDOVER": ["ANDOVER"],
+        "ANN ARBOR": ["ANN ARBOR", "ANNARBOR"],
+        "MESA": ["MESA"],
+        "NASHUA": ["NASHUA"],
+        "SILVER SPRING": ["SILVER SPRING", "SILVERSPRING"],
+        "MEMPHIS": ["MEMPHIS"],
+        "KANSAS CITY": ["KANSAS CITY", "KANSASCITY"],
+    }
 
-        out = []
-        for i in range(0, len(parent_ids), 20):
-            batch = parent_ids[i:i + 20]
-            parent_clause = " or ".join(
-                f"'{pid}' in parents"
-                for pid in batch
-            )
-            q = (
-                "mimeType='application/vnd.google-apps.folder' "
-                f"and trashed=false and ({parent_clause})"
-            )
-            try:
-                out.extend(
-                    service.files().list(
-                        q=q,
-                        fields="files(id,name,parents)",
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    ).execute().get("files", [])
-                )
-            except Exception:
-                continue
-
-        return list({f["id"]: f for f in out}.values())
-
-    def excel_files(parent_ids):
-        parent_ids = list(
-            dict.fromkeys(pid for pid in parent_ids if pid)
-        )
-        if not parent_ids:
-            return []
-
-        out = []
-        for i in range(0, len(parent_ids), 20):
-            batch = parent_ids[i:i + 20]
-            parent_clause = " or ".join(
-                f"'{pid}' in parents"
-                for pid in batch
-            )
-            q = (
-                f"trashed=false and ({parent_clause}) and "
-                "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-                "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
-            )
-            try:
-                out.extend(
-                    service.files().list(
-                        q=q,
-                        fields="files(id,name,parents,modifiedTime)",
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    ).execute().get("files", [])
-                )
-            except Exception:
-                continue
-
-        return list({f["id"]: f for f in out}.values())
-
-    # Search this hotel's own folder tree.
-    scope = []
-    frontier = [hotel_id]
-    seen = set()
-
-    for _depth in range(10):
-        current = [
-            pid for pid in frontier
-            if pid and pid not in seen
-        ]
-        if not current:
+    aliases = None
+    for key, vals in alias_map.items():
+        if key in normalized_hotel:
+            aliases = vals
             break
 
-        seen.update(current)
-        scope.extend(current)
-
-        children = child_folders(current)
-        frontier = [
-            f["id"] for f in children
-        ]
-
-    # Include any already-known Revenue Reports/search roots for this hotel.
-    try:
-        scope.extend(
-            _hotel_search_scope_ids(
-                service,
-                hotel_id,
+    if aliases is None:
+        tokens = [
+            tok for tok in re.split(
+                r"[^A-Z0-9]+",
+                normalized_hotel,
             )
+            if len(tok) >= 3
+        ]
+        aliases = [normalized_hotel] + tokens
+
+    def filename_matches_hotel(filename):
+        up = str(filename or "").upper()
+        compact = re.sub(r"[^A-Z0-9]+", "", up)
+
+        for alias in aliases:
+            alias_up = str(alias).upper()
+            if alias_up in up:
+                return True
+
+            alias_compact = re.sub(
+                r"[^A-Z0-9]+",
+                "",
+                alias_up,
+            )
+            if alias_compact and alias_compact in compact:
+                return True
+
+        return False
+
+    # Drive-wide search among files visible to the service account.
+    # We deliberately do not require parent-folder ancestry here.
+    q = (
+        "trashed=false and "
+        "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')"
+    )
+
+    files = []
+    page_token = None
+
+    try:
+        while True:
+            resp = service.files().list(
+                q=q,
+                fields=(
+                    "nextPageToken,"
+                    "files(id,name,parents,modifiedTime)"
+                ),
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+
+            files.extend(
+                resp.get("files", [])
+            )
+
+            page_token = resp.get(
+                "nextPageToken"
+            )
+            if not page_token:
+                break
+    except Exception as e:
+        return None, (
+            f"Could not search visible Drive files for "
+            f"{historical_year} ROB {hotel_name}: {e}"
         )
-    except Exception:
-        pass
 
-    scope = list(dict.fromkeys(scope))
-    files = excel_files(scope)
-
-    candidates = []
+    # Pass 1: strict year-prefixed filename + hotel name match.
+    raw_candidates = []
 
     for f in files:
-        name = str(f.get("name", ""))
+        name = str(
+            f.get("name", "")
+        )
         up = name.upper().strip()
 
         if "MASTER" in up:
             continue
 
-        # Historical Hilton source must follow the year-prefixed naming rule
-        # observed in the actual Drive examples: `2026 ROB <HOTEL>`.
         if not re.match(
             rf"^\s*{historical_year}\s+ROB\b",
             up,
@@ -8912,64 +8892,116 @@ def resolve_hilton_historical_rob_for_next_year(
         ):
             continue
 
-        filename_score = 0
-        for token in hotel_tokens:
-            if token in up:
-                filename_score += 50
-
-        # Require at least one meaningful property-name token when possible.
-        if hotel_tokens and filename_score == 0:
+        if not filename_matches_hotel(name):
             continue
 
+        raw_candidates.append(f)
+
+    # Pass 2 fallback: some Hilton historical files may contain extra text
+    # before the year. Still require both the target year and ROB plus a hotel
+    # match, but only use this if the strict pass found nothing.
+    if not raw_candidates:
+        for f in files:
+            name = str(
+                f.get("name", "")
+            )
+            up = name.upper().strip()
+
+            if "MASTER" in up:
+                continue
+            if str(historical_year) not in up:
+                continue
+            if "ROB" not in up:
+                continue
+            if not filename_matches_hotel(name):
+                continue
+
+            raw_candidates.append(f)
+
+    if not raw_candidates:
+        return None, (
+            f"No visible Drive file matching "
+            f"{historical_year} ROB {hotel_name} was found."
+        )
+
+    validated = []
+    rejected = []
+
+    for candidate in raw_candidates:
         valid, raw = _historical_rob_has_required_year(
             service,
-            f["id"],
+            candidate["id"],
             historical_year,
             return_bytes=True,
         )
+
         if not valid or raw is None:
+            rejected.append(
+                candidate["name"]
+            )
             continue
 
-        snapshot_dates = _historical_rob_snapshot_dates_from_bytes(
-            raw
-        )
-        month_score = _hilton_historical_month_match_score(
-            snapshot_dates,
-            comparable_month,
+        snapshot_dates = (
+            _historical_rob_snapshot_dates_from_bytes(
+                raw
+            )
         )
 
-        # Keep candidates even when their internal dates do not create an
-        # exact month match. Some historical ROBs are stored as one rolling
-        # year file rather than one file per report month. The month score
-        # still ranks exact/close matches first.
-        candidates.append(
+        month_score = (
+            _hilton_historical_month_match_score(
+                snapshot_dates,
+                comparable_month,
+            )
+        )
+
+        # Prefer exact-looking filenames too.
+        name_up = candidate["name"].upper()
+        filename_score = 0
+
+        if re.match(
+            rf"^\s*{historical_year}\s+ROB\b",
+            name_up,
+            flags=re.I,
+        ):
+            filename_score += 500
+
+        for alias in aliases:
+            if str(alias).upper() in name_up:
+                filename_score += 100
+
+        validated.append(
             {
                 "score": month_score + filename_score,
                 "month_score": month_score,
-                "file": f,
+                "file": candidate,
                 "raw": raw,
                 "snapshot_dates": snapshot_dates,
             }
         )
 
-    if not candidates:
+    if not validated:
         return None, (
-            f"No valid {historical_year} ROB for {hotel_name} was found "
-            f"in that hotel's visible Drive folders."
+            f"Found candidate {historical_year} ROB file(s) for "
+            f"{hotel_name}, but none contained valid "
+            f"{historical_year} ROB year headers. Rejected: "
+            + "; ".join(rejected[:8])
         )
 
-    # Exact internal-date match wins. If none exists, prefer the strongest
-    # hotel-name match and most recently modified valid year-prefixed ROB.
-    candidates.sort(
+    validated.sort(
         key=lambda item: (
             item["month_score"] > 0,
             item["score"],
-            str(item["file"].get("modifiedTime", "")),
+            str(
+                item["file"].get(
+                    "modifiedTime",
+                    "",
+                )
+            ),
         ),
         reverse=True,
     )
 
-    best = candidates[0]
+    best = validated[0]
     best_file = best["file"]
 
     if best["snapshot_dates"]:
@@ -8978,21 +9010,21 @@ def resolve_hilton_historical_rob_for_next_year(
             for sheet, d in best["snapshot_dates"]
         )
     else:
-        date_desc = "no readable weekly snapshot dates"
-
-    match_note = (
-        f"internal snapshot match for {comparable_month:%B %Y}"
-        if best["month_score"] > 0
-        else (
-            f"valid {historical_year} ROB fallback; "
-            f"no exact {comparable_month:%B %Y} snapshot match"
+        date_desc = (
+            "no readable weekly snapshot dates"
         )
+
+    source_note = (
+        f"Drive-wide Hilton historical search; "
+        f"selected {best_file['name']}; "
+        f"comparable target {comparable_month:%B %Y}; "
+        f"{date_desc}"
     )
 
     return (
         best_file["id"],
         best_file["name"],
-        f"{match_note}: {date_desc}",
+        source_note,
         best["raw"],
     ), None
 
@@ -9248,6 +9280,66 @@ def setup_hilton_next_year_rob_month(
             f"{hist_name}. No {tracked_year} ROB changes were saved."
         ), None, None
 
+    # Hard safety readback: at least one historical B:D metric cell must now
+    # contain a literal value. If not, restore the original file rather than
+    # saving another blank Hilton next-year ROB.
+    historical_readback_found = False
+
+    for _sheet_name in ROB_SHEETS:
+        if _sheet_name not in new_wb.sheetnames:
+            continue
+
+        _ws = new_wb[_sheet_name]
+        _blocks = rob_month_blocks(_ws)
+
+        for _month_idx in range(12):
+            _labels = _blocks.get(_month_idx, {})
+            if not _labels:
+                continue
+
+            for _label in _ROB_BASE_METRIC_LABELS:
+                _row = _labels.get(_label)
+                if not _row:
+                    continue
+
+                for _col in (2, 3, 4):
+                    _value = _ws.cell(
+                        _row,
+                        _col,
+                    ).value
+                    if (
+                        _value is not None
+                        and not is_formula(_value)
+                    ):
+                        historical_readback_found = True
+                        break
+
+                if historical_readback_found:
+                    break
+
+            if historical_readback_found:
+                break
+
+        if historical_readback_found:
+            break
+
+    if not historical_readback_found:
+        try:
+            drive_upload(
+                service,
+                new_file_id,
+                original_bytes,
+                new_file_name,
+            )
+        except Exception:
+            pass
+
+        return None, (
+            f"{hist_name} was located, but no historical B:D ROB values "
+            f"were copied into the {tracked_year} workbook. "
+            f"The original workbook was restored and no blank ROB was saved."
+        ), None, None
+
     _emit_rob_setup_progress(
         progress_callback,
         0.80,
@@ -9366,9 +9458,9 @@ def render_hilton_next_year_rob_month_setup(
         )
 
         st.caption(
-            f"Source mapping: search this hotel's own Drive folders for its "
-            f"**{tracked_year - 1} ROB**. Internal weekly snapshot dates are "
-            f"used to prefer the **{source_month:%B %Y}** source → "
+            f"Source mapping: search visible Drive files for this hotel's "
+            f"**{tracked_year - 1} ROB**. Internal weekly snapshot dates "
+            f"prefer the **{source_month:%B %Y}** source → "
             f"**{tracked_year} ROB {report_month:%B %Y}**."
         )
 
