@@ -8757,6 +8757,110 @@ def _hilton_historical_month_match_score(
 
 
 
+def _validate_hilton_historical_rob_bytes(raw):
+    """Validate a Hilton historical ROB by structure and usable ROB content.
+
+    Returns (is_valid, snapshot_dates, reason).
+
+    Hilton historical files are not required to expose the tracked year in
+    the same row-3 header cells used by SNT/IHG templates. A real Hilton ROB
+    is accepted when it has ROB week tabs and recognizable ROB month/metric
+    blocks with historical content.
+    """
+    try:
+        wb = openpyxl.load_workbook(
+            io.BytesIO(raw),
+            data_only=True,
+            read_only=False,
+        )
+    except Exception as e:
+        return False, [], f"could not open workbook: {e}"
+
+    try:
+        week_tabs = [
+            s for s in ROB_SHEETS
+            if s in wb.sheetnames
+        ]
+        if not week_tabs:
+            return False, [], "no ROB week tabs found"
+
+        usable_cells = 0
+        recognizable_sheets = 0
+        snapshot_dates = []
+
+        for sheet_name in week_tabs:
+            ws = wb[sheet_name]
+
+            d = _rob_valid_date(
+                ws.cell(4, 5).value
+            )
+            if d is not None:
+                snapshot_dates.append(
+                    (sheet_name, d)
+                )
+
+            blocks = rob_month_blocks(ws)
+            if not blocks:
+                continue
+
+            recognizable_sheets += 1
+
+            # Historical ROB values live across the year columns. We only
+            # need proof that this is populated ROB content, not a specific
+            # header-year arrangement.
+            for month_idx in range(12):
+                labels = blocks.get(month_idx, {})
+                if not labels:
+                    continue
+
+                for label in _ROB_BASE_METRIC_LABELS:
+                    row = labels.get(label)
+                    if not row:
+                        continue
+
+                    for col in (2, 3, 4, 5):
+                        value = ws.cell(row, col).value
+                        if (
+                            value is not None
+                            and not is_formula(value)
+                        ):
+                            usable_cells += 1
+                            if usable_cells >= 3:
+                                break
+
+                    if usable_cells >= 3:
+                        break
+
+                if usable_cells >= 3:
+                    break
+
+            if usable_cells >= 3:
+                break
+
+        if recognizable_sheets == 0:
+            return (
+                False,
+                snapshot_dates,
+                "ROB week tabs exist but no recognizable month/metric blocks were found",
+            )
+
+        if usable_cells == 0:
+            return (
+                False,
+                snapshot_dates,
+                "ROB structure was found but no usable historical values were present",
+            )
+
+        return True, snapshot_dates, None
+
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+
 def resolve_hilton_historical_rob_for_next_year(
     service,
     hotel_id,
@@ -8928,24 +9032,28 @@ def resolve_hilton_historical_rob_for_next_year(
     rejected = []
 
     for candidate in raw_candidates:
-        valid, raw = _historical_rob_has_required_year(
-            service,
-            candidate["id"],
-            historical_year,
-            return_bytes=True,
-        )
-
-        if not valid or raw is None:
+        try:
+            raw = drive_download(
+                service,
+                candidate["id"],
+            )
+        except Exception as e:
             rejected.append(
-                candidate["name"]
+                f"{candidate['name']} (download failed: {e})"
             )
             continue
 
-        snapshot_dates = (
-            _historical_rob_snapshot_dates_from_bytes(
+        valid, snapshot_dates, invalid_reason = (
+            _validate_hilton_historical_rob_bytes(
                 raw
             )
         )
+
+        if not valid:
+            rejected.append(
+                f"{candidate['name']} ({invalid_reason})"
+            )
+            continue
 
         month_score = (
             _hilton_historical_month_match_score(
@@ -8982,9 +9090,8 @@ def resolve_hilton_historical_rob_for_next_year(
     if not validated:
         return None, (
             f"Found candidate {historical_year} ROB file(s) for "
-            f"{hotel_name}, but none contained valid "
-            f"{historical_year} ROB year headers. Rejected: "
-            + "; ".join(rejected[:8])
+            f"{hotel_name}, but none had usable Hilton ROB data. "
+            f"Rejected: " + "; ".join(rejected[:8])
         )
 
     validated.sort(
@@ -9391,8 +9498,8 @@ def setup_hilton_next_year_rob_month(
     )
 
     note = (
-        f"Historical source: {hist_name} "
-        f"from {hist_folder_name}; "
+        f"Historical source selected: {hist_name}. "
+        f"Match details: {hist_folder_name}. "
         f"{copied} historical cells copied."
     )
     if warnings:
