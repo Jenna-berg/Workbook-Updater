@@ -8080,6 +8080,91 @@ def _historical_rob_has_required_year(
     return valid
 
 
+def _validate_generic_historical_rob_structure(raw):
+    """Fallback validation for SNT/IHG historical ROBs.
+
+    The normal validator remains preferred. This fallback is only used when
+    the workbook does not expose the historical year in the exact header cells
+    expected by the generic validator, but the file is clearly a real ROB with
+    populated historical data.
+    """
+    try:
+        wb = openpyxl.load_workbook(
+            io.BytesIO(raw),
+            data_only=False,
+        )
+    except Exception as e:
+        return False, f"could not open workbook: {e}"
+
+    try:
+        week_tabs = [
+            s for s in ROB_SHEETS
+            if s in wb.sheetnames
+        ]
+        if not week_tabs:
+            return False, "no ROB week tabs found"
+
+        recognizable = 0
+        populated = 0
+
+        for sheet_name in week_tabs:
+            ws = wb[sheet_name]
+            blocks = rob_month_blocks(ws)
+
+            if not blocks:
+                continue
+
+            recognizable += 1
+
+            for month_idx in range(12):
+                labels = blocks.get(
+                    month_idx,
+                    {},
+                )
+                if not labels:
+                    continue
+
+                for label in _ROB_BASE_METRIC_LABELS:
+                    row = labels.get(label)
+                    if not row:
+                        continue
+
+                    # Historical ROBs may contain literals or formulas.
+                    for col in (2, 3, 4, 5):
+                        value = ws.cell(
+                            row,
+                            col,
+                        ).value
+                        if value is not None:
+                            populated += 1
+                            if populated >= 3:
+                                break
+
+                    if populated >= 3:
+                        break
+
+                if populated >= 3:
+                    break
+
+            if populated >= 3:
+                break
+
+        if recognizable == 0:
+            return False, "no recognizable ROB month/metric blocks found"
+
+        if populated == 0:
+            return False, "no populated ROB historical cells found"
+
+        return True, None
+
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+
 def resolve_historical_rob_for_future_year(
     service,
     hotel_id,
@@ -8210,7 +8295,59 @@ def resolve_historical_rob_for_future_year(
                     source_note,
                     raw,
                 ), rejected
-            rejected.append(candidate["name"])
+
+            # Fallback for properties whose historical ROB is real/populated
+            # but does not expose the year in the exact generic header cells.
+            # Only allow this when the filename itself clearly references the
+            # required historical year OR the search is already inside the
+            # comparable prior-year Revenue Reports/month area.
+            name_up = str(
+                candidate.get("name", "")
+            ).upper()
+
+            strong_year_signal = (
+                str(historical_year) in name_up
+                or location_rank >= 700
+            )
+
+            fallback_raw = raw
+            if fallback_raw is None:
+                try:
+                    fallback_raw = _get_workbook_bytes_cached(
+                        service,
+                        candidate["id"],
+                    )
+                except Exception:
+                    fallback_raw = None
+
+            if (
+                strong_year_signal
+                and fallback_raw is not None
+            ):
+                fallback_valid, fallback_reason = (
+                    _validate_generic_historical_rob_structure(
+                        fallback_raw
+                    )
+                )
+
+                if fallback_valid:
+                    return (
+                        candidate["id"],
+                        candidate["name"],
+                        (
+                            f"{source_note} "
+                            f"(accepted by structural historical ROB fallback)"
+                        ),
+                        fallback_raw,
+                    ), rejected
+
+                rejected.append(
+                    f"{candidate['name']} ({fallback_reason})"
+                )
+            else:
+                rejected.append(
+                    candidate["name"]
+                )
 
         return None, rejected
 
@@ -8233,7 +8370,7 @@ def resolve_historical_rob_for_future_year(
         frontier = [prior_rev_id]
         seen_prior = set()
 
-        for _depth in range(5):
+        for _depth in range(8):
             current = [
                 pid for pid in frontier
                 if pid and pid not in seen_prior
@@ -8259,7 +8396,7 @@ def resolve_historical_rob_for_future_year(
     frontier = [hotel_id]
     seen = set()
 
-    for _depth in range(6):
+    for _depth in range(8):
         current = [
             pid for pid in frontier
             if pid and pid not in seen
@@ -8291,9 +8428,9 @@ def resolve_historical_rob_for_future_year(
 
     if rejected_all:
         return None, (
-            f"Found ROB files for {hotel_name}, but none contained "
-            f"{historical_year} in the ROB year headers. Rejected: "
-            + "; ".join(rejected_all[:8])
+            f"Found historical ROB candidate files for {hotel_name}, "
+            f"but none passed year-header or structural validation. "
+            f"Rejected: " + "; ".join(rejected_all[:8])
         )
 
     return None, (
@@ -8350,6 +8487,45 @@ def _resolve_next_year_rob_workbook_session_cached(
         }
 
     return result, err
+
+
+
+def _rob_clear_unavailable_history(wb):
+    """Clear prior-year ROB history when no historical source exists.
+
+    Used for properties such as Foxberry where older Revenue Reports folders
+    do not exist. Historical columns B:D and their historical date headers are
+    cleared, while the tracked-year column and template formulas outside B:D
+    remain available for the normal setup/update flow.
+    """
+    for sheet_name in ROB_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+
+        # Clear historical metric columns B:D.
+        blocks = rob_month_blocks(ws)
+        for month_idx in range(12):
+            labels = blocks.get(month_idx, {})
+            if not labels:
+                continue
+
+            for label in _ROB_BASE_METRIC_LABELS:
+                row = labels.get(label)
+                if not row:
+                    continue
+
+                for col in (2, 3, 4):
+                    if _rob_cell_is_writable(ws, row, col):
+                        ws.cell(row, col).value = None
+
+        # Clear historical date headers B:D.
+        for header_row in _rob_month_header_rows(ws).values():
+            for col in (2, 3, 4):
+                if _rob_cell_is_writable(ws, header_row, col):
+                    ws.cell(header_row, col).value = None
+                    ws.cell(header_row, col).number_format = "mm/dd/yyyy"
 
 
 
@@ -8578,45 +8754,16 @@ def setup_next_year_rob_month(
                 f"(source: {hist_source_note})"
             )
         except Exception as e:
-            try:
-                drive_upload(
-                    service,
-                    new_file_id,
-                    original_bytes,
-                    new_file_name,
-                )
-            except Exception:
-                pass
-            return (
-                None,
-                (
-                    f"Historical {historical_year} ROB was found but could not "
-                    f"be loaded: {e}. No 2027 ROB changes were saved."
-                ),
-                None,
-                None,
+            hist_wb = None
+            warnings.append(
+                f"Historical {historical_year} ROB was found but could not "
+                f"be loaded: {e}. Continuing with blank past-year history."
             )
     else:
-        # A next-year ROB without historical data is not a valid setup.
-        # Do not continue and save a blank master/template.
-        try:
-            drive_upload(
-                service,
-                new_file_id,
-                original_bytes,
-                new_file_name,
-            )
-        except Exception:
-            pass
-
-        return (
-            None,
-            (
-                f"Historical {historical_year} ROB not found or not valid: "
-                f"{hist_err}. No 2027 ROB changes were saved."
-            ),
-            None,
-            None,
+        hist_wb = None
+        warnings.append(
+            f"Historical {historical_year} ROB was not available: "
+            f"{hist_err}. Continuing with blank past-year history."
         )
 
     _emit_rob_setup_progress(progress_callback, 0.68, "Mapping historical reporting weeks...")
@@ -8624,18 +8771,30 @@ def setup_next_year_rob_month(
     # Map historical weeks by the reporting cadence already consumed in the
     # previous month's NORMAL ROB. Never assume historical WK1 belongs in new
     # WK1 — the prior month may already have consumed that snapshot.
-    historical_week_map, historical_map_diag = (
-        _rob_build_next_year_historical_map(
-            new_wb,
-            cadence_prev_wb,
-            report_month,
-            hist_wb,
+    historical_week_map = {}
+    historical_map_diag = []
+
+    if hist_wb is not None:
+        historical_week_map, historical_map_diag = (
+            _rob_build_next_year_historical_map(
+                new_wb,
+                cadence_prev_wb,
+                report_month,
+                hist_wb,
+            )
         )
-    )
-    if historical_map_diag:
+        if historical_map_diag:
+            warnings.append(
+                "Next-year historical week map — "
+                + " | ".join(historical_map_diag)
+            )
+    else:
+        _rob_clear_unavailable_history(
+            new_wb
+        )
         warnings.append(
-            "Next-year historical week map — "
-            + " | ".join(historical_map_diag)
+            "Historical columns B:D were left blank because no usable "
+            "prior-year ROB was available."
         )
 
     wk_one_name = ROB_SHEETS[0]
@@ -8650,10 +8809,11 @@ def setup_next_year_rob_month(
         )
         hist_ws = historical_week_map.get(sheet_name)
         if hist_ws is None:
-            warnings.append(
-                f"{sheet_name}: no historical week remained after cadence "
-                f"mapping; tab left untouched."
-            )
+            if hist_wb is not None:
+                warnings.append(
+                    f"{sheet_name}: no historical week remained after cadence "
+                    f"mapping; tab left untouched."
+                )
             continue
 
         _fill_rob_sheet(
@@ -10916,37 +11076,91 @@ def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_mo
 
 def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_type: str, month_date: datetime.date = None):
     """
-    Walk Drive to find the target workbook. Handles two folder structures:
-      A) Hotel > MMMYYYY REVENUE REPORTS HOTEL > files  (month in folder name, files direct)
-      B) Hotel > REVENUE REPORTS > Year > Month > files (nested year/month subfolders)
-    Returns ((file_id, file_name), None) or (None, error_message).
-    Never touches files whose name contains 'master'.
+    Resolve a monthly workbook without assuming one exact Revenue Reports layout.
 
-    A "hotel" can also be a MULTI:<id>,<id>,... group — several candidate
-    root folders sharing one dropdown entry, either because they're each a
-    flat per-year/month folder shared directly (Hyannis Anchor In) or full
-    duplicate top-level hotel folders from historical typos/copies
-    (confirmed real case: "Provinceetown Surfside", "Provincertown
-    Surfside", "Surfside (1)" all being the same hotel). Each candidate is
-    resolved fully (structures A/B/C, recursing into its own REVENUE REPORTS
-    child if it has one) rather than guessed from its name alone — whichever
-    candidate actually contains the target file wins.
+    Supported examples include:
+      Hotel > OCT2026 REVENUE REPORTS HOTEL > file
+      Hotel > REVENUE REPORTS > 2026 > OCT2026 > file
+      Hotel > REVENUE REPORTS > 2026 > OCTOBER 2026 > file
+      Hotel > REVENUE REPORTS > OCT 2026 > file
+      Hotel > REVENUE REPORTS > 2026 > file
+      REVENUE REPORTS folder > month/year folders or direct monthly file
+
+    MULTI:<id>,<id> hotel entries are also supported.
+
+    The search stays inside each hotel's known folder roots and uses cached
+    child-folder metadata, so this remains much faster than a Drive-wide scan.
     """
     if month_date is None:
         month_date = datetime.date.today()
 
-    month_kw        = month_date.strftime("%b%Y").upper()
+    month_kw = month_date.strftime("%b%Y").upper()
     month_kw_2digit = month_date.strftime("%b%y").upper()
-    year_kw         = str(month_date.year)
-    wb_keyword      = WORKBOOK_KEYWORDS[workbook_type]
+    year_kw = str(month_date.year)
+    wb_keyword = WORKBOOK_KEYWORDS[workbook_type]
+
+    month_abbr = month_date.strftime("%b").upper()
+    month_full = month_date.strftime("%B").upper()
+    month_num = month_date.strftime("%m")
+    month_num_plain = str(month_date.month)
+
+    def _norm_name(value):
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+    target_tokens = {
+        _norm_name(month_kw),
+        _norm_name(f"{month_abbr} {year_kw}"),
+        _norm_name(f"{month_full} {year_kw}"),
+        _norm_name(f"{month_num} {year_kw}"),
+        _norm_name(f"{month_num_plain} {year_kw}"),
+        _norm_name(month_kw_2digit),
+    }
+
+    def _month_match_score(name):
+        up = str(name or "").upper()
+        compact = _norm_name(up)
+
+        if compact in target_tokens:
+            return 100
+
+        if any(tok and tok in compact for tok in target_tokens):
+            return 90
+
+        if year_kw in up and (
+            month_abbr in up
+            or month_full in up
+            or re.search(rf"(?<!\d){re.escape(month_num_plain)}(?!\d)", up)
+            or re.search(rf"(?<!\d){re.escape(month_num)}(?!\d)", up)
+        ):
+            return 80
+
+        if (
+            month_abbr in up
+            or month_full in up
+            or compact in {_norm_name(month_num), _norm_name(month_num_plain)}
+        ):
+            return 40
+
+        return 0
 
     def _list_subfolders(parent_id):
-        q = (f"'{parent_id}' in parents and trashed = false and "
-             f"mimeType = 'application/vnd.google-apps.folder'")
-        return service.files().list(
-            q=q, fields="files(id, name)", pageSize=100,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute().get("files", [])
+        try:
+            return _drive_folder_children_cached(
+                service,
+                parent_id,
+            )
+        except Exception:
+            q = (
+                f"'{parent_id}' in parents and trashed = false and "
+                "mimeType = 'application/vnd.google-apps.folder'"
+            )
+            return service.files().list(
+                q=q,
+                fields="files(id, name)",
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
 
     def _find_file_in(folder_id, folder_name):
         if workbook_type == "ROB":
@@ -10964,91 +11178,279 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
 
         if not fid:
             return None, f"No '{wb_keyword}' workbook found in '{folder_name}'."
-        if "master" in fname.lower():
+
+        if "master" in str(fname).lower():
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
+
         return (fid, fname), None
 
+    def _pick_month_folder(folders):
+        scored = []
+        for folder in folders:
+            score = _month_match_score(
+                folder.get("name", "")
+            )
+            if score > 0:
+                scored.append((score, folder))
+
+        if not scored:
+            return None
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                str(item[1].get("name", "")),
+            ),
+            reverse=True,
+        )
+        return scored[0][1]
+
+    def _search_year_folder(year_folder):
+        direct_result = _find_file_in(
+            year_folder["id"],
+            year_folder["name"],
+        )
+        if direct_result[0]:
+            return direct_result
+
+        year_children = _list_subfolders(
+            year_folder["id"]
+        )
+
+        month_folder = _pick_month_folder(
+            year_children
+        )
+        if month_folder:
+            result = _find_file_in(
+                month_folder["id"],
+                month_folder["name"],
+            )
+            if result[0]:
+                return result
+
+        return None, (
+            f"Could not find '{month_kw}' workbook under "
+            f"'{year_folder['name']}'."
+        )
+
     def _resolve_single(single_id, single_name):
-        """Resolve within ONE candidate root — either a full hotel-parent
-        folder (with its own REVENUE REPORTS > year > month nesting) or a
-        folder that IS already the REVENUE REPORTS level directly (detected
-        from its own name). Returns ((file_id, file_name), None) or (None, err).
-        """
         self_is_rev = _is_rev_reports_name(single_name)
 
-        # A0: candidate IS already the month-level folder — its own name
-        # contains both "REVENUE REPORTS" and the target month, so the file
-        # is directly inside it, not further down. Confirmed real case:
-        # Tybee's month folders are individually named "G: JUL2026 REVENUE
-        # REPORTS TYBEE"; because that name also contains "REVENUE REPORTS"
-        # it gets swept into the same MULTI: candidate group as Tybee's root
-        # and year-level folders (get_hotels_from_drive merges by extracted
-        # hotel name, not by structural level). Without this check,
-        # self_is_rev below always assumes further year/month descent is
-        # needed, finds no subfolders (children are files here), and fails
-        # even though this candidate is the correct one.
-        if self_is_rev and month_kw in single_name.upper():
-            result = _find_file_in(single_id, single_name)
+        if self_is_rev and _month_match_score(single_name) > 0:
+            result = _find_file_in(
+                single_id,
+                single_name,
+            )
             if result[0]:
                 return result
 
         children = _list_subfolders(single_id)
 
-        # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
+        # Hotel > month-specific REVENUE REPORTS folder > file
         if not self_is_rev:
-            a = next((f for f in children
-                       if _is_rev_reports_name(f["name"]) and month_kw in f["name"].upper()), None)
-            if a:
-                result = _find_file_in(a["id"], a["name"])
+            month_rev_candidates = [
+                f for f in children
+                if _is_rev_reports_name(
+                    f.get("name", "")
+                )
+                and _month_match_score(
+                    f.get("name", "")
+                ) > 0
+            ]
+            month_rev_candidates.sort(
+                key=lambda f: _month_match_score(
+                    f.get("name", "")
+                ),
+                reverse=True,
+            )
+            for folder in month_rev_candidates:
+                result = _find_file_in(
+                    folder["id"],
+                    folder["name"],
+                )
                 if result[0]:
                     return result
 
-        # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file
+        # Resolve Revenue Reports root.
         if self_is_rev:
-            rev = {"id": single_id, "name": single_name}
+            rev = {
+                "id": single_id,
+                "name": single_name,
+            }
+            rev_children = children
         else:
             rev_candidates = [
                 f for f in children
-                if _is_rev_reports_name(f["name"])
+                if _is_rev_reports_name(
+                    f.get("name", "")
+                )
             ]
             rev = _pick_rev_reports_candidate(
                 rev_candidates,
                 year_kw,
                 month_kw,
             )
+            rev_children = (
+                _list_subfolders(
+                    rev["id"]
+                )
+                if rev else []
+            )
 
         if rev:
-            rev_children = children if self_is_rev else _list_subfolders(rev["id"])
-            b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
-            if b1:
-                result = _find_file_in(b1["id"], b1["name"])
+            # Some properties put the monthly ROB directly under Revenue Reports.
+            direct_result = _find_file_in(
+                rev["id"],
+                rev["name"],
+            )
+            if direct_result[0]:
+                return direct_result
+
+            # Revenue Reports > flexible month folder > file
+            month_folder = _pick_month_folder(
+                rev_children
+            )
+            if month_folder:
+                result = _find_file_in(
+                    month_folder["id"],
+                    month_folder["name"],
+                )
                 if result[0]:
                     return result
-            b2_year = next((f for f in rev_children if year_kw in f["name"].upper()), None)
-            if b2_year:
-                b2_month_id, b2_month_name = drive_find_folder_by_keyword(
-                    service, month_kw, parent_id=b2_year["id"])
-                if b2_month_id:
-                    result = _find_file_in(b2_month_id, b2_month_name)
+
+            # Revenue Reports > target year > flexible month/direct file
+            year_candidates = [
+                f for f in rev_children
+                if (
+                    year_kw
+                    in str(
+                        f.get("name", "")
+                    ).upper()
+                    or _explicit_folder_year(
+                        f.get("name", "")
+                    ) == month_date.year
+                )
+            ]
+            year_candidates.sort(
+                key=lambda f: (
+                    1
+                    if str(
+                        f.get("name", "")
+                    ).strip() == year_kw
+                    else 0,
+                    str(
+                        f.get("name", "")
+                    ),
+                ),
+                reverse=True,
+            )
+            for year_folder in year_candidates:
+                result = _search_year_folder(
+                    year_folder
+                )
+                if result[0]:
+                    return result
+
+        # Hotel > target year > month/direct file, no Revenue Reports wrapper.
+        year_candidates = [
+            f for f in children
+            if (
+                (
+                    year_kw
+                    in str(
+                        f.get("name", "")
+                    ).upper()
+                    or _explicit_folder_year(
+                        f.get("name", "")
+                    ) == month_date.year
+                )
+                and not _is_rev_reports_name(
+                    f.get("name", "")
+                )
+            )
+        ]
+        for year_folder in year_candidates:
+            result = _search_year_folder(
+                year_folder
+            )
+            if result[0]:
+                return result
+
+        # Final bounded fallback: only within this hotel's known tree.
+        frontier = [
+            {
+                "id": single_id,
+                "name": single_name,
+            }
+        ]
+        seen = set()
+
+        for _depth in range(3):
+            next_frontier = []
+
+            for parent in frontier:
+                pid = parent["id"]
+                if pid in seen:
+                    continue
+                seen.add(pid)
+
+                parent_name = parent.get(
+                    "name",
+                    "",
+                )
+
+                if (
+                    _month_match_score(
+                        parent_name
+                    ) > 0
+                    or year_kw
+                    in str(
+                        parent_name
+                    ).upper()
+                    or _is_rev_reports_name(
+                        parent_name
+                    )
+                ):
+                    result = _find_file_in(
+                        pid,
+                        parent_name,
+                    )
                     if result[0]:
                         return result
 
-        # C: Hotel > Year > Month > file  (no REVENUE REPORTS wrapper)
-        c_year = next((f for f in children
-                       if year_kw in f["name"].upper()
-                       and not _is_rev_reports_name(f["name"])), None)
-        if c_year:
-            c_month_id, c_month_name = drive_find_folder_by_keyword(
-                service, month_kw, parent_id=c_year["id"])
-            if c_month_id:
-                result = _find_file_in(c_month_id, c_month_name)
-                if result[0]:
-                    return result
+                for child in _list_subfolders(
+                    pid
+                ):
+                    child_name = child.get(
+                        "name",
+                        "",
+                    )
+                    child_year = _explicit_folder_year(
+                        child_name
+                    )
 
-        return None, f"Could not find '{month_kw}' workbook under '{single_name}'."
+                    if child_year not in (
+                        None,
+                        month_date.year,
+                    ):
+                        continue
+
+                    next_frontier.append(
+                        child
+                    )
+
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        return None, (
+            f"Could not find '{month_kw}' workbook under '{single_name}'."
+        )
 
     if hotel_id.startswith(MULTI_ID_PREFIX):
-        candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+        candidate_ids = hotel_id[
+            len(MULTI_ID_PREFIX):
+        ].split(",")
         candidates = []
 
         for cid in candidate_ids:
@@ -11058,17 +11460,30 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
                     fields="name",
                     supportsAllDrives=True,
                 ).execute()
-                candidates.append({"id": cid, "name": info["name"]})
+                candidates.append(
+                    {
+                        "id": cid,
+                        "name": info["name"],
+                    }
+                )
             except Exception:
                 continue
 
         if not candidates:
-            return None, f"Could not read any of the shared folders for '{hotel_name}'."
+            return None, (
+                f"Could not read any of the shared folders for "
+                f"'{hotel_name}'."
+            )
 
         target_year = month_date.year
         candidates = [
             f for f in candidates
-            if _explicit_folder_year(f["name"]) in (None, target_year)
+            if _explicit_folder_year(
+                f["name"]
+            ) in (
+                None,
+                target_year,
+            )
         ]
 
         if not candidates:
@@ -11077,29 +11492,45 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
                 f"for '{hotel_name}'."
             )
 
-        def _sort_key(f):
-            name_up = f["name"].upper()
-            if month_kw in name_up or month_kw_2digit in name_up:
-                return 0
-            if year_kw in name_up:
-                return 1
-            return 2
+        def _sort_key(folder):
+            name = folder["name"]
+            score = _month_match_score(
+                name
+            )
+            if score > 0:
+                return (0, -score)
+            if year_kw in name.upper():
+                return (1, 0)
+            if _is_rev_reports_name(
+                name
+            ):
+                return (2, 0)
+            return (3, 0)
 
-        ordered = sorted(candidates, key=_sort_key)
+        ordered = sorted(
+            candidates,
+            key=_sort_key,
+        )
 
         last_err = None
         for cand in ordered:
-            result, err = _resolve_single(cand["id"], cand["name"])
+            result, err = _resolve_single(
+                cand["id"],
+                cand["name"],
+            )
             if result:
                 return result, None
             last_err = err
 
-        return None, last_err or f"Could not find '{month_kw}' workbook for '{hotel_name}'."
+        return None, (
+            last_err
+            or f"Could not find '{month_kw}' workbook for '{hotel_name}'."
+        )
 
-    return _resolve_single(hotel_id, hotel_name)
-
-
-DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    return _resolve_single(
+        hotel_id,
+        hotel_name,
+    )
 
 
 def _count_sheet_data_rows(ws):
