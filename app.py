@@ -5034,7 +5034,7 @@ def _pick_rev_reports_candidate(candidates, year_kw, month_kw):
     return None
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _drive_folder_children_cached(service, parent_id):
+def _drive_folder_children_cached(_service, parent_id):
     """Cache direct child-folder metadata for one parent during the session."""
     key = str(parent_id)
     try:
@@ -5052,7 +5052,7 @@ def _drive_folder_children_cached(service, parent_id):
         "and trashed=false and "
         f"'{parent_id}' in parents"
     )
-    rows = service.files().list(
+    rows = _service.files().list(
         q=q,
         fields="files(id,name,parents,modifiedTime,mimeType)",
         pageSize=1000,
@@ -5066,7 +5066,7 @@ def _drive_folder_children_cached(service, parent_id):
     return rows
 
 
-def _drive_excel_children_cached(service, parent_id, include_google_sheets=False):
+def _drive_excel_children_cached(_service, parent_id, include_google_sheets=False):
     """Cache direct child spreadsheet metadata for one parent."""
     key = (str(parent_id), bool(include_google_sheets))
     try:
@@ -5091,7 +5091,7 @@ def _drive_excel_children_cached(service, parent_id, include_google_sheets=False
         + " or ".join(mime_parts)
         + ")"
     )
-    rows = service.files().list(
+    rows = _service.files().list(
         q=q,
         fields="files(id,name,parents,modifiedTime,mimeType)",
         pageSize=1000,
