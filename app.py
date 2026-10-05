@@ -6876,20 +6876,22 @@ def _rob_build_next_year_historical_map(
     target_month,
     historical_wb,
 ):
-    """Map next-year ROB week tabs from the historical current-year ROB.
+    """Map next-year ROB weeks from the dedicated historical ROB.
 
-    The historical ROB must continue from the last reporting snapshot already
-    consumed in the previous month's NORMAL current-year ROB.
+    The previous month's NORMAL current-year ROB tells us which comparable
+    historical snapshot was already consumed. For a 2026 ROB that comparable
+    snapshot date is stored in column D (2025), not column E (2026).
 
     Example:
-      Building OCT2026 -> 2027 ROB.
-      If SEP2026's last completed week already carries a 10/01/2026 reporting
-      date, then OCT's new WK1 must use the next historical snapshot after
-      10/01 — never copy historical WK1 blindly and reuse 10/01.
+      SEP2026's last completed week already consumed the 10/01/2025 snapshot.
+      When building OCT2026 -> 2027 ROB, new WK1 must therefore start with the
+      first historical 2026-ROB snapshot AFTER 10/01/2025.
 
-    Returns {destination_sheet: source_worksheet}, diagnostics.
+    This mirrors the current-year ROB date-first mapping rule and avoids
+    reusing a week just because the calendar month changed.
     """
     diagnostics = []
+
     if historical_wb is None:
         return {}, ["No historical ROB workbook was available."]
 
@@ -6897,10 +6899,17 @@ def _rob_build_next_year_historical_map(
     for sheet_name in ROB_SHEETS:
         if sheet_name not in historical_wb.sheetnames:
             continue
+
         ws = historical_wb[sheet_name]
-        source_date = _rob_valid_date(ws.cell(4, 5).value)
+
+        # In the dedicated future-year historical ROB, column E contains that
+        # workbook's reporting snapshot date.
+        source_date = _rob_valid_date(
+            ws.cell(4, 5).value
+        )
         if source_date is None:
             continue
+
         snapshots.append(
             {
                 "date": source_date,
@@ -6913,41 +6922,59 @@ def _rob_build_next_year_historical_map(
         key=lambda item: (
             item["date"],
             ROB_SHEETS.index(item["sheet_name"])
-            if item["sheet_name"] in ROB_SHEETS else 999,
+            if item["sheet_name"] in ROB_SHEETS
+            else 999,
         )
     )
 
     if not snapshots:
-        return {}, ["Historical ROB contained no dated week snapshots."]
-
-    # Cadence anchor = last actually-filled week of the previous NORMAL ROB.
-    anchor_sheet = _rob_last_completed_week(
-        cadence_prev_wb,
-        target_month,
-    )
-    anchor_date = None
-    if (
-        cadence_prev_wb is not None
-        and anchor_sheet
-        and anchor_sheet in cadence_prev_wb.sheetnames
-    ):
-        anchor_date = _rob_valid_date(
-            cadence_prev_wb[anchor_sheet].cell(4, 5).value
-        )
-
-    if anchor_date is not None:
-        diagnostics.append(
-            f"Previous-month cadence anchor: {anchor_sheet} "
-            f"({anchor_date:%m/%d/%Y})"
-        )
-        snapshots = [
-            snap for snap in snapshots
-            if snap["date"] > anchor_date
+        return {}, [
+            "Historical ROB contained no dated week snapshots."
         ]
+
+    # IMPORTANT:
+    # Use the prior month's STLY anchor date, not its current-year date.
+    # _rob_previous_stly_anchor_date() reads column D from the last completed
+    # week of the normal current-year ROB. That date lives in the SAME time
+    # frame as the dedicated historical ROB's reporting snapshots.
+    consumed_hist_date, consumed_hist_sheet = (
+        _rob_previous_stly_anchor_date(
+            cadence_prev_wb,
+            target_month,
+        )
+    )
+
+    if consumed_hist_date is not None:
+        diagnostics.append(
+            f"Previously consumed historical snapshot: "
+            f"{consumed_hist_date:%m/%d/%Y} "
+            f"({consumed_hist_sheet})"
+        )
     else:
         diagnostics.append(
-            "Previous-month cadence anchor was unavailable; "
-            "historical snapshots start from the earliest dated week."
+            "Previous-month historical anchor was unavailable; "
+            "falling back to chronological historical weeks."
+        )
+
+    eligible = []
+    for snap in snapshots:
+        if (
+            consumed_hist_date is not None
+            and snap["date"] <= consumed_hist_date
+        ):
+            continue
+        eligible.append(snap)
+
+    # Safety fallback:
+    # Never turn a valid historical ROB into a blank output just because its
+    # date headers are unusual. If the comparable anchor filtered everything,
+    # fall back to the chronological historical snapshots and surface that in
+    # diagnostics rather than silently saving a blank ROB.
+    if not eligible:
+        eligible = snapshots[:]
+        diagnostics.append(
+            "No historical snapshots were later than the previous-month "
+            "anchor; using chronological historical weeks as a fallback."
         )
 
     dest_sheets = [
@@ -6956,7 +6983,11 @@ def _rob_build_next_year_historical_map(
     ]
 
     mapping = {}
-    for dest_sheet, snap in zip(dest_sheets, snapshots):
+
+    for dest_sheet, snap in zip(
+        dest_sheets,
+        eligible,
+    ):
         mapping[dest_sheet] = snap["worksheet"]
         diagnostics.append(
             f"{dest_sheet} <- {snap['sheet_name']} "
@@ -6965,12 +6996,10 @@ def _rob_build_next_year_historical_map(
 
     if len(mapping) < min(4, len(dest_sheets)):
         diagnostics.append(
-            f"WARNING: only {len(mapping)} next-year week tabs mapped "
-            f"after the prior-month cadence anchor."
+            f"WARNING: only {len(mapping)} next-year week tabs mapped."
         )
 
     return mapping, diagnostics
-
 
 
 def _rob_seed_historical_columns(
