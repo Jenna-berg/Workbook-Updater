@@ -11077,6 +11077,35 @@ def _resolve_monthly_report_destination_folder(
 
 
 
+def _strategy_filename_matches_month(file_name, target_month):
+    """Return True only when a Strategy workbook belongs to target_month."""
+    up = str(file_name or "").upper()
+    month_tokens = {
+        target_month.strftime("%b%Y").upper(),   # OCT2026
+        target_month.strftime("%b %Y").upper(),  # OCT 2026
+        target_month.strftime("%B %Y").upper(),  # OCTOBER 2026
+        target_month.strftime("%b%y").upper(),   # OCT26
+    }
+
+    compact = re.sub(
+        r"[^A-Z0-9]+",
+        "",
+        up,
+    )
+
+    for token in month_tokens:
+        token_compact = re.sub(
+            r"[^A-Z0-9]+",
+            "",
+            token,
+        )
+        if token_compact and token_compact in compact:
+            return True
+
+    return False
+
+
+
 def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
     """
     New month Strategy setup.
@@ -11120,6 +11149,10 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
         and "master" not in str(
             existing_name
         ).lower()
+        and _strategy_filename_matches_month(
+            existing_name,
+            target_month,
+        )
     ):
         _cache_drive_workbook_resolution(
             hotel_id,
@@ -17186,9 +17219,18 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
                     svc, hotel_id, hotel_name, "Strategy Report", target_month
                 )
 
-                if existing:
-                    st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                if (
+                    existing
+                    and _strategy_filename_matches_month(
+                        existing[1],
+                        target_month,
+                    )
+                ):
+                    st.info(
+                        f"Found existing file: **{existing[1]}** — skipping copy."
+                    )
                 else:
+                    existing = None
                     is_fresh_copy = True
                     created_name, create_err = setup_new_sr_month(
                         svc,
@@ -17338,8 +17380,76 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
                 result, err = _resolve_drive_workbook_session_cached(
                     svc, hotel_id, hotel_name, "Strategy Report", target_month
                 )
+                if (
+                    result
+                    and not _strategy_filename_matches_month(
+                        result[1],
+                        target_month,
+                    )
+                ):
+                    # Ignore stale/wrong-month cached resolution.
+                    month_id, _month_name, _dest_note = (
+                        _resolve_monthly_report_destination_folder(
+                            svc,
+                            hotel_id,
+                            hotel_name,
+                            target_month,
+                        )
+                    )
+
+                    if month_id:
+                        candidates = _drive_excel_children_cached(
+                            svc,
+                            month_id,
+                            include_google_sheets=False,
+                        )
+                        matched = [
+                            f for f in candidates
+                            if "STRATEGY" in str(
+                                f.get("name", "")
+                            ).upper()
+                            and "MASTER" not in str(
+                                f.get("name", "")
+                            ).upper()
+                            and _strategy_filename_matches_month(
+                                f.get("name", ""),
+                                target_month,
+                            )
+                        ]
+
+                        matched.sort(
+                            key=lambda f: str(
+                                f.get(
+                                    "modifiedTime",
+                                    "",
+                                )
+                            ),
+                            reverse=True,
+                        )
+
+                        if matched:
+                            result = (
+                                matched[0]["id"],
+                                matched[0]["name"],
+                            )
+                            err = None
+
                 if err or not result:
-                    st.error(f"Cannot open Strategy workbook: {err}")
+                    st.error(
+                        f"Cannot open Strategy workbook for "
+                        f"{target_month:%B %Y}: {err}"
+                    )
+                    return
+
+                if not _strategy_filename_matches_month(
+                    result[1],
+                    target_month,
+                ):
+                    st.error(
+                        f"Strategy month mismatch: found **{result[1]}** "
+                        f"while setting up **{target_month:%B %Y}**. "
+                        f"Setup stopped before modifying the wrong workbook."
+                    )
                     return
 
                 file_id, file_name = result
