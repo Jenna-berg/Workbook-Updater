@@ -5209,7 +5209,7 @@ def _find_month_folder_under_rev(_service, rev_id, year_kw, month_kw, target_mon
     # Fallback: search recursively through nested folders (handles deep nesting like SALEM)
     # Some hotels have multiple intermediate folders before reaching the month folder
     def search_recursive(parent_id, depth=0):
-        if depth > 3:  # Prevent infinite recursion
+        if depth > 8:  # Legacy Revenue Reports trees can be deeply nested
             return None, None
         try:
             children = _drive_folder_children_cached(
@@ -7559,6 +7559,68 @@ def _emit_rob_setup_progress(progress_callback, value, message):
 
 
 
+def _rob_copy_budget_reference_columns(source_wb, dest_wb, cols=(9, 10)):
+    """Carry the live ROB's budget/reference columns into a new month ROB.
+
+    Current-year monthly ROBs must not lose their established budget simply
+    because the selected master/template has blank I/J cells. Values/formulas
+    are copied by month + row label from the previous live ROB, so differing
+    row layouts across week tabs are safe.
+
+    Returns the number of cells copied.
+    """
+    if source_wb is None or dest_wb is None:
+        return 0
+
+    copied = 0
+
+    for sheet_name in ROB_SHEETS:
+        if (
+            sheet_name not in source_wb.sheetnames
+            or sheet_name not in dest_wb.sheetnames
+        ):
+            continue
+
+        src_ws = source_wb[sheet_name]
+        dst_ws = dest_wb[sheet_name]
+
+        src_headers = _rob_month_header_rows(src_ws)
+        dst_headers = _rob_month_header_rows(dst_ws)
+        src_blocks = rob_month_blocks(src_ws)
+        dst_blocks = rob_month_blocks(dst_ws)
+
+        for month_idx in range(12):
+            src_header = src_headers.get(month_idx)
+            dst_header = dst_headers.get(month_idx)
+
+            # Preserve I/J block headers when present.
+            if src_header and dst_header:
+                for col in cols:
+                    value = src_ws.cell(src_header, col).value
+                    if value is not None:
+                        dst_ws.cell(dst_header, col).value = value
+                        copied += 1
+
+            src_labels = src_blocks.get(month_idx, {})
+            dst_labels = dst_blocks.get(month_idx, {})
+
+            for label, src_row in src_labels.items():
+                dst_row = dst_labels.get(label)
+                if not dst_row:
+                    continue
+
+                for col in cols:
+                    value = src_ws.cell(src_row, col).value
+                    if value is None:
+                        continue
+
+                    dst_ws.cell(dst_row, col).value = value
+                    copied += 1
+
+    return copied
+
+
+
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
@@ -7686,6 +7748,25 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
     else:
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
+
+    # Preserve the established current-year budget/reference block from the
+    # previous live ROB. This intentionally overrides blank I/J cells inherited
+    # from a generic/future-year master.
+    if prev_wb_formulas is not None:
+        budget_cells_copied = _rob_copy_budget_reference_columns(
+            prev_wb_formulas,
+            new_wb,
+        )
+        warnings.append(
+            f"Budget/reference carry-forward from "
+            f"{prev_result[1] if prev_result else 'previous ROB'}: "
+            f"{budget_cells_copied} I/J cells copied."
+        )
+    else:
+        warnings.append(
+            "Budget/reference carry-forward skipped because the previous "
+            "live ROB could not be loaded."
+        )
 
     _emit_rob_setup_progress(progress_callback, 0.44, "Loading comparable prior-year ROBs...")
     ly_month_dt = target_month.replace(year=target_month.year - 1)
@@ -11422,6 +11503,48 @@ def _monthly_destination_matches_target(file_name, folder_name, target_month):
 
 
 
+def _drive_folder_context_name(service, folder_id, folder_name="", max_depth=6):
+    """Return folder + ancestor names for month/year validation.
+
+    Some legacy hotel trees split the target across levels, e.g.
+    '... REVENUE REPORTS' > '2026' > 'OCTOBER' > workbook. The immediate
+    folder name alone is not enough to prove OCT2026, especially for legacy
+    roots whose own name still contains an old month/date.
+    """
+    names = []
+    if folder_name:
+        names.append(str(folder_name))
+
+    current_id = folder_id
+    seen = set()
+
+    for _ in range(max_depth):
+        if not current_id or current_id in seen:
+            break
+        seen.add(current_id)
+
+        try:
+            info = service.files().get(
+                fileId=current_id,
+                fields="name,parents",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            break
+
+        name = str(info.get("name", "") or "")
+        if name and name not in names:
+            names.append(name)
+
+        parents = info.get("parents", []) or []
+        if not parents:
+            break
+        current_id = parents[0]
+
+    return " / ".join(names)
+
+
+
 def _find_exact_monthly_workbook_in_folder(
     service,
     folder_id,
@@ -11437,6 +11560,11 @@ def _find_exact_monthly_workbook_in_folder(
         )
     except Exception:
         files = []
+
+    folder_context = _drive_folder_context_name(
+        service,
+        folder_id,
+    )
 
     keyword = WORKBOOK_KEYWORDS.get(
         workbook_type,
@@ -11466,7 +11594,7 @@ def _find_exact_monthly_workbook_in_folder(
 
         if not _monthly_destination_matches_target(
             name,
-            "",
+            folder_context,
             target_month,
         ):
             continue
@@ -11608,9 +11736,14 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
 
         if workbook_type in ("ROB", "Strategy Report", "Forecast"):
+            folder_context = _drive_folder_context_name(
+                service,
+                folder_id,
+                folder_name,
+            )
             if not _monthly_destination_matches_target(
                 fname,
-                folder_name,
+                folder_context,
                 month_date,
             ):
                 return None, (
@@ -11821,7 +11954,7 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         ]
         seen = set()
 
-        for _depth in range(3):
+        for _depth in range(8):
             next_frontier = []
 
             for parent in frontier:
