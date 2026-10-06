@@ -7138,6 +7138,29 @@ def _rob_seed_historical_columns(
 
 
 
+
+def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
+    """Copy Hilton historical snapshot columns C:D:E -> B:C:D.
+
+    Preserves formulas and literal values exactly as stored in the source.
+    Only historical destination columns B:D are touched, so current-year
+    column E and unrelated template formulas remain unchanged.
+    """
+    copied = 0
+    max_row = min(source_ws.max_row, dest_ws.max_row)
+
+    for row in range(1, max_row + 1):
+        for source_col, dest_col in ((3, 2), (4, 3), (5, 4)):
+            value = source_ws.cell(row, source_col).value
+            if value is None:
+                continue
+            dest_ws.cell(row, dest_col).value = value
+            copied += 1
+
+    return copied
+
+
+
 def _rob_seed_next_year_closed_months(
     current_year_wb,
     next_year_wb,
