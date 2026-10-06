@@ -10962,63 +10962,243 @@ def find_sr_master(service, hotel_id: str, target_year=None):
     return best["id"], best["name"]
 
 
+def _resolve_monthly_report_destination_folder(
+    service,
+    hotel_id,
+    hotel_name,
+    target_month,
+):
+    """Return the exact Drive folder used by ROB/Forecast for this month.
+
+    Priority:
+      1. Existing ROB for target month -> use its parent folder.
+      2. Existing Forecast for target month -> use its parent folder.
+      3. Shared Revenue Reports/month-folder resolver.
+
+    This keeps Strategy, ROB, and Forecast together in the same monthly folder.
+    """
+    reference_errors = []
+
+    for workbook_type in ("ROB", "Forecast"):
+        try:
+            result, err = _resolve_drive_workbook_session_cached(
+                service,
+                hotel_id,
+                hotel_name,
+                workbook_type,
+                target_month,
+            )
+        except Exception as e:
+            result, err = None, str(e)
+
+        if result:
+            file_id, file_name = result
+
+            try:
+                info = service.files().get(
+                    fileId=file_id,
+                    fields="parents,name",
+                    supportsAllDrives=True,
+                ).execute()
+                parents = info.get(
+                    "parents",
+                    [],
+                )
+
+                if parents:
+                    parent_id = parents[0]
+                    parent_info = service.files().get(
+                        fileId=parent_id,
+                        fields="name",
+                        supportsAllDrives=True,
+                    ).execute()
+
+                    return (
+                        parent_id,
+                        parent_info.get(
+                            "name",
+                            "",
+                        ),
+                        f"same folder as {workbook_type}: {file_name}",
+                    )
+            except Exception as e:
+                reference_errors.append(
+                    f"{workbook_type} parent lookup failed: {e}"
+                )
+        elif err:
+            reference_errors.append(
+                f"{workbook_type}: {err}"
+            )
+
+    year_kw = str(
+        target_month.year
+    )
+    month_kw = target_month.strftime(
+        "%b%Y"
+    ).upper()
+
+    rev_id, rev_name = _find_rev_reports_folder_for_year(
+        service,
+        hotel_id,
+        year_kw,
+        month_kw,
+    )
+
+    if rev_id:
+        month_id, month_name = _find_month_folder_under_rev(
+            service,
+            rev_id,
+            year_kw,
+            month_kw,
+            target_month,
+            hotel_name,
+        )
+
+        if month_id:
+            return (
+                month_id,
+                month_name,
+                "shared monthly folder resolver",
+            )
+
+    detail = (
+        " | ".join(
+            reference_errors
+        )
+        if reference_errors
+        else "no ROB/Forecast monthly reference found"
+    )
+
+    return (
+        None,
+        None,
+        detail,
+    )
+
+
+
 def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
     """
-    New month SR setup:
-      1. Find SR master, copy it, rename to [MON][YEAR] STRATEGY [HOTEL].xlsx
-      2. Find or create month folder under the year folder
-      3. Move the copy into that folder
+    New month Strategy setup.
+
+    Strategy must live in the exact same monthly folder as ROB/Forecast.
+    Existing ROB/Forecast parent folders are authoritative. The older
+    Strategy-only folder resolver is used only as a fallback when neither
+    monthly workbook exists yet.
+
     Returns (new_file_name, error_str).
     """
-    year_kw = str(target_month.year)
-    month_kw = target_month.strftime("%b%Y").upper()
+    month_kw = target_month.strftime(
+        "%b%Y"
+    ).upper()
 
-    # Resolve REVENUE REPORTS and month folder
-    rev_id, rev_name = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
-    if not rev_id:
-        return None, "No REVENUE REPORTS folder."
-
-    # Find month folder — never created, must already exist
-    month_id, month_name = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
-    if not month_id:
-        return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist. (Revenue Reports folder: {rev_name})"
-
-    # Check if SR already exists in that folder
-    existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
-    if existing_id and "master" not in existing_name.lower():
-        _cache_drive_workbook_resolution(
-            hotel_id, hotel_name, "Strategy Report",
-            target_month, existing_id, existing_name
+    month_id, month_name, destination_note = (
+        _resolve_monthly_report_destination_folder(
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
         )
-        return existing_name, None  # already set up
+    )
 
-    # Find master
-    master_id, master_name = find_sr_master(service, hotel_id, target_month.year)
+    if not month_id:
+        return None, (
+            f"Could not resolve the {month_kw} monthly report folder "
+            f"for {hotel_name}. Strategy was not created. "
+            f"Details: {destination_note}"
+        )
+
+    # Check for an existing Strategy workbook in the SAME folder as ROB/Forecast.
+    existing_id, existing_name = drive_find_file(
+        service,
+        "STRATEGY",
+        month_id,
+    )
+
+    if (
+        existing_id
+        and "master" not in str(
+            existing_name
+        ).lower()
+    ):
+        _cache_drive_workbook_resolution(
+            hotel_id,
+            hotel_name,
+            "Strategy Report",
+            target_month,
+            existing_id,
+            existing_name,
+        )
+        return existing_name, None
+
+    # Find the correct Strategy master.
+    master_id, master_name = find_sr_master(
+        service,
+        hotel_id,
+        target_month.year,
+    )
+
     if not master_id:
-        return None, master_name  # error string
+        return None, master_name
 
-    # Infer hotel suffix from master file name for the new file name
-    # e.g. "MASTER 2026 STRATEGY PLYMOUTH.xlsx" → "PLYMOUTH"
+    # Infer hotel suffix from master file name.
     hotel_suffix = hotel_name.upper()
-    name_upper = master_name.upper().replace(".XLSX", "")
-    if "STRATEGY" in name_upper:
-        after = name_upper[name_upper.find("STRATEGY") + len("STRATEGY"):].strip()
-        if after:
-            hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx", "").replace(".XLSX", "").strip()
+    name_upper = master_name.upper().replace(
+        ".XLSX",
+        "",
+    )
 
-    new_file_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
+    if "STRATEGY" in name_upper:
+        after = name_upper[
+            name_upper.find(
+                "STRATEGY"
+            )
+            + len(
+                "STRATEGY"
+            ):
+        ].strip()
+
+        if after:
+            hotel_suffix = master_name[
+                master_name.upper().find(
+                    "STRATEGY"
+                )
+                + len(
+                    "STRATEGY"
+                ):
+            ].strip().replace(
+                ".xlsx",
+                "",
+            ).replace(
+                ".XLSX",
+                "",
+            ).strip()
+
+    new_file_name = (
+        f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
+    )
+
     try:
         created_id, created_name = drive_copy_file(
-            service, master_id, new_file_name, month_id
+            service,
+            master_id,
+            new_file_name,
+            month_id,
         )
     except Exception as e:
         return None, str(e)
 
     _cache_drive_workbook_resolution(
-        hotel_id, hotel_name, "Strategy Report",
-        target_month, created_id, created_name
+        hotel_id,
+        hotel_name,
+        "Strategy Report",
+        target_month,
+        created_id,
+        created_name,
     )
+
     return created_name, None
+
 
 
 def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_month: datetime.date):
@@ -17049,6 +17229,78 @@ def render_ihg_strategy_month_setup(hotel_name, hotel_id):
                         else:
                             st.error(f"Could not create workbook: {create_err}")
                         return
+
+            # Confirm Strategy is in the same monthly folder as ROB/Forecast.
+            try:
+                strategy_result, _strategy_find_err = (
+                    _resolve_drive_workbook_session_cached(
+                        svc,
+                        hotel_id,
+                        hotel_name,
+                        "Strategy Report",
+                        target_month,
+                    )
+                )
+
+                if strategy_result:
+                    strategy_info = svc.files().get(
+                        fileId=strategy_result[0],
+                        fields="parents",
+                        supportsAllDrives=True,
+                    ).execute()
+                    strategy_parents = strategy_info.get(
+                        "parents",
+                        [],
+                    )
+
+                    ref_result = None
+                    ref_type = None
+                    for _ref_type in (
+                        "ROB",
+                        "Forecast",
+                    ):
+                        _result, _err = (
+                            _resolve_drive_workbook_session_cached(
+                                svc,
+                                hotel_id,
+                                hotel_name,
+                                _ref_type,
+                                target_month,
+                            )
+                        )
+                        if _result:
+                            ref_result = _result
+                            ref_type = _ref_type
+                            break
+
+                    if ref_result:
+                        ref_info = svc.files().get(
+                            fileId=ref_result[0],
+                            fields="parents",
+                            supportsAllDrives=True,
+                        ).execute()
+                        ref_parents = ref_info.get(
+                            "parents",
+                            [],
+                        )
+
+                        if (
+                            strategy_parents
+                            and ref_parents
+                            and strategy_parents[0]
+                            != ref_parents[0]
+                        ):
+                            st.error(
+                                f"Strategy destination mismatch: "
+                                f"{strategy_result[1]} is not in the same "
+                                f"monthly folder as {ref_type} "
+                                f"{ref_result[1]}. Setup stopped."
+                            )
+                            return
+            except Exception as e:
+                st.warning(
+                    f"Could not verify Strategy destination folder: {e}"
+                )
 
             # Step 2 — load references.
             with st.spinner("Step 2 / 3 — loading Strategy references..."):
