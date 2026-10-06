@@ -7588,11 +7588,30 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # Fast path: skip extra duplicate-file diagnostic Drive query.
     dup_check_warnings = []
 
-    existing_id, existing_name = drive_find_regular_rob_file(
+    existing_id, existing_name = _find_exact_monthly_workbook_in_folder(
         service,
         month_id,
-        month_date=target_month,
+        "ROB",
+        target_month,
     )
+
+    if not existing_id:
+        existing_id, existing_name = drive_find_regular_rob_file(
+            service,
+            month_id,
+            month_date=target_month,
+        )
+
+        if (
+            existing_id
+            and not _monthly_destination_matches_target(
+                existing_name,
+                month_name,
+                target_month,
+            )
+        ):
+            existing_id = None
+            existing_name = None
     is_fresh_copy = False
     if existing_id and "master" not in existing_name.lower():
         new_file_id, new_file_name = existing_id, existing_name
@@ -10724,16 +10743,25 @@ def setup_new_forecast_month(
     # If the target Forecast already exists, still update its start date/budget
     # instead of returning immediately. That makes the setup button useful for
     # repairing a previously-created workbook too.
-    existing_id, existing_name = drive_find_file(
+    existing_id, existing_name = _find_exact_monthly_workbook_in_folder(
         service,
-        "FORECAST",
         month_id,
+        "Forecast",
+        target_month,
     )
     target_file_id = None
     target_file_name = None
     newly_created = False
 
-    if existing_id and "master" not in existing_name.lower():
+    if (
+        existing_id
+        and "master" not in existing_name.lower()
+        and _monthly_destination_matches_target(
+            existing_name,
+            month_kw,
+            target_month,
+        )
+    ):
         target_file_id = existing_id
         target_file_name = existing_name
     else:
@@ -11157,10 +11185,11 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
         pass
 
     # Check for an existing Strategy workbook in the SAME folder as ROB/Forecast.
-    existing_id, existing_name = drive_find_file(
+    existing_id, existing_name = _find_exact_monthly_workbook_in_folder(
         service,
-        "STRATEGY",
         month_id,
+        "Strategy Report",
+        target_month,
     )
 
     if (
@@ -11307,6 +11336,161 @@ def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_mo
     return result_map
 
 
+def _monthly_destination_matches_target(file_name, folder_name, target_month):
+    """Return True only when a workbook is a valid target-month destination.
+
+    Safety rule:
+      - If the FILE NAME contains a recognizable month/year, that month must
+        equal target_month. A September workbook inside an October folder is
+        still a September workbook and must never be edited.
+      - Only filenames with no recognizable month/year may fall back to the
+        parent folder's month token.
+    """
+    if target_month is None:
+        return True
+
+    def _norm(value):
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+    target_tokens = {
+        _norm(target_month.strftime("%b%Y")),
+        _norm(target_month.strftime("%b %Y")),
+        _norm(target_month.strftime("%B %Y")),
+        _norm(target_month.strftime("%b%y")),
+    }
+
+    file_text = str(file_name or "").upper()
+    file_norm = _norm(file_text)
+
+    # Detect any explicit month/year embedded in the filename.
+    month_names = [
+        ("JAN", 1), ("JANUARY", 1),
+        ("FEB", 2), ("FEBRUARY", 2),
+        ("MAR", 3), ("MARCH", 3),
+        ("APR", 4), ("APRIL", 4),
+        ("MAY", 5),
+        ("JUN", 6), ("JUNE", 6),
+        ("JUL", 7), ("JULY", 7),
+        ("AUG", 8), ("AUGUST", 8),
+        ("SEP", 9), ("SEPT", 9), ("SEPTEMBER", 9),
+        ("OCT", 10), ("OCTOBER", 10),
+        ("NOV", 11), ("NOVEMBER", 11),
+        ("DEC", 12), ("DECEMBER", 12),
+    ]
+
+    explicit_month_years = set()
+
+    for label, month_num in month_names:
+        for year_match in re.finditer(
+            rf"{label}\s*[-_ ]?(20\d{{2}}|\d{{2}})",
+            file_text,
+            flags=re.I,
+        ):
+            raw_year = year_match.group(1)
+            year = int(raw_year)
+            if year < 100:
+                year += 2000
+            explicit_month_years.add(
+                (year, month_num)
+            )
+
+    # Numeric M/YYYY or MM-YYYY forms.
+    for numeric_match in re.finditer(
+        r"(?<!\d)(1[0-2]|0?[1-9])\s*[-_/ ]\s*(20\d{2})(?!\d)",
+        file_text,
+    ):
+        explicit_month_years.add(
+            (
+                int(numeric_match.group(2)),
+                int(numeric_match.group(1)),
+            )
+        )
+
+    if explicit_month_years:
+        return (
+            target_month.year,
+            target_month.month,
+        ) in explicit_month_years
+
+    # Filename has no explicit month/year. Then and only then may the folder
+    # establish the target month.
+    folder_norm = _norm(folder_name)
+    return any(
+        token and token in folder_norm
+        for token in target_tokens
+    )
+
+
+
+def _find_exact_monthly_workbook_in_folder(
+    service,
+    folder_id,
+    workbook_type,
+    target_month,
+):
+    """Find the exact target-month workbook in one monthly folder."""
+    try:
+        files = _drive_excel_children_cached(
+            service,
+            folder_id,
+            include_google_sheets=False,
+        )
+    except Exception:
+        files = []
+
+    keyword = WORKBOOK_KEYWORDS.get(
+        workbook_type,
+        workbook_type,
+    )
+    keyword_up = str(keyword or "").upper()
+
+    candidates = []
+
+    for f in files:
+        name = str(
+            f.get("name", "")
+        )
+        up = name.upper()
+
+        if "MASTER" in up:
+            continue
+
+        if workbook_type == "ROB":
+            if "ROB" not in up:
+                continue
+            # Historical year-prefixed ROBs are never the current monthly ROB.
+            if re.match(r"^\s*20\d{2}\s+ROB\b", up):
+                continue
+        elif keyword_up and keyword_up not in up:
+            continue
+
+        if not _monthly_destination_matches_target(
+            name,
+            "",
+            target_month,
+        ):
+            continue
+
+        candidates.append(f)
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(
+        key=lambda f: str(
+            f.get(
+                "modifiedTime",
+                "",
+            )
+        ),
+        reverse=True,
+    )
+
+    best = candidates[0]
+    return best["id"], best["name"]
+
+
+
 def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_type: str, month_date: datetime.date = None):
     """
     Resolve a monthly workbook without assuming one exact Revenue Reports layout.
@@ -11396,24 +11580,43 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             ).execute().get("files", [])
 
     def _find_file_in(folder_id, folder_name):
-        if workbook_type == "ROB":
-            fid, fname = drive_find_regular_rob_file(
-                service,
-                folder_id,
-                month_date=month_date,
-            )
-        else:
-            fid, fname = drive_find_file(
-                service,
-                wb_keyword,
-                folder_id,
-            )
+        fid, fname = _find_exact_monthly_workbook_in_folder(
+            service,
+            folder_id,
+            workbook_type,
+            month_date,
+        )
+
+        if not fid:
+            if workbook_type == "ROB":
+                fid, fname = drive_find_regular_rob_file(
+                    service,
+                    folder_id,
+                    month_date=month_date,
+                )
+            else:
+                fid, fname = drive_find_file(
+                    service,
+                    wb_keyword,
+                    folder_id,
+                )
 
         if not fid:
             return None, f"No '{wb_keyword}' workbook found in '{folder_name}'."
 
         if "master" in str(fname).lower():
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
+
+        if workbook_type in ("ROB", "Strategy Report", "Forecast"):
+            if not _monthly_destination_matches_target(
+                fname,
+                folder_name,
+                month_date,
+            ):
+                return None, (
+                    f"Found '{fname}' under '{folder_name}', but it is not "
+                    f"the {month_date:%B %Y} destination workbook."
+                )
 
         return (fid, fname), None
 
@@ -16956,7 +17159,11 @@ def render_hilton_update(hotels):
                     )
                 else:
                     result, err = resolve_drive_workbook(
-                        svc, fid, name, wb_type
+                        svc,
+                        fid,
+                        name,
+                        wb_type,
+                        month_date=hilton_as_of.replace(day=1),
                     )
                 if err or not result:
                     problems.append(f"{name} — {wb_type}: {err}")
@@ -17833,9 +18040,12 @@ def render_ihg_update(hotels):
                 f"Editor, then press ↺ to refresh."
             )
             st.stop()
+        report_month = parsed["report_date"].replace(day=1)
+
         for wb_type in wb_sels:
+            created_now = False
+
             if wb_type == NEXT_YEAR_ROB_TYPE:
-                report_month = parsed["report_date"].replace(day=1)
                 result, err = resolve_next_year_rob_workbook(
                     svc,
                     hotel_id,
@@ -17844,9 +18054,14 @@ def render_ihg_update(hotels):
                     tracked_year=report_month.year + 1,
                 )
             else:
-                result, err = resolve_drive_workbook(
-                    svc, hotel_id, hotel_sel, wb_type
+                result, err, created_now = _ensure_monthly_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_sel,
+                    wb_type,
+                    report_month,
                 )
+
             if err or not result:
                 problems.append(f"{wb_type}: {err}")
                 continue
@@ -17855,7 +18070,10 @@ def render_ihg_update(hotels):
             wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
             if wb_type in ("ROB", NEXT_YEAR_ROB_TYPE):
                 avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
-                sheet = first_uncolored_sheet(wb, avail)
+                if wb_type == "ROB" and created_now:
+                    sheet = avail[0]
+                else:
+                    sheet = first_uncolored_sheet(wb, avail)
                 changes = build_ihg_rob_plan(
                     parsed,
                     wb[sheet],
@@ -17871,7 +18089,27 @@ def render_ihg_update(hotels):
                 note = "  ·  skipped " + "; ".join(passed) if passed else ""
             elif wb_type == "Strategy Report":
                 avail = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
-                sheet = first_undone_strategy_sheet(wb, avail)
+
+                if created_now:
+                    clear_tab_colors(
+                        wb,
+                        STRATEGY_SHEETS,
+                    )
+                    restructure_sr_dates(
+                        wb,
+                        report_month,
+                    )
+                    sheet = avail[0]
+                    # Use the in-memory freshly restructured dates for matching.
+                    temp = io.BytesIO()
+                    wb.save(temp)
+                    raw = temp.getvalue()
+                else:
+                    sheet = first_undone_strategy_sheet(
+                        wb,
+                        avail,
+                    )
+
                 # A second, values-only view: the date column is formulas on
                 # some hotels' later week tabs, and formulas read back as text.
                 wb_vals = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
@@ -17905,9 +18143,41 @@ def render_ihg_update(hotels):
                 })
             else:
                 avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-                sheet = first_unhighlighted_forecast_sheet(wb, avail)
-                changes = build_ihg_forecast_plan(parsed, wb[sheet], wb=wb)
+
+                if created_now:
+                    sheet = avail[0]
+                else:
+                    sheet = first_unhighlighted_forecast_sheet(
+                        wb,
+                        avail,
+                    )
+
+                changes = build_ihg_forecast_plan(
+                    parsed,
+                    wb[sheet],
+                    wb=wb,
+                )
                 note = ""
+
+                operational = [
+                    c for c in changes
+                    if not c.get("skip_reason")
+                    and (
+                        "actual rooms" in c.get("label", "").lower()
+                        or "actual revenue" in c.get("label", "").lower()
+                        or "otb rooms" in c.get("label", "").lower()
+                        or "otb adr" in c.get("label", "").lower()
+                    )
+                ]
+
+                if changes and not operational:
+                    problems.append(
+                        f"{file_name}: Forecast matched no daily operational "
+                        f"values for {report_month:%B %Y}; the workbook was "
+                        f"not queued for an as-of-date-only update."
+                    )
+                    continue
+
                 if not changes:
                     problems.append(
                         f"{file_name}: could not locate the OTB / actual rows on "
@@ -18070,6 +18340,88 @@ def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
         "wb_bytes": raw, "sheet": sheet, "changes": changes,
         "note": f"  ·  InnCode {inn}",
     }
+
+
+
+def _ensure_monthly_workbook(
+    service,
+    hotel_id,
+    hotel_name,
+    workbook_type,
+    target_month,
+):
+    """Resolve/create the exact monthly destination workbook.
+
+    Returns (result, error, created_now), where result is (file_id, file_name).
+    Previous-month workbooks are reference-only and can never satisfy this.
+    """
+    result, err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        workbook_type,
+        month_date=target_month,
+    )
+
+    if result and not err:
+        return result, None, False
+
+    created_now = False
+
+    if workbook_type == "ROB":
+        created_name, create_err, _file_id, _orig = setup_new_rob_month(
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
+        )
+        if not created_name:
+            return None, create_err or err, False
+        created_now = True
+
+    elif workbook_type == "Strategy Report":
+        created_name, create_err = setup_new_sr_month(
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
+        )
+        if not created_name:
+            return None, create_err or err, False
+        created_now = True
+
+    elif workbook_type == "Forecast":
+        created_name, create_err = setup_new_forecast_month(
+            service,
+            hotel_id,
+            hotel_name,
+            target_month,
+        )
+        if not created_name:
+            return None, create_err or err, False
+        created_now = True
+
+    else:
+        return None, err, False
+
+    # Re-resolve after creation. The exact-month resolver rejects stale prior
+    # month cached/file candidates.
+    result, err = resolve_drive_workbook(
+        service,
+        hotel_id,
+        hotel_name,
+        workbook_type,
+        month_date=target_month,
+    )
+
+    if not result or err:
+        return None, (
+            err
+            or f"Could not locate {target_month:%B %Y} {workbook_type} "
+               f"after creating it."
+        ), created_now
+
+    return result, None, created_now
 
 
 def _match_inncode(hotel_name, srp):
@@ -18890,8 +19242,10 @@ with tab_weekly:
             )
 
         for wb_type in wb_sels:
+            created_now = False
+
             if wb_type == NEXT_YEAR_ROB_TYPE:
-                report_month = datetime.date.today().replace(day=1)
+                report_month = current_month
                 result, err = resolve_next_year_rob_workbook(
                     svc,
                     hotel_id,
@@ -18900,19 +19254,29 @@ with tab_weekly:
                     tracked_year=report_month.year + 1,
                 )
             else:
-                result, err = resolve_drive_workbook(
-                    svc, hotel_id, hotel_sel, wb_type
+                result, err, created_now = _ensure_monthly_workbook(
+                    svc,
+                    hotel_id,
+                    hotel_sel,
+                    wb_type,
+                    current_month,
                 )
-            if err:
+
+            if err or not result:
                 st.error(f"{wb_type}: {err}")
                 continue
             file_id, file_name = result
             wb_bytes = drive_download(svc, file_id)
             wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
             if wb_type in ("ROB", NEXT_YEAR_ROB_TYPE):
-                avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
-                auto     = first_uncolored_sheet(wb, avail)
-                sheet    = auto or avail[0]
+                avail = [s for s in ROB_SHEETS if s in wb.sheetnames]
+
+                if wb_type == "ROB" and created_now:
+                    sheet = avail[0]
+                    auto = sheet
+                else:
+                    auto = first_uncolored_sheet(wb, avail)
+                    sheet = auto or avail[0]
                 changes  = build_rob_change_plan(
                     df,
                     wb[sheet],
@@ -18936,143 +19300,20 @@ with tab_weekly:
                     if s in wb.sheetnames
                 ]
 
-                # The weekly Strategy update must use the workbook for the
-                # report's actual month. Never continue the last unfinished
-                # tab from a prior-month Strategy workbook.
-                strategy_report_month = (
-                    df.attrs.get("report_date")
-                    if hasattr(df, "attrs")
-                    else None
-                )
-
-                if not isinstance(
-                    strategy_report_month,
-                    (datetime.date, datetime.datetime),
-                ):
-                    strategy_report_month = datetime.date.today()
-
-                if isinstance(
-                    strategy_report_month,
-                    datetime.datetime,
-                ):
-                    strategy_report_month = (
-                        strategy_report_month.date()
+                # Once the month rolls over, the prior-month Strategy is
+                # reference-only. A newly-created monthly Strategy starts WK1.
+                if created_now:
+                    clear_tab_colors(
+                        wb,
+                        STRATEGY_SHEETS,
                     )
-
-                strategy_report_month = (
-                    strategy_report_month.replace(day=1)
-                )
-
-                newly_created_strategy = False
-
-                if not _strategy_filename_matches_month(
-                    file_name,
-                    strategy_report_month,
-                ):
-                    st.info(
-                        f"Strategy Report: **{file_name}** is not the "
-                        f"{strategy_report_month:%B %Y} workbook. "
-                        f"Creating/resolving the correct monthly Strategy..."
+                    restructure_sr_dates(
+                        wb,
+                        current_month,
                     )
-
-                    created_name, setup_err = setup_new_sr_month(
-                        svc,
-                        hotel_id,
-                        hotel_sel,
-                        strategy_report_month,
-                    )
-
-                    if setup_err and not created_name:
-                        problems.append(
-                            f"{strategy_report_month:%b %Y} Strategy: "
-                            f"{setup_err}"
-                        )
-                        continue
-
-                    newly_created_strategy = bool(
-                        created_name
-                        and _strategy_filename_matches_month(
-                            created_name,
-                            strategy_report_month,
-                        )
-                    )
-
-                    # Resolve the exact Strategy file from the same monthly
-                    # destination folder as ROB/Forecast, bypassing stale
-                    # prior-month resolver results.
-                    month_id, _month_name, _dest_note = (
-                        _resolve_monthly_report_destination_folder(
-                            svc,
-                            hotel_id,
-                            hotel_sel,
-                            strategy_report_month,
-                        )
-                    )
-
-                    exact_strategy = None
-
-                    if month_id:
-                        candidates = _drive_excel_children_cached(
-                            svc,
-                            month_id,
-                            include_google_sheets=False,
-                        )
-
-                        matched = [
-                            f for f in candidates
-                            if "STRATEGY" in str(
-                                f.get("name", "")
-                            ).upper()
-                            and "MASTER" not in str(
-                                f.get("name", "")
-                            ).upper()
-                            and _strategy_filename_matches_month(
-                                f.get("name", ""),
-                                strategy_report_month,
-                            )
-                        ]
-
-                        matched.sort(
-                            key=lambda f: str(
-                                f.get("modifiedTime", "")
-                            ),
-                            reverse=True,
-                        )
-
-                        if matched:
-                            exact_strategy = matched[0]
-
-                    if exact_strategy is None:
-                        problems.append(
-                            f"{strategy_report_month:%b %Y} Strategy: "
-                            f"the correct monthly workbook could not be "
-                            f"located after setup."
-                        )
-                        continue
-
-                    file_id = exact_strategy["id"]
-                    file_name = exact_strategy["name"]
-                    wb_bytes = drive_download(
-                        svc,
-                        file_id,
-                    )
-                    wb = openpyxl.load_workbook(
-                        io.BytesIO(wb_bytes),
-                        data_only=False,
-                    )
-                    avail = [
-                        s for s in STRATEGY_SHEETS
-                        if s in wb.sheetnames
-                    ]
-
-                # A new month always starts on WK1. Do not let preloaded
-                # reference fields make first_undone_strategy_sheet() skip
-                # ahead to a later tab.
-                if newly_created_strategy:
                     sheet = (
                         STRATEGY_SHEETS[0]
-                        if STRATEGY_SHEETS
-                        and STRATEGY_SHEETS[0] in wb.sheetnames
+                        if STRATEGY_SHEETS[0] in wb.sheetnames
                         else avail[0]
                     )
                     auto = sheet
@@ -19082,6 +19323,7 @@ with tab_weekly:
                         avail,
                     )
                     sheet = auto or avail[0]
+
                 date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
                 own_debug = build_date_row_map(
                     wb, prefer_sheet=sheet, fallback_to_wkone=False
@@ -19138,11 +19380,72 @@ with tab_weekly:
                     )
                     changes += lh_changes
                     warnings += lh_warnings
-            else:  # Forecast — current month (no Month Ending Forecast fill here)
-                avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-                auto     = first_unhighlighted_forecast_sheet(wb, avail)
-                sheet    = auto or avail[0]
-                changes, warnings = build_forecast_change_plan(df, wb[sheet])
+            else:  # Forecast — current month
+                avail = [
+                    s for s in FORECAST_SHEETS
+                    if s in wb.sheetnames
+                ]
+
+                if created_now:
+                    sheet = avail[0]
+                    auto = sheet
+                else:
+                    auto = first_unhighlighted_forecast_sheet(
+                        wb,
+                        avail,
+                    )
+                    sheet = auto or avail[0]
+
+                # On WK1, use the current-month ROB for Month Ending Forecast.
+                current_rob_wb = None
+                if sheet == FORECAST_SHEETS[0]:
+                    rob_result, _rob_err = resolve_drive_workbook(
+                        svc,
+                        hotel_id,
+                        hotel_sel,
+                        "ROB",
+                        month_date=current_month,
+                    )
+                    if rob_result:
+                        current_rob_wb = openpyxl.load_workbook(
+                            io.BytesIO(
+                                drive_download(
+                                    svc,
+                                    rob_result[0],
+                                )
+                            ),
+                            data_only=True,
+                        )
+
+                changes, warnings = build_forecast_change_plan(
+                    df,
+                    wb[sheet],
+                    rob_wb=current_rob_wb,
+                    is_wk1=(
+                        sheet == FORECAST_SHEETS[0]
+                    ),
+                )
+
+                # Do not treat an as-of date/pickup date-only update as a
+                # successful Forecast. Require actual daily operational writes.
+                operational = [
+                    c for c in changes
+                    if not c.get("skip_reason")
+                    and (
+                        c.get("label", "").startswith("Rooms Sold")
+                        or c.get("label", "").startswith("ADR OTB")
+                        or c.get("label", "").startswith("Revenue (actual)")
+                    )
+                ]
+
+                if not operational:
+                    st.warning(
+                        f"Forecast ({current_month:%b %Y}): no daily rooms, "
+                        f"ADR, or revenue values matched the destination dates. "
+                        f"The workbook was not queued, so an as-of-date-only "
+                        f"update cannot be saved."
+                    )
+                    continue
             all_plans[wb_type] = {
                 "file_id":   file_id,
                 "file_name": file_name,
