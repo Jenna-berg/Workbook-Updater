@@ -1119,6 +1119,7 @@ def build_ihg_next_month_forecast_plan(bob, ws, target_month, wb=None):
 # ── ROB Update ───────────────────────────────────────────────────────────────
 
 ROB_SHEETS = ["wk one", "wk two", "wk three", "wk four", "wk five", "wk six"]
+DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 
 def find_secondary_col(ws, block_start):
