@@ -11137,6 +11137,25 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
             f"Details: {destination_note}"
         )
 
+    # Remove any stale prior-month Strategy resolution for this target month
+    # before deciding whether an October workbook already exists.
+    try:
+        cache_key = _drive_workbook_cache_key(
+            hotel_id,
+            hotel_name,
+            "Strategy Report",
+            target_month,
+        )
+        st.session_state.get(
+            "_drive_workbook_resolution_cache",
+            {},
+        ).pop(
+            cache_key,
+            None,
+        )
+    except Exception:
+        pass
+
     # Check for an existing Strategy workbook in the SAME folder as ROB/Forecast.
     existing_id, existing_name = drive_find_file(
         service,
@@ -18912,9 +18931,157 @@ with tab_weekly:
                 if _passed:
                     warnings.append(f"Writing to '{sheet}'. Skipped: " + "; ".join(_passed))
             elif wb_type == "Strategy Report":
-                avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
-                auto     = first_undone_strategy_sheet(wb, avail)
-                sheet    = auto or avail[0]
+                avail = [
+                    s for s in STRATEGY_SHEETS
+                    if s in wb.sheetnames
+                ]
+
+                # The weekly Strategy update must use the workbook for the
+                # report's actual month. Never continue the last unfinished
+                # tab from a prior-month Strategy workbook.
+                strategy_report_month = (
+                    df.attrs.get("report_date")
+                    if hasattr(df, "attrs")
+                    else None
+                )
+
+                if not isinstance(
+                    strategy_report_month,
+                    (datetime.date, datetime.datetime),
+                ):
+                    strategy_report_month = datetime.date.today()
+
+                if isinstance(
+                    strategy_report_month,
+                    datetime.datetime,
+                ):
+                    strategy_report_month = (
+                        strategy_report_month.date()
+                    )
+
+                strategy_report_month = (
+                    strategy_report_month.replace(day=1)
+                )
+
+                newly_created_strategy = False
+
+                if not _strategy_filename_matches_month(
+                    file_name,
+                    strategy_report_month,
+                ):
+                    st.info(
+                        f"Strategy Report: **{file_name}** is not the "
+                        f"{strategy_report_month:%B %Y} workbook. "
+                        f"Creating/resolving the correct monthly Strategy..."
+                    )
+
+                    created_name, setup_err = setup_new_sr_month(
+                        svc,
+                        hotel_id,
+                        hotel_sel,
+                        strategy_report_month,
+                    )
+
+                    if setup_err and not created_name:
+                        problems.append(
+                            f"{strategy_report_month:%b %Y} Strategy: "
+                            f"{setup_err}"
+                        )
+                        continue
+
+                    newly_created_strategy = bool(
+                        created_name
+                        and _strategy_filename_matches_month(
+                            created_name,
+                            strategy_report_month,
+                        )
+                    )
+
+                    # Resolve the exact Strategy file from the same monthly
+                    # destination folder as ROB/Forecast, bypassing stale
+                    # prior-month resolver results.
+                    month_id, _month_name, _dest_note = (
+                        _resolve_monthly_report_destination_folder(
+                            svc,
+                            hotel_id,
+                            hotel_sel,
+                            strategy_report_month,
+                        )
+                    )
+
+                    exact_strategy = None
+
+                    if month_id:
+                        candidates = _drive_excel_children_cached(
+                            svc,
+                            month_id,
+                            include_google_sheets=False,
+                        )
+
+                        matched = [
+                            f for f in candidates
+                            if "STRATEGY" in str(
+                                f.get("name", "")
+                            ).upper()
+                            and "MASTER" not in str(
+                                f.get("name", "")
+                            ).upper()
+                            and _strategy_filename_matches_month(
+                                f.get("name", ""),
+                                strategy_report_month,
+                            )
+                        ]
+
+                        matched.sort(
+                            key=lambda f: str(
+                                f.get("modifiedTime", "")
+                            ),
+                            reverse=True,
+                        )
+
+                        if matched:
+                            exact_strategy = matched[0]
+
+                    if exact_strategy is None:
+                        problems.append(
+                            f"{strategy_report_month:%b %Y} Strategy: "
+                            f"the correct monthly workbook could not be "
+                            f"located after setup."
+                        )
+                        continue
+
+                    file_id = exact_strategy["id"]
+                    file_name = exact_strategy["name"]
+                    wb_bytes = drive_download(
+                        svc,
+                        file_id,
+                    )
+                    wb = openpyxl.load_workbook(
+                        io.BytesIO(wb_bytes),
+                        data_only=False,
+                    )
+                    avail = [
+                        s for s in STRATEGY_SHEETS
+                        if s in wb.sheetnames
+                    ]
+
+                # A new month always starts on WK1. Do not let preloaded
+                # reference fields make first_undone_strategy_sheet() skip
+                # ahead to a later tab.
+                if newly_created_strategy:
+                    sheet = (
+                        STRATEGY_SHEETS[0]
+                        if STRATEGY_SHEETS
+                        and STRATEGY_SHEETS[0] in wb.sheetnames
+                        else avail[0]
+                    )
+                    auto = sheet
+                else:
+                    auto = first_undone_strategy_sheet(
+                        wb,
+                        avail,
+                    )
+                    sheet = auto or avail[0]
                 date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
                 own_debug = build_date_row_map(
                     wb, prefer_sheet=sheet, fallback_to_wkone=False
