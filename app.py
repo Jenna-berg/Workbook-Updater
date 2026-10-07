@@ -1597,7 +1597,7 @@ def build_hilton_rob_plan(
     return changes, warns
 
 
-def build_hilton_forecast_plan(srp_days, ws, as_of=None):
+def build_hilton_forecast_plan(srp_days, ws, as_of=None, target_month=None):
     """Write Hilton Forecast OTB inputs only.
 
     Validated against completed Nashua files:
@@ -1681,14 +1681,25 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
             ),
         })
 
-    workbook_month = min(col_map).replace(day=1)
+    target_month = (
+        target_month.replace(day=1)
+        if target_month is not None
+        else min(col_map).replace(day=1)
+    )
+    workbook_month = target_month
     as_of_month = as_of.replace(day=1)
-    is_future_month = workbook_month > as_of_month
+    is_future_month = target_month > as_of_month
 
     written = 0
     skipped_past = 0
 
     for d, col in sorted(col_map.items()):
+        if (
+            d.year != target_month.year
+            or d.month != target_month.month
+        ):
+            continue
+
         # Current-month workflow leaves yesterday (T-1) and all earlier
         # dates alone. For a future-month Forecast, populate the full month.
         if not is_future_month and d < as_of:
@@ -1743,6 +1754,11 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None):
 
         pickup_written = 0
         for d, col in sorted(col_map.items()):
+            if (
+                d.year != target_month.year
+                or d.month != target_month.month
+            ):
+                continue
             day_bucket = srp_days.get(d)
             if day_bucket is None:
                 continue
@@ -17297,8 +17313,15 @@ def render_hilton_update(hotels):
             for wb_type in wb_sels:
                 if wb_type == "Forecast":
                     job = _hilton_forecast_job(
-                        svc, fid, name, inn, prop, wash, problems,
-                        as_of=hilton_as_of
+                        svc,
+                        fid,
+                        name,
+                        inn,
+                        prop,
+                        wash,
+                        problems,
+                        month_date=hilton_as_of.replace(day=1),
+                        as_of=hilton_as_of,
                     )
                     if job:
                         jobs.append(job)
@@ -17314,15 +17337,49 @@ def render_hilton_update(hotels):
                         tracked_year=report_month.year + 1,
                     )
                 else:
+                    report_month = hilton_as_of.replace(day=1)
                     result, err = resolve_drive_workbook(
                         svc,
                         fid,
                         name,
                         wb_type,
-                        month_date=hilton_as_of.replace(day=1),
+                        month_date=report_month,
                     )
+
+                    # A missing current-month Hilton ROB should be created via
+                    # the same monthly setup path rather than stopping at an
+                    # old/legacy Revenue Reports root.
+                    if (
+                        wb_type == "ROB"
+                        and (err or not result)
+                    ):
+                        (
+                            created_name,
+                            create_err,
+                            _created_id,
+                            _original_bytes,
+                        ) = setup_new_rob_month(
+                            svc,
+                            fid,
+                            name,
+                            report_month,
+                        )
+
+                        if created_name:
+                            result, err = resolve_drive_workbook(
+                                svc,
+                                fid,
+                                name,
+                                "ROB",
+                                month_date=report_month,
+                            )
+                        else:
+                            err = create_err or err
+
                 if err or not result:
-                    problems.append(f"{name} — {wb_type}: {err}")
+                    problems.append(
+                        f"{name} — {wb_type}: {err}"
+                    )
                     continue
                 file_id, file_name = result
                 raw = drive_download(svc, file_id)
@@ -18421,80 +18478,233 @@ def _show_ihg_plan(changes):
         st.caption(f"{len(skips)} cell(s) left alone because they hold a formula.")
 
 
+def _hilton_repair_forecast_calendar(wb, target_month):
+    """Force every Hilton Forecast week tab to the requested calendar month.
+
+    Existing/copied Forecast files can retain a prior template's dates even
+    when the filename is correct. Hilton updates must trust the requested
+    month, not stale dates inside the workbook.
+
+    Returns change records suitable for apply_portfolio_plans. The workbook
+    passed in is also mutated immediately so the subsequent plan is built
+    against the repaired calendar.
+    """
+    target_month = target_month.replace(day=1)
+    days_in_month = calendar.monthrange(
+        target_month.year,
+        target_month.month,
+    )[1]
+    repairs = []
+
+    for sheet_name in FORECAST_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+        rows = locate_forecast_rows(ws)
+        if not rows:
+            continue
+
+        date_row = rows["date_row"]
+
+        # Prefer the existing date-bearing columns. If stale/invalid dates
+        # prevent that map from forming, fall back to the contiguous daily
+        # grid immediately to the right of column A.
+        existing_map = build_forecast_date_col_map(
+            ws,
+            wb,
+            date_row=date_row,
+        )
+        date_cols = sorted(set(existing_map.values()))
+
+        if len(date_cols) < 28:
+            # Forecast templates use one column per calendar day.
+            date_cols = list(
+                range(
+                    2,
+                    min(ws.max_column, 32) + 1,
+                )
+            )
+
+        # Ensure enough columns for a 31-day month when the sheet supports it.
+        if len(date_cols) < days_in_month:
+            candidate_cols = [
+                c for c in range(2, ws.max_column + 1)
+                if c not in date_cols
+            ]
+            for c in candidate_cols:
+                date_cols.append(c)
+                if len(date_cols) >= days_in_month:
+                    break
+            date_cols = sorted(date_cols)
+
+        for i, col in enumerate(date_cols):
+            new_value = None
+            if i < days_in_month:
+                new_value = datetime.date(
+                    target_month.year,
+                    target_month.month,
+                    i + 1,
+                )
+
+            current_value = parse_any_date(
+                ws.cell(date_row, col).value
+            )
+
+            if current_value == new_value:
+                continue
+
+            ws.cell(date_row, col).value = new_value
+            repairs.append({
+                "label": (
+                    f"Forecast calendar {new_value}"
+                    if new_value
+                    else "Forecast calendar extra day cleared"
+                ),
+                "row": date_row,
+                "col": col,
+                "new_value": new_value,
+                "skip_reason": None,
+                "sheet": sheet_name,
+            })
+
+    return repairs
+
+
+
 def _hilton_forecast_job(svc, hotel_id, hotel_name, inn, prop, wash, problems,
                          month_date=None, as_of=None):
-    """Build the Forecast job for one Hilton hotel and one month.
+    """Build one Hilton Forecast job for an exact requested month."""
+    as_of = as_of or datetime.date.today()
+    if isinstance(as_of, datetime.datetime):
+        as_of = as_of.date()
 
-    month_date picks which month's workbook to open; None means the current
-    one. If a requested future-month Forecast does not exist yet, the job
-    creates it first using setup_new_forecast_month (master if available,
-    otherwise the prior month's Forecast as the template), then fills it.
+    target_month = (
+        month_date.replace(day=1)
+        if month_date is not None
+        else as_of.replace(day=1)
+    )
+    label = f"Forecast ({target_month:%b %Y})"
 
-    The SRP export runs a year forward, and build_hilton_forecast_plan already
-    sends every date that has not happened yet to the OTB rows.
-
-    Returns the job, or None having appended the reason to `problems`.
-    """
-    label = f"Forecast ({month_date:%b %Y})" if month_date else "Forecast"
     result, err = resolve_drive_workbook(
-        svc, hotel_id, hotel_name, "Forecast", month_date=month_date
+        svc,
+        hotel_id,
+        hotel_name,
+        "Forecast",
+        month_date=target_month,
     )
 
-    # For a requested future month, do not fail just because that Forecast
-    # workbook has not been created yet. Use the same setup path as the other
-    # portfolios: Forecast master when available, otherwise prior month's
-    # Forecast as the template, then resolve the newly-created workbook.
-    if (err or not result) and month_date is not None:
+    # Missing target-month Forecasts are created from the Forecast master or
+    # prior live Forecast. This applies to current and future months alike.
+    if err or not result:
         created_name, create_err = setup_new_forecast_month(
             svc,
             hotel_id,
             hotel_name,
-            month_date,
+            target_month,
         )
-        if create_err:
+        if create_err and not created_name:
             problems.append(
-                f"{hotel_name} — {label}: could not create the future "
-                f"Forecast — {create_err}"
+                f"{hotel_name} — {label}: could not create the "
+                f"{target_month:%B %Y} Forecast — {create_err}"
             )
             return None
 
-        # Resolve again after creation so the normal Hilton Forecast job can
-        # preview/apply changes to the exact new workbook.
         result, err = resolve_drive_workbook(
             svc,
             hotel_id,
             hotel_name,
             "Forecast",
-            month_date=month_date,
+            month_date=target_month,
         )
 
     if err or not result:
-        problems.append(f"{hotel_name} — {label}: {err}")
+        problems.append(
+            f"{hotel_name} — {label}: {err}"
+        )
         return None
 
     file_id, file_name = result
     raw = drive_download(svc, file_id)
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
-    avail = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+    keep_vba = str(file_name).lower().endswith(".xlsm")
+    wb = openpyxl.load_workbook(
+        io.BytesIO(raw),
+        data_only=False,
+        keep_vba=keep_vba,
+    )
+
+    avail = [
+        s for s in FORECAST_SHEETS
+        if s in wb.sheetnames
+    ]
     if not avail:
-        problems.append(f"{hotel_name} — {label} ({file_name}): none of "
-                        f"FCST-WK1 – WK9 were found.")
+        problems.append(
+            f"{hotel_name} — {label} ({file_name}): none of "
+            f"FCST-WK1 – WK9 were found."
+        )
         return None
 
-    sheet = first_unhighlighted_forecast_sheet(wb, avail)
-    changes, warns = build_hilton_forecast_plan(
-        prop["days"], wb[sheet], as_of=as_of
+    # Repair stale template dates BEFORE selecting/building the week plan.
+    # This makes target_month authoritative even when an existing file named
+    # DEC2026 still contains JAN2026 dates.
+    calendar_repairs = _hilton_repair_forecast_calendar(
+        wb,
+        target_month,
     )
+
+    sheet = first_unhighlighted_forecast_sheet(
+        wb,
+        avail,
+    )
+
+    changes, warns = build_hilton_forecast_plan(
+        prop["days"],
+        wb[sheet],
+        as_of=as_of,
+        target_month=target_month,
+    )
+
     for w in warns:
-        problems.append(f"{hotel_name} — {label} ({file_name}, {sheet}): {w}")
-    if not changes:
+        problems.append(
+            f"{hotel_name} — {label} "
+            f"({file_name}, {sheet}): {w}"
+        )
+
+    operational = [
+        c for c in changes
+        if (
+            c.get("label", "").startswith("Rooms Sold (OTB)")
+            or c.get("label", "").startswith("ADR OTB")
+        )
+    ]
+    if not operational:
         return None
+
+    # apply_portfolio_plans writes only one sheet per job. Calendar repairs for
+    # the selected week belong in this job; other week tabs will inherit/rebuild
+    # when they become active. This avoids modifying unrelated tabs during a
+    # weekly update while guaranteeing the active tab is correct.
+    selected_repairs = [
+        {
+            k: v for k, v in repair.items()
+            if k != "sheet"
+        }
+        for repair in calendar_repairs
+        if repair.get("sheet") == sheet
+    ]
+    changes = selected_repairs + changes
 
     return {
         "key": f"{hotel_name} — {label}",
-        "file_id": file_id, "file_name": file_name,
-        "wb_bytes": raw, "sheet": sheet, "changes": changes,
-        "note": f"  ·  InnCode {inn}",
+        "file_id": file_id,
+        "file_name": file_name,
+        "wb_bytes": raw,
+        "sheet": sheet,
+        "changes": changes,
+        "note": (
+            f"  ·  InnCode {inn}"
+            f"  ·  target month {target_month:%b %Y}"
+        ),
     }
 
 
