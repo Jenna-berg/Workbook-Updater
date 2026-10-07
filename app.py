@@ -2207,95 +2207,56 @@ def strip_tables(wb):
         ws.tables.clear()
 
 
-
 def _forecast_projection_carry_changes(wb, destination_sheet):
     """Carry manual Forecast assumptions from the prior weekly tab.
 
-    Revenue teams often pre-fill projected pickup / group pickup / manual ADR
-    before the next weekly update. When the updater advances to a new FCST-WK
-    tab, those assumptions should follow forward instead of appearing to vanish.
-
-    Rules:
-      - applies only to Forecast week tabs
-      - identifies the immediately previous FCST-WK tab
-      - carries rows whose labels describe estimated/projected pickup or
-        Forecast ADR
-      - also protects the established manual-entry fallback rows 7, 8, and 12
-      - only fills destination cells that are currently blank
-      - formulas and literal values are both preserved
-      - existing values in the destination tab always win
+    Keeps rows 7, 8, and 12 plus labeled projected/estimated pickup and manual
+    Forecast ADR rows. Existing values on the destination week always win.
     """
     if destination_sheet not in FORECAST_SHEETS:
         return []
-
     try:
         dest_index = FORECAST_SHEETS.index(destination_sheet)
     except ValueError:
         return []
-
     if dest_index <= 0:
         return []
 
-    previous_sheet = None
-    for prior_name in reversed(FORECAST_SHEETS[:dest_index]):
-        if prior_name in wb.sheetnames:
-            previous_sheet = prior_name
-            break
-
+    previous_sheet = next(
+        (name for name in reversed(FORECAST_SHEETS[:dest_index]) if name in wb.sheetnames),
+        None,
+    )
     if not previous_sheet:
         return []
 
     src_ws = wb[previous_sheet]
     dst_ws = wb[destination_sheet]
-
     rows_to_carry = {7, 8, 12}
 
     for r in range(1, min(max(src_ws.max_row, dst_ws.max_row), 40) + 1):
-        label = str(src_ws.cell(r, 1).value or dst_ws.cell(r, 1).value or "")
-        normalized = re.sub(r"\s+", " ", label.strip().lower())
-
+        label = str(src_ws.cell(r, 1).value or dst_ws.cell(r, 1).value or '')
+        normalized = re.sub(r'\s+', ' ', label.strip().lower())
         if (
-            ("pick" in normalized and (
-                "estimate" in normalized
-                or "estimated" in normalized
-                or "project" in normalized
-                or "forecast" in normalized
-                or "group" in normalized
-            ))
-            or ("forecast" in normalized and "adr" in normalized)
-            or ("project" in normalized and "adr" in normalized)
+            ('pick' in normalized and any(x in normalized for x in ('estimate','estimated','project','forecast','group')))
+            or ('forecast' in normalized and 'adr' in normalized)
+            or ('project' in normalized and 'adr' in normalized)
         ):
             rows_to_carry.add(r)
 
-    changes = []
-    max_col = min(max(src_ws.max_column, dst_ws.max_column), 32)
-
+    changes=[]
+    max_col=min(max(src_ws.max_column,dst_ws.max_column),32)
     for row in sorted(rows_to_carry):
-        if row < 1 or row > src_ws.max_row or row > dst_ws.max_row:
+        if row<1 or row>src_ws.max_row or row>dst_ws.max_row:
             continue
-
-        for col in range(2, max_col + 1):
-            src_value = src_ws.cell(row, col).value
-            dst_value = dst_ws.cell(row, col).value
-
-            if src_value is None:
+        for col in range(2,max_col+1):
+            src_value=src_ws.cell(row,col).value
+            dst_value=dst_ws.cell(row,col).value
+            if src_value is None or dst_value not in (None,''):
                 continue
-
-            # Keep anything already entered on the active week.
-            if dst_value not in (None, ""):
-                continue
-
             changes.append({
-                "label": (
-                    f"Carry Forecast assumption from "
-                    f"{previous_sheet} row {row}"
-                ),
-                "row": row,
-                "col": col,
-                "new_value": src_value,
-                "skip_reason": None,
+                'label':f'Carry Forecast assumption from {previous_sheet} row {row}',
+                'row':row,'col':col,'new_value':src_value,'skip_reason':None,
             })
-
     return changes
 
 
@@ -2317,34 +2278,23 @@ def apply_portfolio_plans(svc, jobs, undo_key):
             wb = openpyxl.load_workbook(io.BytesIO(job["wb_bytes"]),
                                         data_only=False, keep_vba=keep_vba)
             ws = wb[job["sheet"]]
-
             job_changes = list(job["changes"])
             is_forecast_job = (
                 "FORECAST" in str(job.get("file_name", "")).upper()
                 or "FORECAST" in str(job.get("key", "")).upper()
             )
-
             if is_forecast_job:
                 existing_targets = {
                     (c.get("row"), c.get("col"))
                     for c in job_changes
                     if not c.get("skip_reason")
                 }
-
-                carry_changes = _forecast_projection_carry_changes(
-                    wb,
-                    job["sheet"],
-                )
-
+                carry_changes = _forecast_projection_carry_changes(wb, job["sheet"])
                 job_changes.extend(
                     c for c in carry_changes
                     if (c.get("row"), c.get("col")) not in existing_targets
                 )
-
-            writes = [
-                c for c in job_changes
-                if not c.get("skip_reason")
-            ]
+            writes = [c for c in job_changes if not c.get("skip_reason")]
             prev_tab = ws.sheet_properties.tabColor
             snapshot[job["key"]] = {
                 "file_id":   job["file_id"],
@@ -7275,21 +7225,76 @@ def _rob_seed_historical_columns(
 
 
 def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
-    """Copy Hilton historical snapshot columns C:D:E -> B:C:D.
+    """Copy Hilton historical C:D:E -> B:C:D by month/metric label.
 
-    Preserves formulas and literal values exactly as stored in the source.
-    Only historical destination columns B:D are touched, so current-year
-    column E and unrelated template formulas remain unchanged.
+    Hilton historical and next-year templates are not guaranteed to keep the
+    same physical row order. Memphis is a confirmed example: Pickup WoW and
+    Permanent rows move between the historical source and the 2027 template.
+    Copying raw rows can therefore put pickup figures into Permanent rows.
+
+    This helper keeps each mapped destination week tied to one source week,
+    but copies the three historical year columns by semantic month/row label.
+    It also carries the year header and reporting-date headers. Current-year
+    destination column E is never touched.
     """
     copied = 0
-    max_row = min(source_ws.max_row, dest_ws.max_row)
+    col_map = ((3, 2), (4, 3), (5, 4))
 
-    for row in range(1, max_row + 1):
-        for source_col, dest_col in ((3, 2), (4, 3), (5, 4)):
-            value = source_ws.cell(row, source_col).value
+    # Year headers.
+    for source_col, dest_col in col_map:
+        value = source_ws.cell(3, source_col).value
+        if value is not None:
+            dest_ws.cell(3, dest_col).value = value
+            copied += 1
+
+    src_headers = _rob_month_header_rows(source_ws)
+    dst_headers = _rob_month_header_rows(dest_ws)
+    src_blocks = rob_month_blocks(source_ws)
+    dst_blocks = rob_month_blocks(dest_ws)
+
+    for month_idx in range(12):
+        src_header = src_headers.get(month_idx)
+        dst_header = dst_headers.get(month_idx)
+        if src_header and dst_header:
+            for source_col, dest_col in col_map:
+                value = source_ws.cell(src_header, source_col).value
+                if value is not None:
+                    dest_ws.cell(dst_header, dest_col).value = value
+                    copied += 1
+
+        src_labels = src_blocks.get(month_idx, {})
+        dst_labels = dst_blocks.get(month_idx, {})
+        for label, src_row in src_labels.items():
+            dst_row = dst_labels.get(label)
+            if not dst_row:
+                continue
+            for source_col, dest_col in col_map:
+                value = source_ws.cell(src_row, source_col).value
+                if value is None:
+                    continue
+                dest_ws.cell(dst_row, dest_col).value = value
+                copied += 1
+
+    # Preserve summary / total sections after the final month block only when
+    # the source and destination row labels match on the same row. This keeps
+    # established Hilton totals without reintroducing cross-layout row drift.
+    src_last = max(src_headers.values()) if src_headers else 0
+    dst_last = max(dst_headers.values()) if dst_headers else 0
+    src_start = src_last + 1
+    dst_start = dst_last + 1
+    tail_rows = min(source_ws.max_row - src_start + 1, dest_ws.max_row - dst_start + 1)
+    for offset in range(max(0, tail_rows)):
+        sr = src_start + offset
+        dr = dst_start + offset
+        src_label = str(source_ws.cell(sr, 1).value or '').strip().lower()
+        dst_label = str(dest_ws.cell(dr, 1).value or '').strip().lower()
+        if not src_label or src_label != dst_label:
+            continue
+        for source_col, dest_col in col_map:
+            value = source_ws.cell(sr, source_col).value
             if value is None:
                 continue
-            dest_ws.cell(row, dest_col).value = value
+            dest_ws.cell(dr, dest_col).value = value
             copied += 1
 
     return copied
@@ -7779,7 +7784,61 @@ def _rob_copy_budget_reference_columns(source_wb, dest_wb, cols=(9, 10)):
 
 
 
-def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None):
+def _hilton_backfill_target_month_history(source_ws, dest_ws, target_month):
+    """Fill only missing Hilton historical B:D cells for the target month.
+
+    Some older current-year Hilton builds left WK2+ historical Revenue,
+    Room Nights, Group, or Permanent values blank even though the mapped
+    historical source week contained them.
+
+    The backstop is deliberately narrow:
+      - target month only
+      - source C:D:E -> destination B:C:D
+      - map by metric label instead of physical row number
+      - fill blanks only
+      - never touch current-year destination column E
+    """
+    if source_ws is None or dest_ws is None:
+        return 0
+
+    month_idx = target_month.month - 1
+    src_blocks = rob_month_blocks(source_ws)
+    dst_blocks = rob_month_blocks(dest_ws)
+
+    src_labels = src_blocks.get(month_idx, {})
+    dst_labels = dst_blocks.get(month_idx, {})
+    if not src_labels or not dst_labels:
+        return 0
+
+    copied = 0
+    labels = tuple(dict.fromkeys(
+        _ROB_BASE_METRIC_LABELS
+        + _ROB_SECONDARY_METRIC_LABELS
+    ))
+
+    for label in labels:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+
+        for source_col, dest_col in ((3, 2), (4, 3), (5, 4)):
+            current = dest_ws.cell(dr, dest_col).value
+            if current not in (None, ""):
+                continue
+
+            value = source_ws.cell(sr, source_col).value
+            if value in (None, ""):
+                continue
+
+            dest_ws.cell(dr, dest_col).value = value
+            copied += 1
+
+    return copied
+
+
+
+def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
     `original_bytes` is the file's content exactly as it was before this
@@ -8148,6 +8207,19 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             tracked_year=target_month.year,
             carry_forward_ws=carry_forward_ws,
         )
+
+        if hilton_mode:
+            _hilton_filled = _hilton_backfill_target_month_history(
+                ly_ws,
+                new_ws,
+                target_month,
+            )
+            if _hilton_filled:
+                warnings.append(
+                    f"{sheet_name}: Hilton target-month historical backfill "
+                    f"filled {_hilton_filled} missing B:D cells."
+                )
+
         filled_stly_sheets.add(sheet_name)
 
     # Normalize all ROB date headers to MM/DD/YYYY display.
@@ -9798,6 +9870,45 @@ def _get_hilton_prev_rob_cadence_wb(
     )
 
 
+def _rob_build_memphis_next_year_benchmark_map(hist_wb, hist_name, new_wb):
+    """Map Memphis next-year weeks from the corrected WK1 benchmark.
+
+    The supplied corrected 2027 OCT2026 Memphis WK1 uses historical source
+    WK2 (not WK1). Once that first source week is established, later
+    destination weeks follow the remaining valid historical snapshots in
+    chronological order. Invalid/zero-dated source tabs are ignored.
+    """
+    snapshots = _rob_collect_stly_snapshots([(hist_name, hist_wb)])
+    if not snapshots:
+        return {}, ['Memphis benchmark: no dated historical snapshots found.']
+
+    # Benchmark: destination WK1 begins with the second valid historical
+    # snapshot. This matches the user-corrected Memphis WK1 and the previously
+    # confirmed Andover October cadence (historical WK1 already consumed).
+    if len(snapshots) < 2:
+        return {}, ['Memphis benchmark: fewer than two valid historical snapshots found.']
+
+    usable = snapshots[1:]
+    dest_sheets = [s for s in ROB_SHEETS if s in new_wb.sheetnames]
+    mapping = {}
+    diagnostics = []
+
+    for dest_sheet, snap in zip(dest_sheets, usable):
+        mapping[dest_sheet] = snap
+        diagnostics.append(
+            f"{dest_sheet} <- {hist_name} / {snap['sheet_name']} "
+            f"({snap['date']:%m/%d/%Y}); Memphis WK1 benchmark sequence"
+        )
+
+    if len(mapping) < min(4, len(dest_sheets)):
+        diagnostics.append(
+            f"WARNING: Memphis benchmark mapped only {len(mapping)} destination weeks."
+        )
+
+    return mapping, diagnostics
+
+
+
 def setup_hilton_next_year_rob_month(
     service,
     hotel_id,
@@ -10001,19 +10112,28 @@ def setup_hilton_next_year_rob_month(
     #
     # WK1 from the historical source (10/01/2025) is skipped because that
     # snapshot was already consumed by the prior reporting cadence.
-    historical_week_map, historical_map_diag = (
-        _rob_build_date_first_stly_map(
-            new_wb,
-            cadence_prev_wb,
-            report_month,
-            [
-                (
-                    hist_name,
-                    hist_wb,
-                )
-            ],
+    if str(hotel_name or "").strip().lower() == "memphis":
+        historical_week_map, historical_map_diag = (
+            _rob_build_memphis_next_year_benchmark_map(
+                hist_wb,
+                hist_name,
+                new_wb,
+            )
         )
-    )
+    else:
+        historical_week_map, historical_map_diag = (
+            _rob_build_date_first_stly_map(
+                new_wb,
+                cadence_prev_wb,
+                report_month,
+                [
+                    (
+                        hist_name,
+                        hist_wb,
+                    )
+                ],
+            )
+        )
 
     copied = 0
 
@@ -16988,485 +17108,6 @@ if st.session_state.get("view") == "admin_settings" and st.session_state.get("is
     render_admin_settings(_admin_svc, _users_file_id, _users_err)
     st.stop()
 
-# ── Best Western monthly setup only ──────────────────────────────────────────
-# These are the Revenue Reports folders supplied for the two Best Western
-# properties. They intentionally do NOT participate in the normal SNT/Hilton/
-# IHG weekly-update portfolio discovery.
-BEST_WESTERN_MONTHLY_HOTELS = {
-    "RUTLAND": "1jdD4DP01HPHAPO0jsZv-5IptyDSqgv6E",
-    "SPRINGFIELD": "1xmtBLZFB5d2HL-BrLvBzLn2KtlHrUqhU",
-}
-
-
-def _best_western_setup_strategy_month(
-    service,
-    hotel_name,
-    hotel_id,
-    target_month,
-):
-    """Run the established SNT Strategy new-month setup for Best Western.
-
-    Returns:
-      (file_name, error_or_warning, file_id, original_bytes, total_written)
-    """
-    is_fresh_copy = False
-
-    existing, _find_err = _resolve_drive_workbook_session_cached(
-        service,
-        hotel_id,
-        hotel_name,
-        "Strategy Report",
-        target_month,
-    )
-
-    if (
-        existing
-        and _strategy_filename_matches_month(
-            existing[1],
-            target_month,
-        )
-    ):
-        target_result = existing
-    else:
-        is_fresh_copy = True
-        created_name, create_err = setup_new_sr_month(
-            service,
-            hotel_id,
-            hotel_name,
-            target_month,
-        )
-        if create_err:
-            return None, create_err, None, None, 0
-
-        target_result, resolve_err = _resolve_drive_workbook_session_cached(
-            service,
-            hotel_id,
-            hotel_name,
-            "Strategy Report",
-            target_month,
-        )
-        if resolve_err or not target_result:
-            return (
-                created_name,
-                resolve_err or "Could not resolve the new Strategy workbook.",
-                None,
-                None,
-                0,
-            )
-
-    file_id, file_name = target_result
-
-    if not _strategy_filename_matches_month(
-        file_name,
-        target_month,
-    ):
-        return (
-            file_name,
-            f"Strategy month mismatch: {file_name} is not "
-            f"{target_month:%B %Y}.",
-            None,
-            None,
-            0,
-        )
-
-    prev_month = (
-        target_month - datetime.timedelta(days=1)
-    ).replace(day=1)
-    ly_month = target_month.replace(
-        year=target_month.year - 1
-    )
-
-    prev_wb = _load_wb_from_drive(
-        service,
-        hotel_id,
-        hotel_name,
-        "Strategy Report",
-        prev_month,
-        data_only=False,
-    )
-    ly_wb = _load_wb_from_drive(
-        service,
-        hotel_id,
-        hotel_name,
-        "Strategy Report",
-        ly_month,
-    )
-
-    wb_bytes = drive_download(
-        service,
-        file_id,
-    )
-    original_bytes = wb_bytes
-
-    wb = openpyxl.load_workbook(
-        io.BytesIO(wb_bytes),
-        data_only=False,
-    )
-
-    if is_fresh_copy:
-        clear_tab_colors(
-            wb,
-            STRATEGY_SHEETS,
-        )
-
-    restructure_sr_dates(
-        wb,
-        target_month,
-    )
-
-    first_ws = (
-        wb[STRATEGY_SHEETS[0]]
-        if STRATEGY_SHEETS[0] in wb.sheetnames
-        else None
-    )
-    num_rows = (
-        _count_sheet_data_rows(first_ws)
-        if first_ws is not None
-        else 365
-    )
-    scope_start = target_month
-    scope_end = (
-        target_month
-        + datetime.timedelta(
-            days=max(0, num_rows - 1)
-        )
-    )
-
-    total_written = 0
-
-    for sheet_name in STRATEGY_SHEETS:
-        if sheet_name not in wb.sheetnames:
-            continue
-
-        changes = build_strategy_change_plan(
-            None,
-            wb,
-            sheet_name,
-            prev_month_wb=prev_wb,
-            ly_wb=ly_wb,
-            scope_start=scope_start,
-            scope_end=scope_end,
-        )
-        apply_strategy_changes(
-            wb,
-            sheet_name,
-            changes,
-        )
-        total_written += len([
-            c for c in changes
-            if not c.get("skip_reason")
-        ])
-
-    strip_tables(wb)
-
-    out = io.BytesIO()
-    wb.save(out)
-
-    drive_upload(
-        service,
-        file_id,
-        out.getvalue(),
-        file_name,
-    )
-
-    warnings = []
-    if prev_wb is None:
-        warnings.append(
-            f"Previous month ({prev_month:%b %Y}) was not found; "
-            f"Last Week OTB fields may stay blank."
-        )
-    if ly_wb is None:
-        warnings.append(
-            f"Last year ({ly_month:%b %Y}) was not found; "
-            f"LY Strategy fields may stay blank."
-        )
-
-    return (
-        file_name,
-        " ".join(warnings) if warnings else None,
-        file_id,
-        original_bytes,
-        total_written,
-    )
-
-
-def render_best_western_monthly_setup():
-    """Monthly ROB/Strategy creation for Rutland and Springfield only."""
-    st.header("Best Western Monthly Setup")
-    st.caption(
-        "Creates the monthly ROB and Strategy workbooks only. "
-        "These hotels are intentionally excluded from the weekly updater."
-    )
-
-    hotel_names = list(
-        BEST_WESTERN_MONTHLY_HOTELS.keys()
-    )
-
-    selected = st.multiselect(
-        "Hotels",
-        hotel_names,
-        default=hotel_names,
-        key="bw_monthly_hotels",
-    )
-
-    today = datetime.date.today()
-    cur_month = today.replace(day=1)
-    prev_month = (
-        cur_month - datetime.timedelta(days=1)
-    ).replace(day=1)
-    next_month = (
-        cur_month + datetime.timedelta(days=32)
-    ).replace(day=1)
-
-    month_options = [
-        prev_month,
-        cur_month,
-        next_month,
-    ]
-
-    default_month = (
-        next_month
-        if today.day >= 22
-        else cur_month
-    )
-
-    target_month = st.selectbox(
-        "Month to set up",
-        month_options,
-        index=month_options.index(default_month),
-        format_func=lambda d: d.strftime("%B %Y"),
-        key="bw_monthly_setup_month",
-    )
-
-    st.info(
-        "The month folder must already exist in each hotel's Revenue Reports "
-        "folder, matching the same process used by the other monthly builders."
-    )
-
-    rob_col, sr_col = st.columns(2)
-
-    with rob_col:
-        st.markdown("**ROB**")
-        if st.button(
-            "Set Up Best Western ROB",
-            type="primary",
-            use_container_width=True,
-            key="bw_setup_rob",
-        ):
-            if not selected:
-                st.warning("Select at least one Best Western hotel.")
-            else:
-                svc = get_drive_service()
-                undo_items = []
-
-                for hotel_name in selected:
-                    hotel_id = BEST_WESTERN_MONTHLY_HOTELS[hotel_name]
-                    try:
-                        progress = st.progress(
-                            0,
-                            text=f"{hotel_name}: starting ROB setup...",
-                        )
-
-                        def _bw_progress_cb(
-                            value,
-                            message,
-                            _bar=progress,
-                            _hotel=hotel_name,
-                        ):
-                            _bar.progress(
-                                int(round(value * 100)),
-                                text=f"{_hotel}: {message}",
-                            )
-
-                        (
-                            file_name,
-                            err,
-                            file_id,
-                            original_bytes,
-                        ) = setup_new_rob_month(
-                            svc,
-                            hotel_id,
-                            hotel_name,
-                            target_month,
-                            progress_callback=_bw_progress_cb,
-                        )
-
-                        progress.progress(
-                            100,
-                            text=f"{hotel_name}: complete",
-                        )
-
-                        if err and not file_name:
-                            st.error(
-                                f"{hotel_name}: {err}"
-                            )
-                            continue
-
-                        if err:
-                            st.warning(
-                                f"{hotel_name}: {err}"
-                            )
-
-                        if (
-                            file_id
-                            and original_bytes is not None
-                        ):
-                            undo_items.append({
-                                "file_id": file_id,
-                                "file_name": file_name,
-                                "bytes": original_bytes,
-                            })
-
-                        st.success(
-                            f"{hotel_name}: **{file_name}** ready for "
-                            f"{target_month:%B %Y}."
-                        )
-                    except Exception as e:
-                        st.error(
-                            f"{hotel_name}: ROB setup error — {e}"
-                        )
-
-                if undo_items:
-                    st.session_state["bw_rob_setup_undo"] = undo_items
-
-        if "bw_rob_setup_undo" in st.session_state:
-            if st.button(
-                "↩ Reset Best Western ROB setup",
-                key="bw_reset_rob",
-                use_container_width=True,
-            ):
-                svc = get_drive_service()
-                errors = []
-
-                for item in st.session_state["bw_rob_setup_undo"]:
-                    try:
-                        drive_upload(
-                            svc,
-                            item["file_id"],
-                            item["bytes"],
-                            item["file_name"],
-                        )
-                    except Exception as e:
-                        errors.append(
-                            f"{item['file_name']}: {e}"
-                        )
-
-                if errors:
-                    for err in errors:
-                        st.error(err)
-                else:
-                    st.session_state.pop(
-                        "bw_rob_setup_undo",
-                        None,
-                    )
-                    st.success(
-                        "Best Western ROB setup restored."
-                    )
-
-    with sr_col:
-        st.markdown("**Strategy Report**")
-        if st.button(
-            "Set Up Best Western Strategy",
-            type="primary",
-            use_container_width=True,
-            key="bw_setup_strategy",
-        ):
-            if not selected:
-                st.warning("Select at least one Best Western hotel.")
-            else:
-                svc = get_drive_service()
-                undo_items = []
-
-                for hotel_name in selected:
-                    hotel_id = BEST_WESTERN_MONTHLY_HOTELS[hotel_name]
-                    try:
-                        with st.spinner(
-                            f"{hotel_name}: preparing Strategy..."
-                        ):
-                            (
-                                file_name,
-                                warning,
-                                file_id,
-                                original_bytes,
-                                total_written,
-                            ) = _best_western_setup_strategy_month(
-                                svc,
-                                hotel_name,
-                                hotel_id,
-                                target_month,
-                            )
-
-                        if not file_name:
-                            st.error(
-                                f"{hotel_name}: "
-                                f"{warning or 'Strategy setup failed.'}"
-                            )
-                            continue
-
-                        if warning:
-                            st.warning(
-                                f"{hotel_name}: {warning}"
-                            )
-
-                        if (
-                            file_id
-                            and original_bytes is not None
-                        ):
-                            undo_items.append({
-                                "file_id": file_id,
-                                "file_name": file_name,
-                                "bytes": original_bytes,
-                            })
-
-                        st.success(
-                            f"{hotel_name}: **{file_name}** ready for "
-                            f"{target_month:%B %Y}. "
-                            f"Prepared {total_written} Strategy cells."
-                        )
-                    except Exception as e:
-                        st.error(
-                            f"{hotel_name}: Strategy setup error — {e}"
-                        )
-
-                if undo_items:
-                    st.session_state["bw_strategy_setup_undo"] = undo_items
-
-        if "bw_strategy_setup_undo" in st.session_state:
-            if st.button(
-                "↩ Reset Best Western Strategy setup",
-                key="bw_reset_strategy",
-                use_container_width=True,
-            ):
-                svc = get_drive_service()
-                errors = []
-
-                for item in st.session_state["bw_strategy_setup_undo"]:
-                    try:
-                        drive_upload(
-                            svc,
-                            item["file_id"],
-                            item["bytes"],
-                            item["file_name"],
-                        )
-                    except Exception as e:
-                        errors.append(
-                            f"{item['file_name']}: {e}"
-                        )
-
-                if errors:
-                    for err in errors:
-                        st.error(err)
-                else:
-                    st.session_state.pop(
-                        "bw_strategy_setup_undo",
-                        None,
-                    )
-                    st.success(
-                        "Best Western Strategy setup restored."
-                    )
-
-
-
 def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
     """Shared ROB new-month setup for Hilton and IHG.
 
@@ -17547,6 +17188,7 @@ def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
                         hotel_name,
                         target_month,
                         progress_callback=_progress_cb,
+                        hilton_mode=(key_prefix == "hil"),
                     )
                     progress.progress(
                         100,
@@ -17961,6 +17603,7 @@ def render_hilton_update(hotels):
                             fid,
                             name,
                             report_month,
+                            hilton_mode=True,
                         )
 
                         if created_name:
@@ -19831,33 +19474,44 @@ with _title:
 _offstage = st.empty()
 _offstage_box = _offstage.container()
 
+BEST_WESTERN_MONTHLY_HOTELS = {
+    "RUTLAND": "1jdD4DP01HPHAPO0jsZv-5IptyDSqgv6E",
+    "SPRINGFIELD": "1xmtBLZFB5d2HL-BrLvBzLn2KtlHrUqhU",
+}
+
+
+def render_best_western_monthly_setup():
+    st.header("Best Western Monthly Setup")
+    st.caption(
+        "Monthly ROB and Strategy setup only. These properties are not added "
+        "to the weekly workbook updater."
+    )
+    hotel_name = st.selectbox(
+        "Best Western hotel",
+        list(BEST_WESTERN_MONTHLY_HOTELS),
+        key="bw_monthly_hotel",
+    )
+    hotel_id = BEST_WESTERN_MONTHLY_HOTELS[hotel_name]
+    st.markdown("### ROB")
+    render_portfolio_rob_month_setup([(hotel_name, hotel_id)], "bw")
+    st.divider()
+    st.markdown("### Strategy Report")
+    render_ihg_strategy_month_setup(hotel_name, hotel_id)
+
+
 if _section == SECTION_REVENUE:
     tab_weekly, tab_best_western, tab_ancillary, tab_ooo = st.tabs(
-        [
-            "Weekly Workbook Update",
-            "Best Western Monthly Setup",
-            "Ancillary Revenue",
-            "Monthly OOO Report",
-        ]
-    )
+        ["Weekly Workbook Update", "Best Western Monthly Setup", "Ancillary Revenue", "Monthly OOO Report"])
     with _offstage_box:
         tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
 else:
     tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
     with _offstage_box:
         tab_weekly, tab_best_western, tab_ancillary, tab_ooo = st.tabs(
-            [
-                "Weekly Workbook Update",
-                "Best Western Monthly Setup",
-                "Ancillary Revenue",
-                "Monthly OOO Report",
-            ]
-        )
-
+            ["Weekly Workbook Update", "Best Western Monthly Setup", "Ancillary Revenue", "Monthly OOO Report"])
 
 with tab_best_western:
     render_best_western_monthly_setup()
-
 
 with tab_weekly:
     st.divider()
