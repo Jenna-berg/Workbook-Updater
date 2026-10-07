@@ -871,10 +871,8 @@ def build_ihg_rob_plan(parsed, ws, as_of=None, bob=None, tracked_year=None):
             if tracked_year == as_of.year and month <= as_of.month:
                 continue          # current month comes from H&F; past is closed
 
-            # Next-year ROB follows a rolling 12-month window. For an OCT2026
-            # report, only JAN-SEP2027 are in range; OCT-DEC2027 stay blank.
-            if tracked_year > as_of.year and month >= as_of.month:
-                continue
+            # Next-year ROB has no rolling 12-month cutoff. If the source
+            # contains this tracked-year month, it remains eligible to copy.
             labels = blocks.get(month - 1)
             if not labels:
                 continue
@@ -4761,7 +4759,7 @@ def portfolio_workbook_options(portfolio):
 # inconsistent for the same hotel and two properties are filed under a
 # different name entirely (Long Beach as ALLEGRIA, Westerly as Pleasant View
 # Inn). Keep keywords distinctive enough not to collide.
-PORTFOLIOS = ["Stay In Touch", "Hilton", "IHG"]
+PORTFOLIOS = ["Stay In Touch", "Hilton", "IHG", "Best Western"]
 
 PORTFOLIO_HOTELS = {
     "Stay In Touch": {
@@ -7838,6 +7836,23 @@ def _hilton_backfill_target_month_history(source_ws, dest_ws, target_month):
 
 
 
+def _monthly_output_hotel_suffix(hotel_name, candidate_suffix=None):
+    """Return the hotel suffix to use in newly-created monthly filenames.
+
+    Most properties can inherit the suffix from their master/template name.
+    Surfside is an exception: some of its masters contain the combined text
+    'PROVINCETOWN SURFSIDE', which should never leak into live filenames.
+    """
+    hotel_clean = str(hotel_name or "").strip()
+    candidate_clean = str(candidate_suffix or "").strip()
+
+    if hotel_clean.upper() == "SURFSIDE":
+        return "SURFSIDE"
+
+    return candidate_clean or hotel_clean.upper()
+
+
+
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
@@ -7905,7 +7920,14 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             after = master_name[name_upper.find("ROB") + 3:].strip()
             after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
             if after:
-                hotel_suffix = after
+                hotel_suffix = _monthly_output_hotel_suffix(
+                    hotel_name,
+                    after,
+                )
+        hotel_suffix = _monthly_output_hotel_suffix(
+            hotel_name,
+            hotel_suffix,
+        )
         ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
         new_file_name = f"{month_kw} ROB {hotel_suffix}{ext}"
         try:
@@ -8947,7 +8969,15 @@ def setup_next_year_rob_month(
                 flags=re.I,
             ).strip()
             if after:
-                hotel_suffix = after
+                hotel_suffix = _monthly_output_hotel_suffix(
+                    hotel_name,
+                    after,
+                )
+
+        hotel_suffix = _monthly_output_hotel_suffix(
+            hotel_name,
+            hotel_suffix,
+        )
 
         ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
         new_file_name = (
@@ -9160,13 +9190,8 @@ def setup_next_year_rob_month(
 
     _emit_rob_setup_progress(progress_callback, 0.82, "Rebuilding year columns and formulas...")
 
-    # Rolling one-year rule: for an October 2026 build, 2027 is only tracked
-    # through September. October-December 2027 stay blank.
-    _rob_clear_next_year_outside_horizon(
-        new_wb,
-        report_month,
-        tracked_year,
-    )
+    # No rolling one-year cutoff. Farther-out months keep whatever the
+    # mapped source actually contains; blank source cells remain blank.
 
     # Normalize ROB date displays.
     # Next-year ROB setup does not build a date-first stly_week_map; it uses
@@ -10303,13 +10328,7 @@ def setup_hilton_next_year_rob_month(
     _emit_rob_setup_progress(
         progress_callback,
         0.80,
-        "Applying one-year tracking window...",
-    )
-
-    _rob_clear_next_year_outside_horizon(
-        new_wb,
-        report_month,
-        tracked_year,
+        "Preserving all available future-month data...",
     )
 
     warnings = apply_rob_pickup_wow_formulas(
@@ -11160,7 +11179,15 @@ def setup_new_forecast_month(
                 after,
             ).strip()
             if after:
-                hotel_suffix = after
+                hotel_suffix = _monthly_output_hotel_suffix(
+                    hotel_name,
+                    after,
+                )
+
+        hotel_suffix = _monthly_output_hotel_suffix(
+            hotel_name,
+            hotel_suffix,
+        )
 
         target_file_name = (
             f"{month_kw} FORECAST {hotel_suffix}{ext}"
@@ -18982,9 +19009,22 @@ def _ensure_monthly_workbook(
             hotel_name,
             target_month,
         )
-        if not created_name:
+        if not created_name or not _file_id:
             return None, create_err or err, False
-        created_now = True
+
+        # setup_new_rob_month already created/opened/validated the exact target
+        # file. Legacy Revenue Reports trees can make a second resolver pass
+        # miss that file even though creation succeeded, so use the returned
+        # Drive file id directly.
+        _cache_drive_workbook_resolution(
+            hotel_id,
+            hotel_name,
+            "ROB",
+            target_month,
+            _file_id,
+            created_name,
+        )
+        return (_file_id, created_name), None, True
 
     elif workbook_type == "Strategy Report":
         created_name, create_err = setup_new_sr_month(
@@ -19481,10 +19521,10 @@ BEST_WESTERN_MONTHLY_HOTELS = {
 
 
 def render_best_western_monthly_setup():
-    st.header("Best Western Monthly Setup")
+    st.subheader("Best Western Monthly Setup")
     st.caption(
-        "Monthly ROB and Strategy setup only. These properties are not added "
-        "to the weekly workbook updater."
+        "Monthly ROB and Strategy setup only for Rutland and Springfield. "
+        "No weekly report uploads are required for these properties."
     )
     hotel_name = st.selectbox(
         "Best Western hotel",
@@ -19500,18 +19540,15 @@ def render_best_western_monthly_setup():
 
 
 if _section == SECTION_REVENUE:
-    tab_weekly, tab_best_western, tab_ancillary, tab_ooo = st.tabs(
-        ["Weekly Workbook Update", "Best Western Monthly Setup", "Ancillary Revenue", "Monthly OOO Report"])
+    tab_weekly, tab_ancillary, tab_ooo = st.tabs(
+        ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
     with _offstage_box:
         tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
 else:
     tab_pl, tab_projection = st.tabs(["P&L Spreadsheet", "1-Year Projection"])
     with _offstage_box:
-        tab_weekly, tab_best_western, tab_ancillary, tab_ooo = st.tabs(
-            ["Weekly Workbook Update", "Best Western Monthly Setup", "Ancillary Revenue", "Monthly OOO Report"])
-
-with tab_best_western:
-    render_best_western_monthly_setup()
+        tab_weekly, tab_ancillary, tab_ooo = st.tabs(
+            ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
 
 with tab_weekly:
     st.divider()
@@ -19529,6 +19566,10 @@ with tab_weekly:
     # Each portfolio's data arrives in a different export, so they get their own
     # tab rather than sharing one hotel list.
     portfolio = st.radio("Portfolio", PORTFOLIOS, horizontal=True, key="drive_portfolio")
+
+    if portfolio == "Best Western":
+        render_best_western_monthly_setup()
+        st.stop()
 
     hotels = hotels_in_portfolio(portfolio, all_discovered)
     hotel_names = [h[0] for h in hotels]
@@ -19959,10 +20000,32 @@ with tab_weekly:
                     )
                     sheet = auto or avail[0]
 
-                date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
-                own_debug = build_date_row_map(
-                    wb, prefer_sheet=sheet, fallback_to_wkone=False
+                strategy_scope_start = current_month
+                strategy_scope_end = (
+                    current_month
+                    + datetime.timedelta(days=364)
                 )
+
+                date_row_map_debug_all = build_date_row_map(
+                    wb,
+                    prefer_sheet=sheet,
+                )
+                date_row_map_debug = {
+                    d: r
+                    for d, r in date_row_map_debug_all.items()
+                    if strategy_scope_start <= d <= strategy_scope_end
+                }
+
+                own_debug_all = build_date_row_map(
+                    wb,
+                    prefer_sheet=sheet,
+                    fallback_to_wkone=False,
+                )
+                own_debug = {
+                    d: r
+                    for d, r in own_debug_all.items()
+                    if strategy_scope_start <= d <= strategy_scope_end
+                }
 
                 if date_row_map_debug:
                     date_summary = (
@@ -20000,6 +20063,8 @@ with tab_weekly:
                     sheet,
                     prev_month_wb=prev_month_sr_wb,
                     ly_wb=ly_sr_wb,
+                    scope_start=strategy_scope_start,
+                    scope_end=strategy_scope_end,
                 )
                 warnings = []
                 if rate_df is not None:
