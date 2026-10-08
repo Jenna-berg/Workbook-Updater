@@ -15930,6 +15930,162 @@ def _plymouth_rebuild_agent_table(
 
 
 
+def _plymouth_find_month_template_sheet(wb, report_month):
+    """Find the best sheet to copy when a new Plymouth month starts."""
+    explicit_names = []
+    for name in wb.sheetnames:
+        norm = re.sub(r"[^A-Z0-9]+", " ", str(name).upper()).strip()
+        if "TEMPLATE" in norm and (
+            "WEEK" in norm
+            or "PLYMOUTH" in norm
+            or "1620" in norm
+            or norm == "TEMPLATE"
+        ):
+            explicit_names.append(name)
+
+    def _looks_like_weekly(ws):
+        return (
+            _plymouth_find_row(ws, "STLY") is not None
+            and _plymouth_find_row(ws, "VARIANCE") is not None
+            and _plymouth_find_row(ws, "TOTALS", start=4) is not None
+        )
+
+    for name in explicit_names:
+        if _looks_like_weekly(wb[name]):
+            return name
+
+    month_abbrs = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ]
+    target_idx = report_month.month - 1
+
+    # If there is no explicit template, use the most recent prior monthly tab.
+    for offset in range(1, 13):
+        name = month_abbrs[(target_idx - offset) % 12]
+        if name in wb.sheetnames and _looks_like_weekly(wb[name]):
+            return name
+
+    return None
+
+
+def _plymouth_reset_new_month_sheet(ws, report_month):
+    """Reset a copied weekly tab so it is ready for Week 1 of a new month."""
+    year_rows = []
+    for r in range(1, min(ws.max_row, 220) + 1):
+        raw = ws.cell(r, 1).value
+        try:
+            year_val = int(float(raw))
+        except Exception:
+            continue
+        if 2000 <= year_val <= 2100:
+            year_rows.append((r, year_val))
+
+    variance_row = _plymouth_find_row(ws, "VARIANCE")
+    if variance_row:
+        post_variance = [(r, y) for r, y in year_rows if r > variance_row]
+        if post_variance:
+            ws.cell(post_variance[0][0], 1).value = report_month.year
+        if len(post_variance) > 1:
+            ws.cell(post_variance[1][0], 1).value = report_month.year - 1
+
+    layout = _plymouth_section_layout(ws, report_month.year)
+
+    # Clear all current/STLY/itemized weekly values in B:K.
+    for first_key, end_key in (
+        ("current_first", "current_total"),
+        ("stly_first", "stly_total"),
+        ("current_item_first", "current_item_end"),
+        ("stly_item_first", "stly_item_end"),
+    ):
+        first_row = layout[first_key]
+        end_row = layout[end_key]
+        for r in range(first_row, end_row):
+            for c in range(2, 12):
+                ws.cell(r, c).value = None
+
+    # Clear weekly header values/dates in B:K.
+    for header_key in ("current_header", "stly_header", "variance_header"):
+        r = layout.get(header_key)
+        if not r:
+            continue
+        for c in range(2, 12):
+            if not (
+                isinstance(ws.cell(r, c).value, str)
+                and ws.cell(r, c).value.startswith("=")
+            ):
+                ws.cell(r, c).value = None
+
+    # Clear variance weekly cells; the normal updater rebuilds formulas.
+    for r in range(layout["variance_first"], layout["variance_total"]):
+        for c in range(2, 12):
+            ws.cell(r, c).value = None
+
+    # Rebuild clean TOTALS formulas for all five weekly pairs.
+    for first_key, total_key in (
+        ("current_first", "current_total"),
+        ("stly_first", "stly_total"),
+    ):
+        first_row = layout[first_key]
+        total_row = layout[total_key]
+        for slot in range(1, 6):
+            count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
+            for col in (count_col, revenue_col):
+                letter = get_column_letter(col)
+                ws.cell(total_row, col).value = (
+                    f"=SUM({letter}{first_row}:{letter}{total_row - 1})"
+                )
+
+    total_row = layout["variance_total"]
+    for slot in range(1, 6):
+        count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[slot]
+        for col in (count_col, revenue_col):
+            letter = get_column_letter(col)
+            ws.cell(total_row, col).value = (
+                f"=SUM({letter}{layout['variance_first']}:"
+                f"{letter}{total_row - 1})"
+            )
+
+    return layout
+
+
+def _plymouth_ensure_month_sheet(wb, report_month, week_slot):
+    """Create a missing Plymouth month tab automatically on Week 1."""
+    sheet_name = report_month.strftime("%b").upper()
+
+    if sheet_name in wb.sheetnames:
+        return wb[sheet_name], False, None
+
+    if int(week_slot) != 1:
+        raise ValueError(
+            f"Plymouth weekly tab **{sheet_name}** does not exist yet. "
+            f"Run Week 1 first so the app can create the new month tab "
+            f"automatically."
+        )
+
+    template_name = _plymouth_find_month_template_sheet(
+        wb,
+        report_month,
+    )
+    if not template_name:
+        raise ValueError(
+            f"Plymouth weekly tab **{sheet_name}** does not exist and no "
+            f"usable weekly template or prior-month tab was found to copy."
+        )
+
+    source_ws = wb[template_name]
+    new_ws = wb.copy_worksheet(source_ws)
+    new_ws.title = sheet_name
+
+    _plymouth_reset_new_month_sheet(
+        new_ws,
+        report_month,
+    )
+
+    return new_ws, True, template_name
+
+
+
 def plymouth_build_weekly_update(
     workbook_bytes,
     report_month,
@@ -15953,14 +16109,12 @@ def plymouth_build_weekly_update(
 
     wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes), data_only=False)
     sheet_name = report_month.strftime("%b").upper()
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(
-            f"Plymouth weekly tab **{sheet_name}** was not found in the "
-            "existing tracking workbook. Create the new month tab from the "
-            "weekly template first, then run the weekly updater."
-        )
 
-    ws = wb[sheet_name]
+    ws, month_created, month_template_source = _plymouth_ensure_month_sheet(
+        wb,
+        report_month,
+        week_slot,
+    )
     layout = _plymouth_section_layout(ws, report_month.year)
     count_col, revenue_col = PLYMOUTH_WEEKLY_COLS[int(week_slot)]
 
@@ -16126,6 +16280,8 @@ def plymouth_build_weekly_update(
 
     summary = {
         "sheet": sheet_name,
+        "monthCreated": bool(month_created),
+        "monthTemplateSource": month_template_source,
         "weekSlot": int(week_slot),
         "weekLabel": current_label,
         "currentWritten": current_written,
