@@ -424,9 +424,10 @@ def parse_group_wash(file_like, hotel_name=None):
     seg is 'GRP' or 'PRM'; Northbrook also treats Market Segment MEPS as PRM; each holds
     pu_rooms / pu_rev / av_rooms / av_rev.
 
-    'Pick Up' is what has actually been reserved out of the block and belongs
-    in the ROB's column E. 'Available Block' is the unpicked remainder and
-    belongs in column G ('not p/u'). Market Segment is the discriminator, not
+    'Pick Up' is parsed for diagnostics/backward compatibility, but Hilton ROB
+    Group/Permanent totals come from SRP Activity. 'Available Block' is the
+    unpicked remainder and is the only Group Wash measure written to the ROB,
+    in column G ('not p/u'). Market Segment is the discriminator, not
     Forecast Group — one real property has a block named 'Group_PERM_SMRF'
     whose segment is SMRF, i.e. ordinary group business despite the name.
     """
@@ -1325,17 +1326,14 @@ def build_hilton_rob_plan(
 
     Each figure comes from the report that measures it best:
 
-      total (col E)    SRP's own TOT — every room on the books
-      group/perm (E)   the Wash report's Pick Up
-      not p/u (col G)  the Wash report's Available Block
+      total (col E)    SRP's own TOT — every picked-up room on the books
+      group/perm (E)   SRP's GRP / PRM segments — picked-up business only
+      not p/u (col G)  Group Wash Available Block only
 
-    The total used to be assembled as SRP transient + Wash pick-up, which
-    double-counted: pick-up *reclassifies* rooms that SRP has already counted
-    inside TOT — SRP files a block room under whatever code the individual
-    booked with — so adding the two put every month out by a few thousand.
-    Group still has to come from the Wash report, because SRP's 'convention'
-    flag genuinely undercounts it (Kansas City September: 270 rooms by SRP
-    against 789 by the wash report).
+    Group Wash is intentionally NOT used for Group/Permanent totals. Its
+    Available Block represents contracted rooms that have not picked up yet
+    (for example airline blocks), so those rooms belong only in the separate
+    not-picked-up columns and must not inflate Group totals or hotel totals.
 
     Rows are located by label. A cell holding a hand-written reconciliation
     like '=294767+55017' is left alone, but a cross-sheet mirror like
@@ -1462,12 +1460,31 @@ def build_hilton_rob_plan(
             tot_rooms = current_month_total["rooms"]
             tot_rev = current_month_total["revenue"]
 
-        g = wash.get("GRP") or {}
-        p = wash.get("PRM") or {}
+        wash_g = wash.get("GRP") or {}
+        wash_p = wash.get("PRM") or {}
+
+        srp_group_rooms, srp_group_rev = _srp_seg(srp, "GRP")
+        srp_perm_rooms, srp_perm_rev = _srp_seg(srp, "PRM")
+
+        # Picked-up Group/Permanent totals come from SRP. Group Wash contributes
+        # only Available Block / not-picked-up values.
+        g = {
+            "pu_rooms": srp_group_rooms,
+            "pu_rev": srp_group_rev,
+            "av_rooms": _ar_num(wash_g.get("av_rooms")) or 0,
+            "av_rev": _ar_num(wash_g.get("av_rev")) or 0,
+        }
+        p = {
+            "pu_rooms": srp_perm_rooms,
+            "pu_rev": srp_perm_rev,
+            "av_rooms": _ar_num(wash_p.get("av_rooms")) or 0,
+            "av_rev": _ar_num(wash_p.get("av_rev")) or 0,
+        }
 
         if current_month_reconciled and wash_days is not None:
-            # Current-month Group/Permanent use the same cutoff as Total:
-            # manual actuals through T-2 + live Wash data from T-1 to EOM.
+            # Current-month picked-up Group/Permanent uses the same cutoff as
+            # Total: manual actuals through T-2 + live SRP from T-1 to EOM.
+            # Wash remains only the source for live Available Block.
             month_end = (
                 (as_of.replace(day=28) + datetime.timedelta(days=4))
                 .replace(day=1)
@@ -1475,60 +1492,45 @@ def build_hilton_rob_plan(
             )
             live_start = as_of - datetime.timedelta(days=1)
 
-            live_group = {
-                "pu_rooms": 0.0,
-                "pu_rev": 0.0,
-                "av_rooms": 0.0,
-                "av_rev": 0.0,
-            }
-            live_perm = {
-                "pu_rooms": 0.0,
-                "pu_rev": 0.0,
-                "av_rooms": 0.0,
-                "av_rev": 0.0,
-            }
+            live_group_av = {"av_rooms": 0.0, "av_rev": 0.0}
+            live_perm_av = {"av_rooms": 0.0, "av_rev": 0.0}
 
             d = live_start
             while d <= month_end:
                 day_bucket = wash_days.get(d) or {}
                 for src, dest in (
-                    (day_bucket.get("GRP") or {}, live_group),
-                    (day_bucket.get("PRM") or {}, live_perm),
+                    (day_bucket.get("GRP") or {}, live_group_av),
+                    (day_bucket.get("PRM") or {}, live_perm_av),
                 ):
-                    for metric in (
-                        "pu_rooms",
-                        "pu_rev",
-                        "av_rooms",
-                        "av_rev",
-                    ):
-                        dest[metric] += _ar_num(src.get(metric)) or 0
+                    dest["av_rooms"] += _ar_num(src.get("av_rooms")) or 0
+                    dest["av_rev"] += _ar_num(src.get("av_rev")) or 0
                 d += datetime.timedelta(days=1)
 
             g = {
                 "pu_rooms": (
                     (_ar_num(current_month_total.get("actual_group_rooms")) or 0)
-                    + live_group["pu_rooms"]
+                    + (_ar_num(current_month_total.get("srp_group_rooms")) or 0)
                 ),
                 "pu_rev": (
                     (_ar_num(current_month_total.get("actual_group_revenue")) or 0)
-                    + live_group["pu_rev"]
+                    + (_ar_num(current_month_total.get("srp_group_revenue")) or 0)
                 ),
                 # Not-picked-up is a live future block measure, so only the
-                # T-1-to-EOM remainder belongs in the current ROB.
-                "av_rooms": live_group["av_rooms"],
-                "av_rev": live_group["av_rev"],
+                # T-1-to-EOM Available Block belongs in the current ROB.
+                "av_rooms": live_group_av["av_rooms"],
+                "av_rev": live_group_av["av_rev"],
             }
             p = {
                 "pu_rooms": (
                     (_ar_num(current_month_total.get("actual_perm_rooms")) or 0)
-                    + live_perm["pu_rooms"]
+                    + (_ar_num(current_month_total.get("srp_perm_rooms")) or 0)
                 ),
                 "pu_rev": (
                     (_ar_num(current_month_total.get("actual_perm_revenue")) or 0)
-                    + live_perm["pu_rev"]
+                    + (_ar_num(current_month_total.get("srp_perm_revenue")) or 0)
                 ),
-                "av_rooms": live_perm["av_rooms"],
-                "av_rev": live_perm["av_rev"],
+                "av_rooms": live_perm_av["av_rooms"],
+                "av_rev": live_perm_av["av_rev"],
             }
 
         # Zero is a real ROB value, not "missing data". A month with no rooms
@@ -1538,19 +1540,9 @@ def build_hilton_rob_plan(
         # _srp_seg() returns (0, 0.0) for a genuinely empty month, so do not
         # skip merely because tot_rooms is zero.
 
-        # The two reports have to describe the same hotel. Pick-up is a subset
-        # of what is on the books, so it cannot exceed it — when it does, one
-        # of the two exports is for a different date range or a different
-        # property, and the month is wrong whichever figure you believe.
-        # Confirmed real case: Kansas City September read 773 rooms on the
-        # books against 1,017 picked up.
-        picked = g.get("pu_rooms", 0.0) + p.get("pu_rooms", 0.0)
-        if picked > tot_rooms:
-            warns.append(
-                f"{datetime.date(as_of.year, month, 1):%B}: the Wash report picks up "
-                f"{picked:,.0f} rooms but SRP only has {tot_rooms:,.0f} on the books. "
-                f"Group can't exceed the total — check the two exports cover the "
-                f"same dates and the same property.")
+        # No Group-vs-total warning is needed here: picked-up Group and
+        # Permanent values now come from the same SRP source as Total, while
+        # Wash Available Block is kept separate in column G.
 
         L = labels.get
 
@@ -17845,11 +17837,22 @@ def render_hilton_update(hotels):
 
                     srp_rooms = 0.0
                     srp_revenue_raw = 0.0
+                    srp_group_rooms = 0.0
+                    srp_group_revenue = 0.0
+                    srp_perm_rooms = 0.0
+                    srp_perm_revenue = 0.0
                     d = srp_start
                     while d <= month_end:
-                        rooms, rev = _srp_seg(prop["days"].get(d), "TOT")
+                        day_srp = prop["days"].get(d)
+                        rooms, rev = _srp_seg(day_srp, "TOT")
+                        grp_rooms, grp_rev = _srp_seg(day_srp, "GRP")
+                        prm_rooms, prm_rev = _srp_seg(day_srp, "PRM")
                         srp_rooms += rooms
                         srp_revenue_raw += rev
+                        srp_group_rooms += grp_rooms
+                        srp_group_revenue += grp_rev
+                        srp_perm_rooms += prm_rooms
+                        srp_perm_revenue += prm_rev
                         d += datetime.timedelta(days=1)
 
                     # Completed Hilton ROBs are not uniform here:
@@ -17876,6 +17879,10 @@ def render_hilton_update(hotels):
                         "srp_rooms": srp_rooms,
                         "srp_revenue": srp_revenue,
                         "srp_revenue_raw": srp_revenue_raw,
+                        "srp_group_rooms": srp_group_rooms,
+                        "srp_group_revenue": srp_group_revenue,
+                        "srp_perm_rooms": srp_perm_rooms,
+                        "srp_perm_revenue": srp_perm_revenue,
                         "actual_through": (
                             hilton_as_of - datetime.timedelta(days=2)
                         ),
