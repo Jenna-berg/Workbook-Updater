@@ -424,10 +424,9 @@ def parse_group_wash(file_like, hotel_name=None):
     seg is 'GRP' or 'PRM'; Northbrook also treats Market Segment MEPS as PRM; each holds
     pu_rooms / pu_rev / av_rooms / av_rev.
 
-    'Pick Up' is parsed for diagnostics/backward compatibility, but Hilton ROB
-    Group/Permanent totals come from SRP Activity. 'Available Block' is the
-    unpicked remainder and is the only Group Wash measure written to the ROB,
-    in column G ('not p/u'). Market Segment is the discriminator, not
+    'Pick Up' is what has actually been reserved out of the block and belongs
+    in the ROB's column E. 'Available Block' is the unpicked remainder and
+    belongs in column G ('not p/u'). Market Segment is the discriminator, not
     Forecast Group — one real property has a block named 'Group_PERM_SMRF'
     whose segment is SMRF, i.e. ordinary group business despite the name.
     """
@@ -1326,14 +1325,17 @@ def build_hilton_rob_plan(
 
     Each figure comes from the report that measures it best:
 
-      total (col E)    SRP's own TOT — every picked-up room on the books
-      group/perm (E)   SRP's GRP / PRM segments — picked-up business only
-      not p/u (col G)  Group Wash Available Block only
+      total (col E)    SRP's own TOT — every room on the books
+      group/perm (E)   the Wash report's Pick Up
+      not p/u (col G)  the Wash report's Available Block
 
-    Group Wash is intentionally NOT used for Group/Permanent totals. Its
-    Available Block represents contracted rooms that have not picked up yet
-    (for example airline blocks), so those rooms belong only in the separate
-    not-picked-up columns and must not inflate Group totals or hotel totals.
+    The total used to be assembled as SRP transient + Wash pick-up, which
+    double-counted: pick-up *reclassifies* rooms that SRP has already counted
+    inside TOT — SRP files a block room under whatever code the individual
+    booked with — so adding the two put every month out by a few thousand.
+    Group still has to come from the Wash report, because SRP's 'convention'
+    flag genuinely undercounts it (Kansas City September: 270 rooms by SRP
+    against 789 by the wash report).
 
     Rows are located by label. A cell holding a hand-written reconciliation
     like '=294767+55017' is left alone, but a cross-sheet mirror like
@@ -1460,31 +1462,12 @@ def build_hilton_rob_plan(
             tot_rooms = current_month_total["rooms"]
             tot_rev = current_month_total["revenue"]
 
-        wash_g = wash.get("GRP") or {}
-        wash_p = wash.get("PRM") or {}
-
-        srp_group_rooms, srp_group_rev = _srp_seg(srp, "GRP")
-        srp_perm_rooms, srp_perm_rev = _srp_seg(srp, "PRM")
-
-        # Picked-up Group/Permanent totals come from SRP. Group Wash contributes
-        # only Available Block / not-picked-up values.
-        g = {
-            "pu_rooms": srp_group_rooms,
-            "pu_rev": srp_group_rev,
-            "av_rooms": _ar_num(wash_g.get("av_rooms")) or 0,
-            "av_rev": _ar_num(wash_g.get("av_rev")) or 0,
-        }
-        p = {
-            "pu_rooms": srp_perm_rooms,
-            "pu_rev": srp_perm_rev,
-            "av_rooms": _ar_num(wash_p.get("av_rooms")) or 0,
-            "av_rev": _ar_num(wash_p.get("av_rev")) or 0,
-        }
+        g = wash.get("GRP") or {}
+        p = wash.get("PRM") or {}
 
         if current_month_reconciled and wash_days is not None:
-            # Current-month picked-up Group/Permanent uses the same cutoff as
-            # Total: manual actuals through T-2 + live SRP from T-1 to EOM.
-            # Wash remains only the source for live Available Block.
+            # Current-month Group/Permanent use the same cutoff as Total:
+            # manual actuals through T-2 + live Wash data from T-1 to EOM.
             month_end = (
                 (as_of.replace(day=28) + datetime.timedelta(days=4))
                 .replace(day=1)
@@ -1492,45 +1475,60 @@ def build_hilton_rob_plan(
             )
             live_start = as_of - datetime.timedelta(days=1)
 
-            live_group_av = {"av_rooms": 0.0, "av_rev": 0.0}
-            live_perm_av = {"av_rooms": 0.0, "av_rev": 0.0}
+            live_group = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
+            live_perm = {
+                "pu_rooms": 0.0,
+                "pu_rev": 0.0,
+                "av_rooms": 0.0,
+                "av_rev": 0.0,
+            }
 
             d = live_start
             while d <= month_end:
                 day_bucket = wash_days.get(d) or {}
                 for src, dest in (
-                    (day_bucket.get("GRP") or {}, live_group_av),
-                    (day_bucket.get("PRM") or {}, live_perm_av),
+                    (day_bucket.get("GRP") or {}, live_group),
+                    (day_bucket.get("PRM") or {}, live_perm),
                 ):
-                    dest["av_rooms"] += _ar_num(src.get("av_rooms")) or 0
-                    dest["av_rev"] += _ar_num(src.get("av_rev")) or 0
+                    for metric in (
+                        "pu_rooms",
+                        "pu_rev",
+                        "av_rooms",
+                        "av_rev",
+                    ):
+                        dest[metric] += _ar_num(src.get(metric)) or 0
                 d += datetime.timedelta(days=1)
 
             g = {
                 "pu_rooms": (
                     (_ar_num(current_month_total.get("actual_group_rooms")) or 0)
-                    + (_ar_num(current_month_total.get("srp_group_rooms")) or 0)
+                    + live_group["pu_rooms"]
                 ),
                 "pu_rev": (
                     (_ar_num(current_month_total.get("actual_group_revenue")) or 0)
-                    + (_ar_num(current_month_total.get("srp_group_revenue")) or 0)
+                    + live_group["pu_rev"]
                 ),
                 # Not-picked-up is a live future block measure, so only the
-                # T-1-to-EOM Available Block belongs in the current ROB.
-                "av_rooms": live_group_av["av_rooms"],
-                "av_rev": live_group_av["av_rev"],
+                # T-1-to-EOM remainder belongs in the current ROB.
+                "av_rooms": live_group["av_rooms"],
+                "av_rev": live_group["av_rev"],
             }
             p = {
                 "pu_rooms": (
                     (_ar_num(current_month_total.get("actual_perm_rooms")) or 0)
-                    + (_ar_num(current_month_total.get("srp_perm_rooms")) or 0)
+                    + live_perm["pu_rooms"]
                 ),
                 "pu_rev": (
                     (_ar_num(current_month_total.get("actual_perm_revenue")) or 0)
-                    + (_ar_num(current_month_total.get("srp_perm_revenue")) or 0)
+                    + live_perm["pu_rev"]
                 ),
-                "av_rooms": live_perm_av["av_rooms"],
-                "av_rev": live_perm_av["av_rev"],
+                "av_rooms": live_perm["av_rooms"],
+                "av_rev": live_perm["av_rev"],
             }
 
         # Zero is a real ROB value, not "missing data". A month with no rooms
@@ -1540,9 +1538,19 @@ def build_hilton_rob_plan(
         # _srp_seg() returns (0, 0.0) for a genuinely empty month, so do not
         # skip merely because tot_rooms is zero.
 
-        # No Group-vs-total warning is needed here: picked-up Group and
-        # Permanent values now come from the same SRP source as Total, while
-        # Wash Available Block is kept separate in column G.
+        # The two reports have to describe the same hotel. Pick-up is a subset
+        # of what is on the books, so it cannot exceed it — when it does, one
+        # of the two exports is for a different date range or a different
+        # property, and the month is wrong whichever figure you believe.
+        # Confirmed real case: Kansas City September read 773 rooms on the
+        # books against 1,017 picked up.
+        picked = g.get("pu_rooms", 0.0) + p.get("pu_rooms", 0.0)
+        if picked > tot_rooms:
+            warns.append(
+                f"{datetime.date(as_of.year, month, 1):%B}: the Wash report picks up "
+                f"{picked:,.0f} rooms but SRP only has {tot_rooms:,.0f} on the books. "
+                f"Group can't exceed the total — check the two exports cover the "
+                f"same dates and the same property.")
 
         L = labels.get
 
@@ -1599,6 +1607,9 @@ def build_hilton_forecast_plan(srp_days, ws, as_of=None, target_month=None):
       - Forecast Rooms Sold / Forecast ADR
       - Estimated Pick Up / Est. Group Pick Up
       - Actual Rooms / Actual Revenue
+
+    Existing manual/projected Forecast information already present in the
+    destination week is preserved. Nothing is copied from the prior week.
 
     The Forecast as-of date is written explicitly from the selected Hilton
     report date so the workbook header stays current.
@@ -2198,56 +2209,14 @@ def strip_tables(wb):
 
 
 def _forecast_projection_carry_changes(wb, destination_sheet):
-    """Carry manual Forecast assumptions from the prior weekly tab.
+    """Forecast assumptions are week-specific and are never carried forward.
 
-    Keeps rows 7, 8, and 12 plus labeled projected/estimated pickup and manual
-    Forecast ADR rows. Existing values on the destination week always win.
+    Existing values already present in the destination week remain untouched.
+    Blank destination cells stay blank unless another explicit Forecast rule
+    writes to them.
     """
-    if destination_sheet not in FORECAST_SHEETS:
-        return []
-    try:
-        dest_index = FORECAST_SHEETS.index(destination_sheet)
-    except ValueError:
-        return []
-    if dest_index <= 0:
-        return []
+    return []
 
-    previous_sheet = next(
-        (name for name in reversed(FORECAST_SHEETS[:dest_index]) if name in wb.sheetnames),
-        None,
-    )
-    if not previous_sheet:
-        return []
-
-    src_ws = wb[previous_sheet]
-    dst_ws = wb[destination_sheet]
-    rows_to_carry = {7, 8, 12}
-
-    for r in range(1, min(max(src_ws.max_row, dst_ws.max_row), 40) + 1):
-        label = str(src_ws.cell(r, 1).value or dst_ws.cell(r, 1).value or '')
-        normalized = re.sub(r'\s+', ' ', label.strip().lower())
-        if (
-            ('pick' in normalized and any(x in normalized for x in ('estimate','estimated','project','forecast','group')))
-            or ('forecast' in normalized and 'adr' in normalized)
-            or ('project' in normalized and 'adr' in normalized)
-        ):
-            rows_to_carry.add(r)
-
-    changes=[]
-    max_col=min(max(src_ws.max_column,dst_ws.max_column),32)
-    for row in sorted(rows_to_carry):
-        if row<1 or row>src_ws.max_row or row>dst_ws.max_row:
-            continue
-        for col in range(2,max_col+1):
-            src_value=src_ws.cell(row,col).value
-            dst_value=dst_ws.cell(row,col).value
-            if src_value is None or dst_value not in (None,''):
-                continue
-            changes.append({
-                'label':f'Carry Forecast assumption from {previous_sheet} row {row}',
-                'row':row,'col':col,'new_value':src_value,'skip_reason':None,
-            })
-    return changes
 
 
 def apply_portfolio_plans(svc, jobs, undo_key):
@@ -2269,21 +2238,6 @@ def apply_portfolio_plans(svc, jobs, undo_key):
                                         data_only=False, keep_vba=keep_vba)
             ws = wb[job["sheet"]]
             job_changes = list(job["changes"])
-            is_forecast_job = (
-                "FORECAST" in str(job.get("file_name", "")).upper()
-                or "FORECAST" in str(job.get("key", "")).upper()
-            )
-            if is_forecast_job:
-                existing_targets = {
-                    (c.get("row"), c.get("col"))
-                    for c in job_changes
-                    if not c.get("skip_reason")
-                }
-                carry_changes = _forecast_projection_carry_changes(wb, job["sheet"])
-                job_changes.extend(
-                    c for c in carry_changes
-                    if (c.get("row"), c.get("col")) not in existing_targets
-                )
             writes = [c for c in job_changes if not c.get("skip_reason")]
             prev_tab = ws.sheet_properties.tabColor
             snapshot[job["key"]] = {
@@ -17837,22 +17791,11 @@ def render_hilton_update(hotels):
 
                     srp_rooms = 0.0
                     srp_revenue_raw = 0.0
-                    srp_group_rooms = 0.0
-                    srp_group_revenue = 0.0
-                    srp_perm_rooms = 0.0
-                    srp_perm_revenue = 0.0
                     d = srp_start
                     while d <= month_end:
-                        day_srp = prop["days"].get(d)
-                        rooms, rev = _srp_seg(day_srp, "TOT")
-                        grp_rooms, grp_rev = _srp_seg(day_srp, "GRP")
-                        prm_rooms, prm_rev = _srp_seg(day_srp, "PRM")
+                        rooms, rev = _srp_seg(prop["days"].get(d), "TOT")
                         srp_rooms += rooms
                         srp_revenue_raw += rev
-                        srp_group_rooms += grp_rooms
-                        srp_group_revenue += grp_rev
-                        srp_perm_rooms += prm_rooms
-                        srp_perm_revenue += prm_rev
                         d += datetime.timedelta(days=1)
 
                     # Completed Hilton ROBs are not uniform here:
@@ -17879,10 +17822,6 @@ def render_hilton_update(hotels):
                         "srp_rooms": srp_rooms,
                         "srp_revenue": srp_revenue,
                         "srp_revenue_raw": srp_revenue_raw,
-                        "srp_group_rooms": srp_group_rooms,
-                        "srp_group_revenue": srp_group_revenue,
-                        "srp_perm_rooms": srp_perm_rooms,
-                        "srp_perm_revenue": srp_perm_revenue,
                         "actual_through": (
                             hilton_as_of - datetime.timedelta(days=2)
                         ),
