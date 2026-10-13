@@ -22317,26 +22317,29 @@ with tab_ancillary:
                     status_staff_messages_by_month[mkey] = _ar_status_staff_message_rows(staff_msg_file)
 
                 eng_rows = []
-                with st.expander(f"{month_date.strftime('%b %Y')} Engagement Rate points", expanded=False):
-                    for i in range(8):
-                        ec1, ec2 = st.columns([2, 1])
-                        with ec1:
-                            ed = st.date_input(
-                                f"Date {i + 1}",
-                                value=None,
-                                key=f"status_eng_date_{mkey}_{i}_{ancillary_platform}",
-                            )
-                        with ec2:
-                            er = st.number_input(
-                                f"Rate % {i + 1}",
-                                min_value=0.0,
-                                max_value=100.0,
-                                value=0.0,
-                                step=0.1,
-                                key=f"status_eng_rate_{mkey}_{i}_{ancillary_platform}",
-                            )
-                        if ed is not None:
-                            eng_rows.append((datetime.datetime.combine(ed, datetime.time()), er / 100.0))
+                # Streamlit does not allow an expander inside another expander.
+                # Messaging information is already inside the outer month-information
+                # expander, so render engagement inputs directly within that section.
+                st.markdown(f"**{month_date.strftime('%b %Y')} Engagement Rate points (optional)**")
+                for i in range(8):
+                    ec1, ec2 = st.columns([2, 1])
+                    with ec1:
+                        ed = st.date_input(
+                            f"Date {i + 1}",
+                            value=None,
+                            key=f"status_eng_date_{mkey}_{i}_{ancillary_platform}",
+                        )
+                    with ec2:
+                        er = st.number_input(
+                            f"Rate % {i + 1}",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=0.0,
+                            step=0.1,
+                            key=f"status_eng_rate_{mkey}_{i}_{ancillary_platform}",
+                        )
+                    if ed is not None:
+                        eng_rows.append((datetime.datetime.combine(ed, datetime.time()), er / 100.0))
                 status_engagement_by_month[mkey] = eng_rows
 
         status_ready = bool(status_months) and bool(str(status_property or "").strip()) and status_current_canary is not None and status_stly_canary is not None
