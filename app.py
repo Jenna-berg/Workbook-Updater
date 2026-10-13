@@ -13680,6 +13680,728 @@ def ancillary_build_monthly_report(template_bytes, property_name, report_month, 
 
 
 
+
+# ── Canary / Oaky status-based ancillary builder ─────────────────────────────
+# Used by Margaritaville (Canary + Oaky) and branded Marriott/IHG properties
+# that receive their ancillary revenue through Canary only. Current year and
+# STLY intentionally use the SAME parser and row structure; only the target year
+# changes. Grouped exports can contain several months and are split by date.
+
+CANARY_STATUS_HEADERS = [
+    "Name",
+    "Revenue Requested $",
+    "Revenue Approved $",
+    "Revenue Expired $",
+    "Revenue Denied $",
+]
+
+MARGARITAVILLE_ANCILLARY_ALIASES = {
+    _ar_norm("My Furry Friend’s Joining Me!"): ["My Dog Is Staying With Me!"],
+    _ar_norm("Early Check-in - Noon"): ["Early Check-in"],
+    _ar_norm("Early Check-in - 10AM"): ["Early Check-in", "Very Early Check-in"],
+    _ar_norm("Late Checkout - 1PM"): ["Late Checkout"],
+    _ar_norm("Late Checkout - 4PM"): ["Very Late Checkout", "Late Checkout"],
+}
+
+
+def _ar_upload_bytes(uploaded_file):
+    """Return bytes without depending on the current file pointer position."""
+    if uploaded_file is None:
+        return None
+    if isinstance(uploaded_file, (bytes, bytearray)):
+        return bytes(uploaded_file)
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    if hasattr(uploaded_file, "read"):
+        pos = None
+        try:
+            pos = uploaded_file.tell()
+        except Exception:
+            pass
+        data = uploaded_file.read()
+        if pos is not None:
+            try:
+                uploaded_file.seek(pos)
+            except Exception:
+                pass
+        return data
+    raise TypeError("Unsupported uploaded file object.")
+
+
+def ancillary_canary_status_months(uploaded_file):
+    """Return sorted (year, month) pairs present in a grouped Canary export."""
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        return []
+    h = _ar_header_map(raw[0])
+    date_i = _ar_col(h, ["Arrival Date"])
+    if date_i < 0:
+        raise ValueError("Canary upsell export is missing Arrival Date.")
+    months = set()
+    for row in raw[1:]:
+        dt = _ar_date(row[date_i] if date_i < len(row) else None)
+        if dt:
+            months.add((dt.year, dt.month))
+    return sorted(months)
+
+
+def ancillary_oaky_status_months(uploaded_file):
+    """Return sorted (year, month) pairs present in a grouped Oaky export."""
+    if uploaded_file is None:
+        return []
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        return []
+    h = _ar_header_map(raw[0])
+    date_i = _ar_col(h, ["Revenue Date", "orders.revenue_date.day"])
+    if date_i < 0:
+        raise ValueError("Oaky export is missing Revenue Date.")
+    months = set()
+    for row in raw[1:]:
+        dt = _ar_date(row[date_i] if date_i < len(row) else None)
+        if dt:
+            months.add((dt.year, dt.month))
+    return sorted(months)
+
+
+def ancillary_parse_canary_status(uploaded_file, report_month):
+    """Parse one month from a grouped Canary upsell export.
+
+    Mapping confirmed from the Margaritaville source/report pair:
+      Arrival Date -> month
+      Item         -> report row name
+      Status       -> approved / denied / expired bucket
+      Revenue      -> dollar value
+      Updated By   -> staff approved/denied revenue table
+
+    Revenue Requested is approved + denied + expired, matching the completed
+    status-based ancillary workbooks.
+    """
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("Canary upsell export is empty.")
+
+    h = _ar_header_map(raw[0])
+    date_i = _ar_col(h, ["Arrival Date"])
+    status_i = _ar_col(h, ["Status"])
+    item_i = _ar_col(h, ["Item"])
+    revenue_i = _ar_col(h, ["Revenue"])
+    updated_i = _ar_col(h, ["Updated By"])
+
+    if min(date_i, status_i, item_i, revenue_i) < 0:
+        raise ValueError(
+            "Canary upsell export must contain Arrival Date, Status, Item, and Revenue."
+        )
+
+    items = collections.OrderedDict()
+    staff = collections.OrderedDict()
+    matched = 0
+
+    for row in raw[1:]:
+        dt = _ar_date(row[date_i] if date_i < len(row) else None)
+        if (
+            dt is None
+            or dt.year != report_month.year
+            or dt.month != report_month.month
+        ):
+            continue
+
+        name = str(row[item_i] or "").strip() if item_i < len(row) else ""
+        if not name:
+            continue
+        status = str(row[status_i] or "").strip().lower() if status_i < len(row) else ""
+        revenue = _ar_num(row[revenue_i] if revenue_i < len(row) else None) or 0.0
+
+        # Only statuses represented by the established report table contribute
+        # to Revenue Requested. Unknown/pending statuses are not silently folded
+        # into a different bucket.
+        if status not in {"approved", "denied", "expired"}:
+            continue
+
+        matched += 1
+        key = _ar_norm(name)
+        item = items.setdefault(
+            key,
+            {
+                "name": name,
+                "requested": 0.0,
+                "approved": 0.0,
+                "expired": 0.0,
+                "denied": 0.0,
+                "source": "CANARY",
+            },
+        )
+        item[status] += revenue
+        item["requested"] += revenue
+
+        if updated_i >= 0 and updated_i < len(row):
+            person = str(row[updated_i] or "").strip()
+            if person:
+                skey = _ar_norm(person)
+                s = staff.setdefault(
+                    skey,
+                    {"name": person, "approved": 0.0, "denied": 0.0},
+                )
+                if status == "approved":
+                    s["approved"] += revenue
+                elif status == "denied":
+                    s["denied"] += revenue
+
+    rows = list(items.values())
+    rows.sort(
+        key=lambda x: (
+            -(_ar_num(x.get("approved")) or 0),
+            -(_ar_num(x.get("requested")) or 0),
+            str(x.get("name") or "").lower(),
+        )
+    )
+    staff_rows = list(staff.values())
+    staff_rows.sort(
+        key=lambda x: (
+            -(_ar_num(x.get("approved")) or 0),
+            str(x.get("name") or "").lower(),
+        )
+    )
+
+    totals = {
+        k: sum(_ar_num(x.get(k)) or 0 for x in rows)
+        for k in ("requested", "approved", "expired", "denied")
+    }
+    return {
+        "rows": rows,
+        "byItem": {_ar_norm(x["name"]): x for x in rows},
+        "staff": staff_rows,
+        "totals": totals,
+        "matched": matched,
+        "sourceType": "CANARY",
+    }
+
+
+def ancillary_parse_oaky_status(uploaded_file, report_month):
+    """Parse one month from Oaky's Daily Revenue Generated by Deal Category.
+
+    Oaky has realized revenue rather than request status. Each Subcategory is
+    therefore written as Requested = Approved = Revenue; Expired/Denied are
+    unavailable and remain blank on detail rows.
+    """
+    if uploaded_file is None:
+        return {"rows": [], "byItem": {}, "totals": {"requested": 0.0, "approved": 0.0, "expired": 0.0, "denied": 0.0}, "matched": 0, "sourceType": "OAKY"}
+
+    raw = _ar_file_rows(uploaded_file)
+    if not raw:
+        raise ValueError("Oaky revenue export is empty.")
+    h = _ar_header_map(raw[0])
+    name_i = _ar_col(h, ["Subcategory"])
+    date_i = _ar_col(h, ["Revenue Date", "orders.revenue_date.day"])
+    revenue_i = _ar_col(h, ["Revenue in Hotel Currency"])
+    if min(name_i, date_i, revenue_i) < 0:
+        raise ValueError(
+            "Oaky export must contain Subcategory, Revenue Date, and Revenue in Hotel Currency."
+        )
+
+    items = collections.OrderedDict()
+    matched = 0
+    for row in raw[1:]:
+        dt = _ar_date(row[date_i] if date_i < len(row) else None)
+        if (
+            dt is None
+            or dt.year != report_month.year
+            or dt.month != report_month.month
+        ):
+            continue
+        name = str(row[name_i] or "").strip() if name_i < len(row) else ""
+        if not name:
+            continue
+        revenue = _ar_num(row[revenue_i] if revenue_i < len(row) else None) or 0.0
+        matched += 1
+        key = _ar_norm(name)
+        x = items.setdefault(
+            key,
+            {
+                "name": name,
+                "requested": 0.0,
+                "approved": 0.0,
+                "expired": None,
+                "denied": None,
+                "source": "OAKY",
+            },
+        )
+        x["requested"] += revenue
+        x["approved"] += revenue
+
+    rows = list(items.values())
+    rows.sort(key=lambda x: (-(_ar_num(x.get("approved")) or 0), str(x["name"]).lower()))
+    total = sum(_ar_num(x.get("approved")) or 0 for x in rows)
+    return {
+        "rows": rows,
+        "byItem": {_ar_norm(x["name"]): x for x in rows},
+        "totals": {"requested": total, "approved": total, "expired": 0.0, "denied": 0.0},
+        "matched": matched,
+        "sourceType": "OAKY",
+    }
+
+
+def ancillary_combine_status_sources(canary, oaky=None):
+    """Combine Canary and optional Oaky rows without collapsing unlike sources."""
+    rows = [dict(x) for x in canary.get("rows", [])]
+    if oaky:
+        rows.extend(dict(x) for x in oaky.get("rows", []))
+    rows.sort(
+        key=lambda x: (
+            -(_ar_num(x.get("approved")) or 0),
+            -(_ar_num(x.get("requested")) or 0),
+            str(x.get("name") or "").lower(),
+        )
+    )
+    totals = {
+        k: sum(_ar_num(x.get(k)) or 0 for x in rows)
+        for k in ("requested", "approved", "expired", "denied")
+    }
+    return {
+        "rows": rows,
+        "byItem": {_ar_norm(x["name"]): x for x in rows},
+        "totals": totals,
+    }
+
+
+def ancillary_status_variance(current_rows, stly_rows, property_name=""):
+    """Build status-by-status current minus STLY variance rows.
+
+    Exact item names are the default. Margaritaville retains the small set of
+    historical name mappings visible in the completed FEB-APR report.
+    """
+    stly_by = collections.OrderedDict()
+    for row in stly_rows:
+        stly_by.setdefault(_ar_norm(row.get("name")), []).append(row)
+
+    is_margaritaville = "margaritaville" in _ar_norm(property_name)
+    used = set()
+    out = []
+
+    def pick_stly(cur):
+        key = _ar_norm(cur.get("name"))
+        candidates = [key]
+        if is_margaritaville:
+            candidates.extend(_ar_norm(x) for x in MARGARITAVILLE_ANCILLARY_ALIASES.get(key, []))
+        for candidate in candidates:
+            for idx, row in enumerate(stly_by.get(candidate, [])):
+                token = (candidate, idx)
+                if token not in used:
+                    used.add(token)
+                    return row
+        return None
+
+    for cur in current_rows:
+        prev = pick_stly(cur)
+        row = {"name": cur.get("name")}
+        for field in ("requested", "approved", "expired", "denied"):
+            row[field] = (_ar_num(cur.get(field)) or 0) - (_ar_num(prev.get(field)) or 0 if prev else 0)
+        out.append(row)
+
+    for key, rows in stly_by.items():
+        for idx, prev in enumerate(rows):
+            if (key, idx) in used:
+                continue
+            row = {"name": prev.get("name")}
+            for field in ("requested", "approved", "expired", "denied"):
+                row[field] = -(_ar_num(prev.get(field)) or 0)
+            out.append(row)
+
+    return out
+
+
+def _ar_status_apply_table_style(ws, row, start_col, values, header=False, total=False):
+    dark = "1C4587"
+    light = "D9EAF7"
+    stly_fill = "FFF2CC"
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for offset, value in enumerate(values):
+        cell = ws.cell(row, start_col + offset, value)
+        cell.border = border
+        if header:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=dark)
+            cell.alignment = Alignment(horizontal="center")
+        elif total:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor=light)
+        else:
+            cell.fill = PatternFill("solid", fgColor="EFEFEF")
+    return row
+
+
+def _ar_status_write_month_sheet(
+    wb,
+    property_name,
+    report_month,
+    current,
+    stly,
+    staff_rows,
+    messaging=None,
+    engagement=None,
+    staff_messages=None,
+):
+    """Write one completed status-based ancillary month tab."""
+    messaging = messaging or {}
+    engagement = engagement or []
+    staff_messages = staff_messages or []
+
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+
+    dark = "1C4587"
+    green = "B6D7A8"
+    red = "EA9999"
+    gray = "EFEFEF"
+    stly_fill = "FFF2CC"
+    white = "FFFFFF"
+
+    # Sizing mirrors the established report's three-column-zone layout.
+    widths = {"A": 34, "B": 18, "C": 18, "D": 18, "E": 18, "F": 15,
+              "G": 4, "H": 26, "I": 22, "J": 22, "K": 4, "L": 4,
+              "M": 35, "N": 18, "O": 18, "P": 18}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    ws.merge_cells("A1:E1")
+    ws["A1"] = f"{property_name} Upsell Overview - {report_month.strftime('%B')}"
+    ws["A1"].fill = PatternFill("solid", fgColor=dark)
+    ws["A1"].font = Font(size=16, bold=True, color=white)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    for c in range(1, 6):
+        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
+    ws["A2"] = report_month.year
+    ws["A2"].font = Font(bold=True)
+
+    _ar_status_apply_table_style(ws, 3, 1, CANARY_STATUS_HEADERS, header=True)
+    row = 4
+    for x in current["rows"]:
+        vals = [
+            x.get("name"),
+            _ar_num(x.get("requested")) or 0,
+            _ar_num(x.get("approved")) or 0,
+            "" if x.get("expired") is None else (_ar_num(x.get("expired")) or 0),
+            "" if x.get("denied") is None else (_ar_num(x.get("denied")) or 0),
+        ]
+        _ar_status_apply_table_style(ws, row, 1, vals)
+        row += 1
+
+    current_total_row = row
+    t = current["totals"]
+    _ar_status_apply_table_style(
+        ws,
+        row,
+        1,
+        ["TOTALS", t["requested"], t["approved"], t["expired"], t["denied"]],
+        total=True,
+    )
+    ws.cell(row, 6, "Approval Rate")
+    ws.cell(row + 1, 6, (t["approved"] / t["requested"] if t["requested"] else 0))
+    ws.cell(row + 1, 6).number_format = "0.0%"
+    row += 2
+
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    ws.cell(row, 1, "STLY")
+    ws.cell(row, 1).fill = PatternFill("solid", fgColor=dark)
+    ws.cell(row, 1).font = Font(bold=True, color=white)
+    ws.cell(row, 1).alignment = Alignment(horizontal="center")
+    row += 1
+    _ar_status_apply_table_style(ws, row, 1, CANARY_STATUS_HEADERS, header=True)
+    row += 1
+    for x in stly["rows"]:
+        vals = [
+            x.get("name"),
+            _ar_num(x.get("requested")) or 0,
+            _ar_num(x.get("approved")) or 0,
+            "" if x.get("expired") is None else (_ar_num(x.get("expired")) or 0),
+            "" if x.get("denied") is None else (_ar_num(x.get("denied")) or 0),
+        ]
+        _ar_status_apply_table_style(ws, row, 1, vals)
+        for c in range(1, 6):
+            ws.cell(row, c).fill = PatternFill("solid", fgColor=stly_fill)
+        row += 1
+
+    stly_total_row = row
+    st = stly["totals"]
+    _ar_status_apply_table_style(
+        ws,
+        row,
+        1,
+        ["TOTALS", st["requested"], st["approved"], st["expired"], st["denied"]],
+        total=True,
+    )
+    ws.cell(row, 6, "Approval Rate")
+    ws.cell(row + 1, 6, (st["approved"] / st["requested"] if st["requested"] else 0))
+    ws.cell(row + 1, 6).number_format = "0.0%"
+    row += 2
+
+    variance = ancillary_status_variance(current["rows"], stly["rows"], property_name)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    ws.cell(row, 1, "Variance")
+    ws.cell(row, 1).fill = PatternFill("solid", fgColor=dark)
+    ws.cell(row, 1).font = Font(bold=True, color=white)
+    ws.cell(row, 1).alignment = Alignment(horizontal="center")
+    row += 1
+    _ar_status_apply_table_style(ws, row, 1, CANARY_STATUS_HEADERS, header=True)
+    row += 1
+    variance_start = row
+    for x in variance:
+        vals = [x.get("name"), x["requested"], x["approved"], x["expired"], x["denied"]]
+        _ar_status_apply_table_style(ws, row, 1, vals)
+        for c in range(2, 6):
+            val = _ar_num(ws.cell(row, c).value) or 0
+            ws.cell(row, c).fill = PatternFill("solid", fgColor=green if val >= 0 else red)
+        row += 1
+    variance_end = row - 1
+    vtot = {
+        k: sum(_ar_num(x.get(k)) or 0 for x in variance)
+        for k in ("requested", "approved", "expired", "denied")
+    }
+    _ar_status_apply_table_style(
+        ws, row, 1,
+        ["TOTALS", vtot["requested"], vtot["approved"], vtot["expired"], vtot["denied"]],
+        total=True,
+    )
+    for c in range(2, 6):
+        val = _ar_num(ws.cell(row, c).value) or 0
+        ws.cell(row, c).fill = PatternFill("solid", fgColor=green if val >= 0 else red)
+
+    # Currency formatting for every status value in A:E.
+    for r in range(4, row + 1):
+        for c in range(2, 6):
+            ws.cell(r, c).number_format = '$#,##0.00;$(#,##0.00);$-'
+
+    # Current-year staff upsell revenue (from Canary Updated By).
+    _ar_status_apply_table_style(
+        ws, 3, 8,
+        ["User Name", "Upsell Revenue Approved $", "Upsell Revenue Denied $"],
+        header=True,
+    )
+    sr = 4
+    for s in staff_rows:
+        _ar_status_apply_table_style(
+            ws, sr, 8,
+            [s.get("name"), s.get("approved", 0), s.get("denied", 0)],
+        )
+        ws.cell(sr, 9).number_format = '$#,##0.00;$(#,##0.00);$-'
+        ws.cell(sr, 10).number_format = '$#,##0.00;$(#,##0.00);$-'
+        sr += 1
+
+    if staff_messages:
+        sr += 2
+        _ar_status_apply_table_style(ws, sr, 8, ["Staff Name", "Messages"], header=True)
+        sr += 1
+        for s in staff_messages:
+            _ar_status_apply_table_style(ws, sr, 8, [s.get("name"), s.get("messages", 0)])
+            sr += 1
+
+    # Messaging Overview — same KPI block as the existing universal renderer.
+    ws.merge_cells("M1:P1")
+    ws["M1"] = f"{property_name} Messaging Overview - {report_month.strftime('%B')}"
+    ws["M1"].fill = PatternFill("solid", fgColor=dark)
+    ws["M1"].font = Font(size=16, bold=True, color=white)
+    ws["M1"].alignment = Alignment(horizontal="center")
+    for c in range(13, 17):
+        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
+    ws["M2"] = report_month.year
+    ws["N21"] = report_month.strftime("%b %Y").upper()
+    ws["O21"] = "STLY"
+    ws["P21"] = "YoY"
+
+    labels = [
+        "Total Messages",
+        "# of messages guest sent",
+        "# of messages hotel sent",
+        "% of your guests that sent a message",
+        "Response Rate",
+        "Average minutes to respond",
+        "Median minutes to respond",
+    ]
+    current_msg = [
+        _ar_num(messaging.get("msgTotal")) or 0,
+        _ar_num(messaging.get("msgGuest")) or 0,
+        _ar_num(messaging.get("msgHotel")) or 0,
+        messaging.get("msgGuestPct", 0) or 0,
+        messaging.get("responseRate", 0) or 0,
+        _ar_num(messaging.get("avgResponse")) or 0,
+        _ar_num(messaging.get("medianResponse")) or 0,
+    ]
+    stly_msg = [
+        _ar_num(messaging.get("stlyMsgTotal")) or 0,
+        _ar_num(messaging.get("stlyMsgGuest")) or 0,
+        _ar_num(messaging.get("stlyMsgHotel")) or 0,
+        messaging.get("stlyMsgGuestPct", 0) or 0,
+        messaging.get("stlyResponseRate", 0) or 0,
+        _ar_num(messaging.get("stlyAvgResponse")) or 0,
+        _ar_num(messaging.get("stlyMedianResponse")) or 0,
+    ]
+    _ar_status_apply_table_style(ws, 21, 13, ["Metric", "Current", "STLY", "YoY"], header=True)
+    for i, label in enumerate(labels, start=22):
+        idx = i - 22
+        values = [label, current_msg[idx], stly_msg[idx], current_msg[idx] - stly_msg[idx]]
+        _ar_status_apply_table_style(ws, i, 13, values)
+    for r in range(22, 25):
+        for c in range(14, 17):
+            ws.cell(r, c).number_format = "0"
+    for r in range(25, 27):
+        for c in range(14, 17):
+            ws.cell(r, c).number_format = "0.0%"
+    for r in range(27, 29):
+        for c in range(14, 17):
+            ws.cell(r, c).number_format = "0.0"
+
+    _ar_status_apply_table_style(ws, 31, 13, ["Date", "Engagement Rate"], header=True)
+    for i, (d, rate) in enumerate(engagement[:8], start=32):
+        ws.cell(i, 13, d)
+        ws.cell(i, 14, rate)
+        ws.cell(i, 13).number_format = "m/d/yyyy"
+        ws.cell(i, 14).number_format = "0.0%"
+
+    ws.freeze_panes = None
+
+    return {
+        "month": report_month,
+        "current": current["totals"],
+        "stly": stly["totals"],
+        "variance": vtot,
+        "currentRows": current["rows"],
+        "stlyRows": stly["rows"],
+        "staff": staff_rows,
+    }
+
+
+def ancillary_status_build_multi_month_report(
+    property_name,
+    report_months,
+    current_canary_file,
+    stly_canary_file,
+    current_oaky_file=None,
+    stly_oaky_file=None,
+    messaging_by_month=None,
+    engagement_by_month=None,
+    staff_messages_by_month=None,
+):
+    """Build several Canary-status ancillary months in one workbook."""
+    if not report_months:
+        raise ValueError("Select at least one month to build.")
+    if current_canary_file is None or stly_canary_file is None:
+        raise ValueError("Current-year and STLY Canary exports are both required.")
+
+    messaging_by_month = messaging_by_month or {}
+    engagement_by_month = engagement_by_month or {}
+    staff_messages_by_month = staff_messages_by_month or {}
+
+    current_canary_months = set(ancillary_canary_status_months(current_canary_file))
+    stly_canary_months = set(ancillary_canary_status_months(stly_canary_file))
+    current_oaky_months = set(ancillary_oaky_status_months(current_oaky_file)) if current_oaky_file else set()
+    stly_oaky_months = set(ancillary_oaky_status_months(stly_oaky_file)) if stly_oaky_file else set()
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    summaries = []
+    warnings = []
+
+    for month in sorted(report_months):
+        report_month = datetime.datetime(month.year, month.month, 1)
+        stly_month = report_month.replace(year=report_month.year - 1)
+        cur_key = (report_month.year, report_month.month)
+        stly_key = (stly_month.year, stly_month.month)
+
+        if cur_key not in current_canary_months:
+            raise ValueError(
+                f"Current Canary export has no rows for {report_month.strftime('%B %Y')}."
+            )
+        if stly_key not in stly_canary_months:
+            raise ValueError(
+                f"STLY Canary export has no rows for {stly_month.strftime('%B %Y')}."
+            )
+
+        current_canary = ancillary_parse_canary_status(current_canary_file, report_month)
+        stly_canary = ancillary_parse_canary_status(stly_canary_file, stly_month)
+
+        current_oaky = None
+        stly_oaky = None
+        if current_oaky_file is not None:
+            if cur_key in current_oaky_months:
+                current_oaky = ancillary_parse_oaky_status(current_oaky_file, report_month)
+            else:
+                warnings.append(
+                    f"Current Oaky export has no rows for {report_month.strftime('%B %Y')}; "
+                    "that month was built from Canary only."
+                )
+        if stly_oaky_file is not None:
+            if stly_key in stly_oaky_months:
+                stly_oaky = ancillary_parse_oaky_status(stly_oaky_file, stly_month)
+            else:
+                warnings.append(
+                    f"STLY Oaky export has no rows for {stly_month.strftime('%B %Y')}; "
+                    "that STLY month was built from Canary only."
+                )
+
+        current = ancillary_combine_status_sources(current_canary, current_oaky)
+        stly = ancillary_combine_status_sources(stly_canary, stly_oaky)
+
+        mkey = f"{report_month.year}-{report_month.month:02d}"
+        summary = _ar_status_write_month_sheet(
+            wb,
+            property_name,
+            report_month,
+            current,
+            stly,
+            current_canary.get("staff", []),
+            messaging=messaging_by_month.get(mkey, {}),
+            engagement=engagement_by_month.get(mkey, []),
+            staff_messages=staff_messages_by_month.get(mkey, []),
+        )
+        summaries.append(summary)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), summaries, warnings
+
+
+def ancillary_status_merge_month_sheets(destination_bytes, generated_bytes, destination_name=""):
+    """Replace/add every generated month tab in an existing ancillary workbook."""
+    keep_vba = str(destination_name or "").lower().endswith(".xlsm")
+    dest = openpyxl.load_workbook(io.BytesIO(destination_bytes), data_only=False, keep_vba=keep_vba)
+    gen = openpyxl.load_workbook(io.BytesIO(generated_bytes), data_only=False)
+    inserted = []
+
+    for src in gen.worksheets:
+        name = src.title
+        old_idx = dest.sheetnames.index(name) if name in dest.sheetnames else len(dest.sheetnames)
+        if name in dest.sheetnames:
+            del dest[name]
+        dst = dest.create_sheet(name, old_idx)
+        _ancillary_copy_generated_sheet(src, dst)
+        inserted.append(name)
+
+    out = io.BytesIO()
+    dest.save(out)
+    return out.getvalue(), inserted
+
+
+def _ar_status_staff_message_rows(uploaded_file):
+    """Reuse the existing Staff Name / Messages parser for a month-specific file."""
+    if uploaded_file is None:
+        return []
+    return ancillary_parse_staff(_ar_file_rows(uploaded_file))
+
+
+def _ar_status_month_options(count=18):
+    today_month = datetime.date.today().replace(day=1)
+    out = []
+    cursor = today_month
+    for _ in range(count):
+        out.append(cursor)
+        cursor = (cursor - datetime.timedelta(days=1)).replace(day=1)
+    return out
+
+
 # ── Hilton Ancillary Revenue — NOR1 + Lobby ──────────────────────────────────
 HILTON_ANCILLARY_LOBBY_EXCLUDE_FROM_MAIN = {"self parking"}
 
@@ -20426,7 +21148,7 @@ with tab_ancillary:
 
     ancillary_platform = st.radio(
         "Choose report type",
-        ["Hilton", "SNT / Independent Hotels"],
+        ["Hilton", "SNT / Independent Hotels", "Margaritaville", "Marriott / IHG"],
         horizontal=True,
         key="ancillary_platform_choice",
     )
@@ -20690,7 +21412,7 @@ with tab_ancillary:
                 key="har_download_multi",
                 use_container_width=True,
             )
-    else:
+    elif ancillary_platform == "SNT / Independent Hotels":
         st.markdown("### SNT / Independent Hotels")
         st.caption(
             "Builds the monthly report from the universal template. After reviewing "
@@ -21432,6 +22154,365 @@ with tab_ancillary:
                             st.rerun()
                         except Exception as e:
                             st.error(f"Could not undo ancillary Drive save: {e}")
+
+
+    elif ancillary_platform in ("Margaritaville", "Marriott / IHG"):
+        is_margaritaville = ancillary_platform == "Margaritaville"
+        if is_margaritaville:
+            st.markdown("### Margaritaville — Canary + Oaky Multi-Month Builder")
+            st.caption(
+                "Build several months at once from one grouped current-year Canary export, "
+                "one grouped STLY Canary export, and matching Oaky exports. Canary and Oaky "
+                "are combined into the same status-based monthly table."
+            )
+            status_property = st.text_input(
+                "Property name",
+                value="Margaritaville Resort Cape Cod",
+                key="status_marg_property",
+            )
+            status_brand = "Margaritaville"
+        else:
+            st.markdown("### Marriott / IHG — Canary Multi-Month Builder")
+            st.caption(
+                "For branded properties whose ancillary revenue is entirely in Canary. "
+                "Current year and STLY use the same grouped Canary parsing and each selected "
+                "month receives the full messaging KPI block."
+            )
+            status_brand = st.radio(
+                "Brand",
+                ["Marriott", "IHG"],
+                horizontal=True,
+                key="status_brand",
+            )
+            known_ihg = list(PORTFOLIO_HOTELS.get("IHG", {}).keys())
+            if status_brand == "IHG" and known_ihg:
+                property_mode = st.radio(
+                    "Property entry",
+                    ["Known IHG property", "Other property"],
+                    horizontal=True,
+                    key="status_ihg_property_mode",
+                )
+                if property_mode == "Known IHG property":
+                    status_property = st.selectbox(
+                        "Property",
+                        known_ihg,
+                        key="status_ihg_property",
+                    )
+                else:
+                    status_property = st.text_input(
+                        "Property name",
+                        key="status_ihg_property_other",
+                    )
+            else:
+                # Marriott is intentionally free-text so new properties do not need
+                # to be coded into a profile before the builder can be used.
+                status_property = st.text_input(
+                    "Property name",
+                    key="status_marriott_property",
+                    placeholder="e.g. Sheraton Tampa Brandon",
+                )
+
+        status_month_options = _ar_status_month_options(18)
+        status_months = st.multiselect(
+            "Months to build",
+            options=status_month_options,
+            default=status_month_options[:3],
+            format_func=lambda d: d.strftime("%B %Y"),
+            key=f"status_months_{ancillary_platform}",
+            help="One grouped source file can contain every selected month.",
+        )
+
+        st.markdown("**Revenue source files**")
+        c1, c2 = st.columns(2)
+        with c1:
+            status_current_canary = st.file_uploader(
+                "Current-Year Canary Upsells — all selected months",
+                type=["csv", "xlsx"],
+                key=f"status_current_canary_{ancillary_platform}",
+            )
+        with c2:
+            status_stly_canary = st.file_uploader(
+                "STLY Canary Upsells — matching prior-year months",
+                type=["csv", "xlsx"],
+                key=f"status_stly_canary_{ancillary_platform}",
+            )
+
+        status_current_oaky = status_stly_oaky = None
+        if is_margaritaville:
+            oc1, oc2 = st.columns(2)
+            with oc1:
+                status_current_oaky = st.file_uploader(
+                    "Current-Year Oaky Revenue — all selected months",
+                    type=["csv", "xlsx"],
+                    key="status_current_oaky_marg",
+                )
+            with oc2:
+                status_stly_oaky = st.file_uploader(
+                    "STLY Oaky Revenue — matching prior-year months",
+                    type=["csv", "xlsx"],
+                    key="status_stly_oaky_marg",
+                )
+            st.caption(
+                "If an Oaky upload does not contain one of the selected months, the builder "
+                "will flag that month and build its Canary portion only instead of treating "
+                "missing Oaky data as $0."
+            )
+
+        # Messaging values are month-specific. Keeping them beside each month avoids
+        # accidentally copying one month's KPI values into every tab in a batch.
+        status_messaging_by_month = {}
+        status_engagement_by_month = {}
+        status_staff_messages_by_month = {}
+        with st.expander("Messaging information by month", expanded=False):
+            st.caption(
+                "Enter the current and STLY Canary messaging KPIs for each selected month. "
+                "Staff message counts are optional and can be uploaded per month."
+            )
+            for month_date in sorted(status_months):
+                mkey = f"{month_date.year}-{month_date.month:02d}"
+                st.markdown(f"#### {month_date.strftime('%B %Y')}")
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.markdown("**Current Year**")
+                    cur_total = st.number_input("Total Messages", value=0.0, key=f"status_msg_total_{mkey}_{ancillary_platform}")
+                    cur_guest = st.number_input("Guest Messages", value=0.0, key=f"status_msg_guest_{mkey}_{ancillary_platform}")
+                    cur_hotel = st.number_input("Hotel Messages", value=0.0, key=f"status_msg_hotel_{mkey}_{ancillary_platform}")
+                    cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_msg_pct_{mkey}_{ancillary_platform}")
+                    cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_resp_{mkey}_{ancillary_platform}")
+                    cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"status_avg_{mkey}_{ancillary_platform}")
+                    cur_med = st.number_input("Median Minutes to Respond", value=0.0, key=f"status_med_{mkey}_{ancillary_platform}")
+                with mc2:
+                    st.markdown(f"**STLY — {month_date.year - 1}**")
+                    prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"status_stly_total_{mkey}_{ancillary_platform}")
+                    prev_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"status_stly_guest_{mkey}_{ancillary_platform}")
+                    prev_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"status_stly_hotel_{mkey}_{ancillary_platform}")
+                    prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_pct_{mkey}_{ancillary_platform}")
+                    prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_resp_{mkey}_{ancillary_platform}")
+                    prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"status_stly_avg_{mkey}_{ancillary_platform}")
+                    prev_med = st.number_input("STLY Median Minutes to Respond", value=0.0, key=f"status_stly_med_{mkey}_{ancillary_platform}")
+
+                status_messaging_by_month[mkey] = {
+                    "msgTotal": cur_total,
+                    "msgGuest": cur_guest,
+                    "msgHotel": cur_hotel,
+                    "msgGuestPct": cur_pct / 100.0,
+                    "responseRate": cur_resp / 100.0,
+                    "avgResponse": cur_avg,
+                    "medianResponse": cur_med,
+                    "stlyMsgTotal": prev_total,
+                    "stlyMsgGuest": prev_guest,
+                    "stlyMsgHotel": prev_hotel,
+                    "stlyMsgGuestPct": prev_pct / 100.0,
+                    "stlyResponseRate": prev_resp / 100.0,
+                    "stlyAvgResponse": prev_avg,
+                    "stlyMedianResponse": prev_med,
+                }
+
+                staff_msg_file = st.file_uploader(
+                    f"{month_date.strftime('%b %Y')} Canary Message Count by Staff (optional)",
+                    type=["csv", "xlsx"],
+                    key=f"status_staff_msg_{mkey}_{ancillary_platform}",
+                )
+                if staff_msg_file is not None:
+                    status_staff_messages_by_month[mkey] = _ar_status_staff_message_rows(staff_msg_file)
+
+                eng_rows = []
+                with st.expander(f"{month_date.strftime('%b %Y')} Engagement Rate points", expanded=False):
+                    for i in range(8):
+                        ec1, ec2 = st.columns([2, 1])
+                        with ec1:
+                            ed = st.date_input(
+                                f"Date {i + 1}",
+                                value=None,
+                                key=f"status_eng_date_{mkey}_{i}_{ancillary_platform}",
+                            )
+                        with ec2:
+                            er = st.number_input(
+                                f"Rate % {i + 1}",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=0.0,
+                                step=0.1,
+                                key=f"status_eng_rate_{mkey}_{i}_{ancillary_platform}",
+                            )
+                        if ed is not None:
+                            eng_rows.append((datetime.datetime.combine(ed, datetime.time()), er / 100.0))
+                status_engagement_by_month[mkey] = eng_rows
+
+        status_ready = bool(status_months) and bool(str(status_property or "").strip()) and status_current_canary is not None and status_stly_canary is not None
+        if is_margaritaville:
+            status_ready = status_ready and status_current_oaky is not None and status_stly_oaky is not None
+
+        if st.button(
+            "Build Multi-Month Ancillary Workbook",
+            type="primary",
+            key=f"status_build_{ancillary_platform}",
+            disabled=not status_ready,
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner("Building multi-month ancillary workbook..."):
+                    status_output, status_summaries, status_warnings = ancillary_status_build_multi_month_report(
+                        property_name=str(status_property).strip(),
+                        report_months=status_months,
+                        current_canary_file=status_current_canary,
+                        stly_canary_file=status_stly_canary,
+                        current_oaky_file=status_current_oaky if is_margaritaville else None,
+                        stly_oaky_file=status_stly_oaky if is_margaritaville else None,
+                        messaging_by_month=status_messaging_by_month,
+                        engagement_by_month=status_engagement_by_month,
+                        staff_messages_by_month=status_staff_messages_by_month,
+                    )
+                    years = sorted({m.year for m in status_months})
+                    year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
+                    status_filename = f"{year_label} {str(status_property).strip()} Ancillary Revenue Report.xlsx"
+                    st.session_state[f"status_output_{ancillary_platform}"] = status_output
+                    st.session_state[f"status_summaries_{ancillary_platform}"] = status_summaries
+                    st.session_state[f"status_warnings_{ancillary_platform}"] = status_warnings
+                    st.session_state[f"status_filename_{ancillary_platform}"] = status_filename
+                st.success(f"Built {len(status_summaries)} month tab(s).")
+            except Exception as e:
+                st.error(f"Multi-month ancillary build error: {e}")
+
+        output_key = f"status_output_{ancillary_platform}"
+        if output_key in st.session_state:
+            for warning in st.session_state.get(f"status_warnings_{ancillary_platform}", []):
+                st.warning(warning)
+
+            summaries = st.session_state.get(f"status_summaries_{ancillary_platform}", [])
+            if summaries:
+                preview = []
+                for s in summaries:
+                    preview.append({
+                        "Month": s["month"].strftime("%b %Y"),
+                        "Current Approved": s["current"].get("approved", 0),
+                        "STLY Approved": s["stly"].get("approved", 0),
+                        "YoY Approved Variance": s["variance"].get("approved", 0),
+                        "Current Approval Rate": (
+                            s["current"].get("approved", 0) / s["current"].get("requested", 1)
+                            if s["current"].get("requested", 0) else 0
+                        ),
+                    })
+                st.dataframe(pd.DataFrame(preview), use_container_width=True)
+
+            st.download_button(
+                "Download Multi-Month Ancillary Workbook",
+                data=st.session_state[output_key],
+                file_name=st.session_state.get(f"status_filename_{ancillary_platform}", "Ancillary Revenue Report.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"status_download_{ancillary_platform}",
+                use_container_width=True,
+            )
+
+
+            if st.button(
+                "Save Built Months to Existing Drive Report",
+                key=f"status_drive_save_{ancillary_platform}",
+                type="primary",
+                use_container_width=True,
+            ):
+                try:
+                    svc = get_drive_service()
+                    discovered = dict(get_hotels_from_drive())
+                    target_name = str(status_property or "").strip()
+                    target_norm = _ancillary_normalize_drive_name(target_name)
+
+                    # First prefer an exact normalized property label; then allow
+                    # one unambiguous contains-match so a new Marriott property or
+                    # Margaritaville can work without being hard-coded in a profile.
+                    exact = [
+                        (name, hid)
+                        for name, hid in discovered.items()
+                        if _ancillary_normalize_drive_name(name) == target_norm
+                    ]
+                    contains = [
+                        (name, hid)
+                        for name, hid in discovered.items()
+                        if target_norm
+                        and (
+                            target_norm in _ancillary_normalize_drive_name(name)
+                            or _ancillary_normalize_drive_name(name) in target_norm
+                        )
+                    ]
+
+                    match = exact[0] if len(exact) == 1 else None
+                    if match is None and len(contains) == 1:
+                        match = contains[0]
+                    if match is None and is_margaritaville:
+                        marg = [
+                            (name, hid)
+                            for name, hid in discovered.items()
+                            if "MARGARITAVILLE" in _ancillary_normalize_drive_name(name)
+                        ]
+                        if len(marg) == 1:
+                            match = marg[0]
+
+                    if match is None:
+                        raise ValueError(
+                            f"Could not uniquely match {target_name} to a Drive hotel folder. "
+                            "Download the workbook for now, or use the property name exactly as it appears in Drive."
+                        )
+
+                    drive_label, hotel_id = match
+                    reference_month = datetime.datetime(
+                        max(status_months).year,
+                        max(status_months).month,
+                        1,
+                    )
+                    target, target_err = ancillary_find_drive_report(
+                        svc,
+                        hotel_id,
+                        drive_label,
+                        reference_month,
+                    )
+                    if target_err or not target:
+                        raise ValueError(target_err or "Ancillary Drive report not found.")
+
+                    original_bytes = drive_download(svc, target["file_id"])
+                    merged_bytes, inserted_tabs = ancillary_status_merge_month_sheets(
+                        original_bytes,
+                        st.session_state[output_key],
+                        destination_name=target["file_name"],
+                    )
+
+                    undo_key = f"status_drive_undo_{ancillary_platform}"
+                    st.session_state[undo_key] = {
+                        "file_id": target["file_id"],
+                        "file_name": target["file_name"],
+                        "bytes": original_bytes,
+                    }
+                    drive_upload(
+                        svc,
+                        target["file_id"],
+                        merged_bytes,
+                        target["file_name"],
+                    )
+                    st.success(
+                        f"Updated **{target['file_name']}** in **{target['folder_name']}** "
+                        f"with {', '.join(inserted_tabs)}."
+                    )
+                except Exception as e:
+                    st.error(f"Could not save the multi-month ancillary report to Drive: {e}")
+
+            status_undo_key = f"status_drive_undo_{ancillary_platform}"
+            if st.session_state.get(status_undo_key):
+                if st.button(
+                    "↩ Undo Last Multi-Month Ancillary Drive Save",
+                    key=f"status_drive_undo_btn_{ancillary_platform}",
+                ):
+                    try:
+                        undo = st.session_state[status_undo_key]
+                        drive_upload(
+                            get_drive_service(),
+                            undo["file_id"],
+                            undo["bytes"],
+                            undo["file_name"],
+                        )
+                        st.session_state.pop(status_undo_key, None)
+                        st.success("Restored the ancillary workbook to its previous version.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not undo the multi-month ancillary Drive save: {e}")
 
         with tab_ooo:
             st.caption(
