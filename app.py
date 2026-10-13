@@ -14714,6 +14714,93 @@ def _ar_rows_to_csv_upload(rows, filename):
     return out
 
 
+def _ar_grouped_snt_wide_addon_month(rows, report_month):
+    """Extract one month from SNT's wide Add-On Production export.
+
+    Real SNT grouped Add-On Production files use one summary table covering a
+    date range. The third row contains repeating daily column pairs:
+
+        blank | Total Count | Total Revenue | Average revenue |
+        2026-07-01 | blank | 2026-07-02 | blank | ...
+
+    For each daily pair, the dated column is that day's count and the following
+    blank-header column is that day's revenue. This helper sums only the daily
+    pairs belonging to report_month and rebuilds the normal four-column monthly
+    summary consumed by ancillary_parse_addon().
+    """
+    if not rows:
+        return None
+
+    target = (report_month.year, report_month.month)
+    header_idx = None
+    date_pairs = []
+
+    # Find the wide summary header. Do not assume it is always row 3.
+    for i, row in enumerate(rows[:20]):
+        norm = [_ar_norm(v) for v in row]
+        if len(norm) < 5:
+            continue
+        if "total count" not in norm or "total revenue" not in norm:
+            continue
+
+        pairs = []
+        for c in range(4, len(row)):
+            d = _ar_date(row[c])
+            if d and (d.year, d.month) == target:
+                # In SNT Add-On Production, the dated column is Count and the
+                # immediately following column is Revenue.
+                pairs.append((c, c + 1))
+        if pairs:
+            header_idx = i
+            date_pairs = pairs
+            break
+
+    if header_idx is None or not date_pairs:
+        return None
+
+    summary_rows = [["", "Total Count", "Total Revenue", "Average revenue"]]
+
+    for row in rows[header_idx + 1:]:
+        name = str(row[0] or "").strip() if row else ""
+        if not name:
+            continue
+
+        # Skip any trailing report metadata / totals that are not add-on names.
+        if _ar_norm(name) in {"total", "totals", "date range"}:
+            continue
+
+        count = 0.0
+        revenue = 0.0
+        saw_numeric = False
+
+        for count_c, revenue_c in date_pairs:
+            if count_c < len(row):
+                v = _ar_num(row[count_c])
+                if v is not None:
+                    count += v
+                    saw_numeric = True
+            if revenue_c < len(row):
+                v = _ar_num(row[revenue_c])
+                if v is not None:
+                    revenue += v
+                    saw_numeric = True
+
+        if not saw_numeric:
+            continue
+
+        # Keep zero-revenue rows when there is a count because the existing
+        # parser/report can still use the production count.
+        if abs(count) < 1e-12 and abs(revenue) < 1e-12:
+            continue
+
+        average = revenue / count if count else 0.0
+        summary_rows.append([name, count, revenue, average])
+
+    if len(summary_rows) == 1:
+        return None
+    return summary_rows
+
+
 def ancillary_prepare_grouped_snt_month(uploaded_file, report_month, kind):
     """Extract one month from a grouped SNT Add-On Production or Upsell file.
 
@@ -14745,6 +14832,18 @@ def ancillary_prepare_grouped_snt_month(uploaded_file, report_month, kind):
                 rows,
                 f"{report_month:%Y-%m}_{kind}.csv",
             )
+
+    # SNT Add-On Production has a portfolio-specific grouped shape: one wide
+    # summary table with daily Count/Revenue column pairs. Split those daily
+    # columns into a normal monthly summary before trying transaction-table logic.
+    if kind == "addon":
+        for title, rows in sheets:
+            monthly_rows = _ar_grouped_snt_wide_addon_month(rows, report_month)
+            if monthly_rows:
+                return _ar_rows_to_csv_upload(
+                    monthly_rows,
+                    f"{report_month:%Y-%m}_addon.csv",
+                )
 
     # Otherwise locate a dated table and filter it to the requested month.
     for title, rows in sheets:
@@ -14824,8 +14923,8 @@ def ancillary_prepare_grouped_snt_month(uploaded_file, report_month, kind):
     raise ValueError(
         f"Could not find {report_month:%B %Y} inside the grouped SNT "
         f"{'Add On Production' if kind == 'addon' else 'Upsell By Day/User'} file. "
-        "The grouped export needs either a recognizable date column, a month-named "
-        "worksheet, or month-labelled sections."
+        "The grouped export needs either SNT daily date columns, a recognizable "
+        "date column, a month-named worksheet, or month-labelled sections."
     )
 
 def ancillary_build_snt_multi_month_report(
