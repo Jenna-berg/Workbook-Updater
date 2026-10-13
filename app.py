@@ -2019,38 +2019,57 @@ def rob_month_blocks(ws):
     return out
 
 
-def rob_week_status(wb, sheet_names):
+def rob_week_status(wb, sheet_names, next_year=False):
     """[(sheet_name, reason_or_None), ...] — why each week tab was passed over.
-    Purely diagnostic; drives the 'why did it skip a week' caption in the UI.
+
+    Normal ROBs determine usage from the current month's Revenue / Room Nights
+    block. Next-year ROBs cannot use that test because the same calendar month
+    in the tracked year may intentionally sit outside the rolling 12-month
+    horizon (for example, an OCT2026 report tracks through SEP2027, so OCT2027
+    is intentionally blank).
+
+    For a next-year ROB, E4 is the weekly as-of marker. Setup leaves it blank;
+    the weekly update writes the report date there.
     """
     month = datetime.date.today().month
     out = []
+
     for name in sheet_names:
         ws = wb[name]
+
+        if next_year:
+            as_of = _rob_valid_date(ws.cell(4, 5).value)
+            if as_of is not None:
+                out.append((name, f"already used for {as_of:%b %d, %Y}"))
+                continue
+
         block_start = 4 + rob_block_step(ws) * (month - 1)
         out.append((name, _rob_week_taken_reason(ws, block_start)))
+
     return out
 
 
-def first_uncolored_sheet(wb, sheet_names):
-    """Return the first ROB week tab that is neither marked done (our green)
-    nor already holding real data in this month's block.
+def first_uncolored_sheet(wb, sheet_names, next_year=False):
+    """Return the first available ROB week tab.
 
-    Color alone isn't enough in either direction: a master template can carry
-    its own unrelated baked-in tab color on a sheet that's never been touched
-    (so "any color = done" produces false positives), while a real, already-
-    filled week can fail to carry our exact green (so "only our green = done"
-    produces false negatives — confirmed on a real hotel: week one already had
-    this month's Revenue/Room Nights filled in but got silently re-picked and
-    overwritten because its tab color didn't match). Checking actual data in
-    the cells this month's update is about to write closes that gap.
+    Normal ROBs use this month's Revenue / Room Nights block as the completion
+    test. Next-year ROBs use E4 as the primary completion marker because their
+    same-calendar-month tracked-year block may intentionally be outside the
+    rolling horizon and therefore blank.
     """
     month = datetime.date.today().month
+
     for name in sheet_names:
         ws = wb[name]
+
+        # A completed next-year weekly update writes its as-of date to E4.
+        if next_year and _rob_valid_date(ws.cell(4, 5).value) is not None:
+            continue
+
         block_start = 4 + rob_block_step(ws) * (month - 1)
         if _rob_week_taken_reason(ws, block_start) is None:
             return name
+
     return sheet_names[-1]  # fallback: last sheet
 
 
@@ -17605,7 +17624,11 @@ def render_hilton_update(hotels):
                     problems.append(f"{name} — ROB ({file_name}): none of the "
                                     f"week tabs were found.")
                     continue
-                sheet = first_uncolored_sheet(wb, avail)
+                sheet = first_uncolored_sheet(
+                    wb,
+                    avail,
+                    next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                )
                 current_month_total = None
 
                 # Current-month Hilton ROB is automatic: use completed Actuals
@@ -17705,8 +17728,15 @@ def render_hilton_update(hotels):
                         f"${current_month_total['actual_revenue']:,.2f} + "
                         f"${current_month_total['srp_revenue']:,.0f})"
                     )
-                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                          if w and n != sheet]
+                passed = [
+                    f"{n} ({w})"
+                    for n, w in rob_week_status(
+                        wb,
+                        avail,
+                        next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                    )
+                    if w and n != sheet
+                ]
                 if passed:
                     note += "  ·  skipped " + "; ".join(passed)
                 jobs.append({
@@ -18471,7 +18501,11 @@ def render_ihg_update(hotels):
                 if wb_type == "ROB" and created_now:
                     sheet = avail[0]
                 else:
-                    sheet = first_uncolored_sheet(wb, avail)
+                    sheet = first_uncolored_sheet(
+                        wb,
+                        avail,
+                        next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                    )
                 changes = build_ihg_rob_plan(
                     parsed,
                     wb[sheet],
@@ -18482,8 +18516,15 @@ def render_ihg_update(hotels):
                         else parsed["report_date"].year
                     ),
                 )
-                passed = [f"{n} ({w})" for n, w in rob_week_status(wb, avail)
-                          if w and n != sheet]
+                passed = [
+                    f"{n} ({w})"
+                    for n, w in rob_week_status(
+                        wb,
+                        avail,
+                        next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                    )
+                    if w and n != sheet
+                ]
                 note = "  ·  skipped " + "; ".join(passed) if passed else ""
             elif wb_type == "Strategy Report":
                 avail = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
@@ -19868,7 +19909,11 @@ with tab_weekly:
                     sheet = avail[0]
                     auto = sheet
                 else:
-                    auto = first_uncolored_sheet(wb, avail)
+                    auto = first_uncolored_sheet(
+                        wb,
+                        avail,
+                        next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                    )
                     sheet = auto or avail[0]
                 changes  = build_rob_change_plan(
                     df,
@@ -19883,8 +19928,15 @@ with tab_weekly:
                 warnings = []
                 # Say which weeks were passed over and why — a silently skipped
                 # week tab is otherwise invisible until someone spots the gap.
-                _passed = [f"{n} ({why})" for n, why in rob_week_status(wb, avail)
-                           if why and n != sheet]
+                _passed = [
+                    f"{n} ({why})"
+                    for n, why in rob_week_status(
+                        wb,
+                        avail,
+                        next_year=(wb_type == NEXT_YEAR_ROB_TYPE),
+                    )
+                    if why and n != sheet
+                ]
                 if _passed:
                     warnings.append(f"Writing to '{sheet}'. Skipped: " + "; ".join(_passed))
             elif wb_type == "Strategy Report":
