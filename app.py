@@ -4599,6 +4599,15 @@ def get_hotels_from_drive():
                     break
 
             if not canonical:
+                # Margaritaville is not part of the normal Revenue Reports
+                # portfolio selectors, but its ancillary builder still needs a
+                # stable Drive identity for saving generated AREV tabs.
+                if "MARGARITAVILLE" in haystack and "CAPE COD" in haystack:
+                    canonical = "Margaritaville Resort Cape Cod"
+                elif "MARGARITAVILLE" in haystack:
+                    canonical = "Margaritaville Resort Cape Cod"
+
+            if not canonical:
                 continue
 
             grouped.setdefault(canonical, []).append(folder["id"])
@@ -13390,7 +13399,7 @@ def ancillary_render_report(
         "% of your guests that sent a message",
         "Response Rate",
         "Average minutes to respond",
-        "Median minutes to respond",
+        "Engagement Rate",
     ]
     current = [
         _ar_num(messaging.get("msgTotal")) or 0,
@@ -13399,7 +13408,7 @@ def ancillary_render_report(
         messaging.get("msgGuestPct", 0) or 0,
         messaging.get("responseRate", 0) or 0,
         _ar_num(messaging.get("avgResponse")) or 0,
-        _ar_num(messaging.get("medianResponse")) or 0,
+        messaging.get("engagementRate", 0) or 0,
     ]
     prior = [
         _ar_num(messaging.get("stlyMsgTotal")) or 0,
@@ -13408,7 +13417,7 @@ def ancillary_render_report(
         messaging.get("stlyMsgGuestPct", 0) or 0,
         messaging.get("stlyResponseRate", 0) or 0,
         _ar_num(messaging.get("stlyAvgResponse")) or 0,
-        _ar_num(messaging.get("stlyMedianResponse")) or 0,
+        messaging.get("stlyEngagementRate", 0) or 0,
     ]
 
     for i, label in enumerate(labels):
@@ -13424,15 +13433,15 @@ def ancillary_render_report(
     for row in range(25, 27):
         for col in range(14, 17):
             sh.cell(row, col).number_format = "0.0%"
-    for row in range(27, 29):
-        for col in range(14, 17):
-            sh.cell(row, col).number_format = "0.0"
+    for col in range(14, 17):
+        sh.cell(27, col).number_format = "0.0"
+        sh.cell(28, col).number_format = "0.0%"
 
-    for i, (d, rate) in enumerate(engagement[:8], start=31):
-        sh.cell(i, 13).value = d
-        sh.cell(i, 14).value = rate
-        sh.cell(i, 13).number_format = "m/d/yyyy"
-        sh.cell(i, 14).number_format = "0.0%"
+    # Canary now reports one engagement-rate summary for the report period.
+    # The old dated engagement table is intentionally removed.
+    for row in sh["M31:N38"]:
+        for cell in row:
+            cell.value = None
 
     # ============================================================
     # Conditional formatting
@@ -13471,12 +13480,20 @@ def ancillary_render_report(
         CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
     )
     sh.conditional_formatting.add(
-        "P27:P28",
+        "P27:P27",
         CellIsRule(operator="greaterThan", formula=["0"], fill=red_fill),
     )
     sh.conditional_formatting.add(
-        "P27:P28",
+        "P27:P27",
         CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
+    )
+    sh.conditional_formatting.add(
+        "P28:P28",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
+    )
+    sh.conditional_formatting.add(
+        "P28:P28",
+        CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
     )
 
     # ============================================================
@@ -13486,10 +13503,10 @@ def ancillary_render_report(
     # already exist on Report Template, then create the two sentiment charts
     # when the template does not contain them.
     #
-    # This guarantees every generated report opens with all three charts:
+    # This guarantees every generated report opens with the two sentiment charts:
     #   1) Common Guest Conversation Topics — pie
-    #   2) Engagement Rate — line
-    #   3) Recurring Operational Concerns — column/bar
+    #   2) Recurring Operational Concerns — column/bar
+    # Engagement Rate is now a single monthly KPI in the Messaging Overview.
     #
     # The pie/bar charts intentionally point at blank paste-in tables. When the
     # monthly sentiment data is pasted into M:N later, Excel populates them
@@ -13527,12 +13544,9 @@ def ancillary_render_report(
         title_l = title.lower()
 
         if "engagement rate" in title_l:
-            _ar_set_chart_series_range(
-                chart,
-                "'Report'!$M$31:$M$38",
-                "'Report'!$N$31:$N$38",
-            )
-            cloned_titles.add("engagement")
+            # Canary no longer exposes dated engagement-rate points, so do not
+            # carry the obsolete engagement chart into newly generated reports.
+            continue
         elif "common guest" in title_l:
             _ar_set_chart_series_range(
                 chart,
@@ -14219,7 +14233,7 @@ def _ar_status_write_month_sheet(
         "% of your guests that sent a message",
         "Response Rate",
         "Average minutes to respond",
-        "Median minutes to respond",
+        "Engagement Rate",
     ]
     current_msg = [
         _ar_num(messaging.get("msgTotal")) or 0,
@@ -14228,7 +14242,7 @@ def _ar_status_write_month_sheet(
         messaging.get("msgGuestPct", 0) or 0,
         messaging.get("responseRate", 0) or 0,
         _ar_num(messaging.get("avgResponse")) or 0,
-        _ar_num(messaging.get("medianResponse")) or 0,
+        messaging.get("engagementRate", 0) or 0,
     ]
     stly_msg = [
         _ar_num(messaging.get("stlyMsgTotal")) or 0,
@@ -14237,7 +14251,7 @@ def _ar_status_write_month_sheet(
         messaging.get("stlyMsgGuestPct", 0) or 0,
         messaging.get("stlyResponseRate", 0) or 0,
         _ar_num(messaging.get("stlyAvgResponse")) or 0,
-        _ar_num(messaging.get("stlyMedianResponse")) or 0,
+        messaging.get("stlyEngagementRate", 0) or 0,
     ]
     _ar_status_apply_table_style(ws, 21, 13, ["Metric", "Current", "STLY", "YoY"], header=True)
     for i, label in enumerate(labels, start=22):
@@ -14250,16 +14264,12 @@ def _ar_status_write_month_sheet(
     for r in range(25, 27):
         for c in range(14, 17):
             ws.cell(r, c).number_format = "0.0%"
-    for r in range(27, 29):
-        for c in range(14, 17):
-            ws.cell(r, c).number_format = "0.0"
+    for c in range(14, 17):
+        ws.cell(27, c).number_format = "0.0"
+        ws.cell(28, c).number_format = "0.0%"
 
-    _ar_status_apply_table_style(ws, 31, 13, ["Date", "Engagement Rate"], header=True)
-    for i, (d, rate) in enumerate(engagement[:8], start=32):
-        ws.cell(i, 13, d)
-        ws.cell(i, 14, rate)
-        ws.cell(i, 13).number_format = "m/d/yyyy"
-        ws.cell(i, 14).number_format = "0.0%"
+    # No separate engagement-rate history table: Canary now provides one
+    # summary engagement rate for the selected reporting period.
 
     ws.freeze_panes = None
 
@@ -21909,8 +21919,13 @@ with tab_ancillary:
                 avg = st.number_input(
                     "Average Minutes to Respond", value=0.0, key="ar_avg"
                 )
-                med = st.number_input(
-                    "Median Minutes to Respond", value=0.0, key="ar_med"
+                engagement_ui = st.number_input(
+                    "Engagement Rate %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    key="ar_engagement_rate",
                 )
 
             with stly_col:
@@ -21945,10 +21960,13 @@ with tab_ancillary:
                     value=0.0,
                     key="ar_stly_avg",
                 )
-                stly_med = st.number_input(
-                    "STLY Median Minutes to Respond",
+                stly_engagement_ui = st.number_input(
+                    "STLY Engagement Rate %",
+                    min_value=0.0,
+                    max_value=100.0,
                     value=0.0,
-                    key="ar_stly_med",
+                    step=0.1,
+                    key="ar_stly_engagement_rate",
                 )
 
             msg_pct = msg_pct_ui / 100.0
@@ -21956,41 +21974,11 @@ with tab_ancillary:
             stly_pct = stly_pct_ui / 100.0
             stly_resp = stly_resp_ui / 100.0
 
-            engagement_rows = []
-            with st.expander("Engagement Rate points (optional)"):
-                st.caption(
-                    "Add up to eight Canary engagement-rate points for the monthly table."
-                )
-                for i in range(8):
-                    c_date, c_rate = st.columns([2, 1])
-                    with c_date:
-                        e_date = st.date_input(
-                            f"Date {i + 1}",
-                            value=None,
-                            key=f"ar_eng_date_{i}",
-                        )
-                    with c_rate:
-                        e_rate = st.number_input(
-                            f"Rate % {i + 1}",
-                            min_value=0.0,
-                            max_value=100.0,
-                            value=0.0,
-                            step=0.1,
-                            key=f"ar_eng_rate_{i}",
-                        )
-                    if e_date is not None:
-                        engagement_rows.append(
-                            (
-                                datetime.datetime.combine(e_date, datetime.time()),
-                                e_rate / 100.0,
-                            )
-                        )
-
             ar_messaging={
                 'msgTotal':msg_total,'msgGuest':msg_guest,'msgHotel':msg_hotel,'msgGuestPct':msg_pct,
-                'responseRate':resp,'avgResponse':avg,'medianResponse':med,
+                'responseRate':resp,'avgResponse':avg,'engagementRate':engagement_ui / 100.0,
                 'stlyMsgTotal':stly_total,'stlyMsgGuest':stly_guest,'stlyMsgHotel':stly_hotel,
-                'stlyMsgGuestPct':stly_pct,'stlyResponseRate':stly_resp,'stlyAvgResponse':stly_avg,'stlyMedianResponse':stly_med,
+                'stlyMsgGuestPct':stly_pct,'stlyResponseRate':stly_resp,'stlyAvgResponse':stly_avg,'stlyEngagementRate':stly_engagement_ui / 100.0,
             }
 
             required_ok = ar_addon is not None and ar_upsell is not None
@@ -22026,7 +22014,7 @@ with tab_ancillary:
                             journal_values=ar_journal_values,
                             stly_journal_values=ar_stly_journal_values,
                             messaging=ar_messaging,
-                            engagement=engagement_rows,
+                            engagement=[],
                         )
                         st.session_state['ar_monthly_output'] = ar_output
                         st.session_state['ar_monthly_filename'] = (
@@ -22261,7 +22249,7 @@ with tab_ancillary:
         # Messaging values are month-specific. Keeping them beside each month avoids
         # accidentally copying one month's KPI values into every tab in a batch.
         status_messaging_by_month = {}
-        status_engagement_by_month = {}
+        status_engagement_by_month = {}  # retained for backward-compatible builder signature; no dated points are collected
         status_staff_messages_by_month = {}
         with st.expander("Messaging information by month", expanded=False):
             st.caption(
@@ -22280,7 +22268,7 @@ with tab_ancillary:
                     cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_msg_pct_{mkey}_{ancillary_platform}")
                     cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_resp_{mkey}_{ancillary_platform}")
                     cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"status_avg_{mkey}_{ancillary_platform}")
-                    cur_med = st.number_input("Median Minutes to Respond", value=0.0, key=f"status_med_{mkey}_{ancillary_platform}")
+                    cur_engagement = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_engagement_{mkey}_{ancillary_platform}")
                 with mc2:
                     st.markdown(f"**STLY — {month_date.year - 1}**")
                     prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"status_stly_total_{mkey}_{ancillary_platform}")
@@ -22289,7 +22277,7 @@ with tab_ancillary:
                     prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_pct_{mkey}_{ancillary_platform}")
                     prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_resp_{mkey}_{ancillary_platform}")
                     prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"status_stly_avg_{mkey}_{ancillary_platform}")
-                    prev_med = st.number_input("STLY Median Minutes to Respond", value=0.0, key=f"status_stly_med_{mkey}_{ancillary_platform}")
+                    prev_engagement = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_engagement_{mkey}_{ancillary_platform}")
 
                 status_messaging_by_month[mkey] = {
                     "msgTotal": cur_total,
@@ -22298,14 +22286,14 @@ with tab_ancillary:
                     "msgGuestPct": cur_pct / 100.0,
                     "responseRate": cur_resp / 100.0,
                     "avgResponse": cur_avg,
-                    "medianResponse": cur_med,
+                    "engagementRate": cur_engagement / 100.0,
                     "stlyMsgTotal": prev_total,
                     "stlyMsgGuest": prev_guest,
                     "stlyMsgHotel": prev_hotel,
                     "stlyMsgGuestPct": prev_pct / 100.0,
                     "stlyResponseRate": prev_resp / 100.0,
                     "stlyAvgResponse": prev_avg,
-                    "stlyMedianResponse": prev_med,
+                    "stlyEngagementRate": prev_engagement / 100.0,
                 }
 
                 staff_msg_file = st.file_uploader(
@@ -22316,31 +22304,7 @@ with tab_ancillary:
                 if staff_msg_file is not None:
                     status_staff_messages_by_month[mkey] = _ar_status_staff_message_rows(staff_msg_file)
 
-                eng_rows = []
-                # Streamlit does not allow an expander inside another expander.
-                # Messaging information is already inside the outer month-information
-                # expander, so render engagement inputs directly within that section.
-                st.markdown(f"**{month_date.strftime('%b %Y')} Engagement Rate points (optional)**")
-                for i in range(8):
-                    ec1, ec2 = st.columns([2, 1])
-                    with ec1:
-                        ed = st.date_input(
-                            f"Date {i + 1}",
-                            value=None,
-                            key=f"status_eng_date_{mkey}_{i}_{ancillary_platform}",
-                        )
-                    with ec2:
-                        er = st.number_input(
-                            f"Rate % {i + 1}",
-                            min_value=0.0,
-                            max_value=100.0,
-                            value=0.0,
-                            step=0.1,
-                            key=f"status_eng_rate_{mkey}_{i}_{ancillary_platform}",
-                        )
-                    if ed is not None:
-                        eng_rows.append((datetime.datetime.combine(ed, datetime.time()), er / 100.0))
-                status_engagement_by_month[mkey] = eng_rows
+                status_engagement_by_month[mkey] = []
 
         status_ready = bool(status_months) and bool(str(status_property or "").strip()) and status_current_canary is not None and status_stly_canary is not None
         if is_margaritaville:
@@ -22418,6 +22382,8 @@ with tab_ancillary:
                     svc = get_drive_service()
                     discovered = dict(get_hotels_from_drive())
                     target_name = str(status_property or "").strip()
+                    if is_margaritaville:
+                        target_name = "Margaritaville Resort Cape Cod"
                     target_norm = _ancillary_normalize_drive_name(target_name)
 
                     # First prefer an exact normalized property label; then allow
