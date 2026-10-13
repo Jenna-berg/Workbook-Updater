@@ -14590,16 +14590,274 @@ def _ar_status_month_options(count=18):
         cursor = (cursor - datetime.timedelta(days=1)).replace(day=1)
     return out
 
-def ancillary_build_snt_multi_month_report(template_bytes, property_name, month_inputs):
-    """Build several standard SNT/Independent ancillary months in one workbook.
 
-    SNT Add On Production and Upsell exports are month-scoped rather than reliable
-    grouped-history files, so each selected month supplies its own source bundle.
-    The existing one-month parser/renderer remains the source of truth for all
-    property-specific rules, STLY logic, journal adjustments, and formatting.
+
+def _ar_grouped_upload_sheets(uploaded_file):
+    """Return [(sheet_name, rows)] from a grouped CSV/XLSX upload without
+    consuming the Streamlit upload object. Grouped SNT exports may identify
+    months either with a date column or with one worksheet per month.
+    """
+    if uploaded_file is None:
+        return []
+    data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file
+    name = str(getattr(uploaded_file, "name", "") or "").lower()
+    if name.endswith(".csv"):
+        txt = data.decode("utf-8-sig", errors="replace")
+        return [("", list(csv.reader(io.StringIO(txt))))]
+
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append((ws.title, [list(r) for r in ws.iter_rows(values_only=True)]))
+    return out
+
+
+def _ar_month_key_from_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # Worksheet names and report section labels commonly use MAR 2026,
+    # March 2026, 03/2026, or 2026-03.
+    for fmt in ("%b %Y", "%B %Y", "%b-%Y", "%B-%Y", "%m/%Y", "%Y-%m"):
+        try:
+            d = datetime.datetime.strptime(text, fmt)
+            return d.year, d.month
+        except Exception:
+            pass
+    m = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)\s*[-_/ ]\s*(20\d{2})\b",
+        text,
+        flags=re.I,
+    )
+    if m:
+        try:
+            d = datetime.datetime.strptime(f"{m.group(1)[:3]} {m.group(2)}", "%b %Y")
+            return d.year, d.month
+        except Exception:
+            pass
+    m = re.search(r"\b(20\d{2})[-_/](0?[1-9]|1[0-2])\b", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _ar_grouped_find_header(rows, kind):
+    """Find a transaction/header row and its date column in grouped SNT data."""
+    date_names = {
+        "date", "stay date", "arrival date", "posting date", "revenue date",
+        "transaction date", "created date", "creation date", "business date",
+        "check in date", "check-in date", "occupancy date", "service date",
+        "upsell date", "add on date", "add-on date", "addon date",
+        "month", "report month", "stay month", "revenue month", "posting month",
+        "period", "report period",
+    }
+    if kind == "upsell":
+        expected = {"to room type", "total amount", "user", "channel"}
+    else:
+        expected = {
+            "add on name", "add-on name", "addon name", "item", "name",
+            "total revenue", "revenue", "amount", "total amount",
+            "total count", "count", "quantity", "units",
+        }
+
+    best = None
+    for i, row in enumerate(rows[:40]):
+        norm = [_ar_norm(v) for v in row]
+        norm_set = {x for x in norm if x}
+        date_idx = -1
+        for j, v in enumerate(norm):
+            if v in date_names:
+                date_idx = j
+                break
+        if date_idx < 0:
+            # Fallback only for genuine header-looking rows. Avoid report titles
+            # such as "Date Printed" unless other expected fields are present.
+            for j, v in enumerate(norm):
+                if v.endswith(" date") and v not in {"date printed", "print date"}:
+                    date_idx = j
+                    break
+        score = len(norm_set & expected)
+        if date_idx >= 0 and score and (best is None or score > best[0]):
+            best = (score, i, date_idx, norm)
+    if best:
+        return best[1], best[2], best[3]
+    return None
+
+
+def _ar_grouped_month_section(rows, report_month):
+    """Fallback for exports that stack month-labelled report sections."""
+    target = (report_month.year, report_month.month)
+    starts = []
+    for i, row in enumerate(rows):
+        # Month labels in these exports are normally single-cell titles; joining
+        # a few cells also catches "Report Period: May 2026".
+        label = " ".join(str(v or "").strip() for v in row[:4] if str(v or "").strip())
+        key = _ar_month_key_from_text(label)
+        if key:
+            starts.append((i, key))
+    for pos, (start, key) in enumerate(starts):
+        if key != target:
+            continue
+        end = starts[pos + 1][0] if pos + 1 < len(starts) else len(rows)
+        return rows[start + 1:end]
+    return None
+
+
+def _ar_rows_to_csv_upload(rows, filename):
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerows(rows)
+    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    out.name = filename
+    return out
+
+
+def ancillary_prepare_grouped_snt_month(uploaded_file, report_month, kind):
+    """Extract one month from a grouped SNT Add-On Production or Upsell file.
+
+    Supported grouped layouts:
+      1) one worksheet per month,
+      2) one transaction table with a recognizable date column,
+      3) one file with repeated month-labelled sections.
+
+    The result is converted to a small CSV upload so the established SNT
+    property-specific parsers and report renderer remain unchanged.
+    """
+    if uploaded_file is None:
+        return None
+    if kind not in ("addon", "upsell"):
+        raise ValueError(f"Unsupported grouped SNT source kind: {kind}")
+
+    target = (report_month.year, report_month.month)
+    sheets = _ar_grouped_upload_sheets(uploaded_file)
+    if not sheets:
+        raise ValueError("Grouped SNT source file is empty.")
+
+    # Best case: workbook sheet title identifies the month. This also supports
+    # the classic SNT monthly summary layout used by ancillary_parse_addon().
+    for title, rows in sheets:
+        if _ar_month_key_from_text(title) == target:
+            if not rows:
+                break
+            return _ar_rows_to_csv_upload(
+                rows,
+                f"{report_month:%Y-%m}_{kind}.csv",
+            )
+
+    # Otherwise locate a dated table and filter it to the requested month.
+    for title, rows in sheets:
+        found = _ar_grouped_find_header(rows, kind)
+        if not found:
+            continue
+        header_idx, date_idx, norm_header = found
+        header = rows[header_idx]
+        matches = []
+        for row in rows[header_idx + 1:]:
+            raw_date = row[date_idx] if date_idx < len(row) else None
+            d = _ar_date(raw_date)
+            period_key = (d.year, d.month) if d else _ar_month_key_from_text(raw_date)
+            if period_key == target:
+                matches.append(row)
+        if not matches:
+            continue
+
+        if kind == "upsell":
+            return _ar_rows_to_csv_upload(
+                [header] + matches,
+                f"{report_month:%Y-%m}_upsell.csv",
+            )
+
+        # Transaction-level Add-On Production exports need to be reduced to the
+        # four-column monthly summary shape the existing parser consumes.
+        name_candidates = {
+            "add on name", "add-on name", "addon name", "item", "item name",
+            "add on", "add-on", "addon", "name", "description",
+        }
+        count_candidates = {"total count", "count", "quantity", "qty", "units"}
+        revenue_candidates = {
+            "total revenue", "revenue", "amount", "total amount", "revenue amount",
+            "add on revenue", "add-on revenue", "addon revenue",
+        }
+        name_idx = next((i for i, v in enumerate(norm_header) if v in name_candidates), -1)
+        count_idx = next((i for i, v in enumerate(norm_header) if v in count_candidates), -1)
+        revenue_idx = next((i for i, v in enumerate(norm_header) if v in revenue_candidates), -1)
+        if name_idx < 0 or revenue_idx < 0:
+            raise ValueError(
+                f"Could not identify Add-On Name and Revenue columns in the grouped SNT "
+                f"Add On Production file for {report_month:%B %Y}."
+            )
+
+        agg = collections.OrderedDict()
+        for row in matches:
+            name = str(row[name_idx] or "").strip() if name_idx < len(row) else ""
+            if not name:
+                continue
+            count = _ar_num(row[count_idx]) if count_idx >= 0 and count_idx < len(row) else 1.0
+            revenue = _ar_num(row[revenue_idx]) if revenue_idx < len(row) else 0.0
+            count = 1.0 if count is None else count
+            revenue = 0.0 if revenue is None else revenue
+            key = _ar_norm(name)
+            item = agg.setdefault(key, {"name": name, "count": 0.0, "revenue": 0.0})
+            item["count"] += count
+            item["revenue"] += revenue
+
+        summary_rows = [["", "Total Count", "Total Revenue", "Average Revenue"]]
+        for item in agg.values():
+            avg = item["revenue"] / item["count"] if item["count"] else 0.0
+            summary_rows.append([item["name"], item["count"], item["revenue"], avg])
+        return _ar_rows_to_csv_upload(
+            summary_rows,
+            f"{report_month:%Y-%m}_addon.csv",
+        )
+
+    # Last supported shape: repeated month-labelled sections in one file.
+    for title, rows in sheets:
+        section = _ar_grouped_month_section(rows, report_month)
+        if section:
+            return _ar_rows_to_csv_upload(
+                section,
+                f"{report_month:%Y-%m}_{kind}.csv",
+            )
+
+    raise ValueError(
+        f"Could not find {report_month:%B %Y} inside the grouped SNT "
+        f"{'Add On Production' if kind == 'addon' else 'Upsell By Day/User'} file. "
+        "The grouped export needs either a recognizable date column, a month-named "
+        "worksheet, or month-labelled sections."
+    )
+
+def ancillary_build_snt_multi_month_report(
+    template_bytes,
+    property_name,
+    month_inputs,
+    current_addon_file,
+    current_upsell_file,
+    stly_addon_file=None,
+    stly_upsell_file=None,
+    canary_history_file=None,
+):
+    """Build several standard SNT/Independent ancillary months from grouped files.
+
+    Current-year SNT uses one Add On Production file + one Upsell By Day/User file
+    containing every selected month. If the property uses SNT for STLY, one grouped
+    prior-year Add On file + one grouped prior-year Upsell file are split the same
+    way. If the property uses Canary for STLY, the existing Canary parser filters
+    the one grouped historical export by Arrival Date for each matching month.
     """
     if not month_inputs:
         raise ValueError("Select at least one month to build.")
+    if current_addon_file is None or current_upsell_file is None:
+        raise ValueError("Upload the grouped current-year SNT Add On Production and Upsell files.")
+
+    profile, _ = ancillary_profile(property_name)
+    uses_snt_stly = profile.get("stlySource") == "SNT"
+    if uses_snt_stly:
+        if stly_addon_file is None or stly_upsell_file is None:
+            raise ValueError("This property uses SNT for STLY. Upload the grouped STLY Add On Production and Upsell files.")
+    elif canary_history_file is None:
+        raise ValueError("This property uses Canary for STLY. Upload the grouped historical Canary upsell export.")
 
     combined_bytes = template_bytes
     summaries = []
@@ -14607,15 +14865,36 @@ def ancillary_build_snt_multi_month_report(template_bytes, property_name, month_
 
     for bundle in sorted(month_inputs, key=lambda x: x["report_month"]):
         report_month = bundle["report_month"]
+        current_addon_month = ancillary_prepare_grouped_snt_month(
+            current_addon_file, report_month, "addon"
+        )
+        current_upsell_month = ancillary_prepare_grouped_snt_month(
+            current_upsell_file, report_month, "upsell"
+        )
+
+        stly_month = report_month.replace(year=report_month.year - 1)
+        if uses_snt_stly:
+            stly_addon_month = ancillary_prepare_grouped_snt_month(
+                stly_addon_file, stly_month, "addon"
+            )
+            stly_upsell_month = ancillary_prepare_grouped_snt_month(
+                stly_upsell_file, stly_month, "upsell"
+            )
+            month_canary_history = None
+        else:
+            stly_addon_month = None
+            stly_upsell_month = None
+            month_canary_history = canary_history_file
+
         generated, summary = ancillary_build_monthly_report(
             template_bytes=template_bytes,
             property_name=property_name,
             report_month=report_month,
-            addon_file=bundle.get("addon_file"),
-            upsell_file=bundle.get("upsell_file"),
-            stly_addon_file=bundle.get("stly_addon_file"),
-            stly_upsell_file=bundle.get("stly_upsell_file"),
-            canary_history_file=bundle.get("canary_history_file"),
+            addon_file=current_addon_month,
+            upsell_file=current_upsell_month,
+            stly_addon_file=stly_addon_month,
+            stly_upsell_file=stly_upsell_month,
+            canary_history_file=month_canary_history,
             staff_file=bundle.get("staff_file"),
             journal_values=bundle.get("journal_values") or [],
             stly_journal_values=bundle.get("stly_journal_values") or [],
@@ -14623,9 +14902,7 @@ def ancillary_build_snt_multi_month_report(template_bytes, property_name, month_
             engagement=[],
         )
         combined_bytes, sheet_name = ancillary_insert_report_sheet(
-            combined_bytes,
-            generated,
-            report_month,
+            combined_bytes, generated, report_month
         )
         summaries.append({
             "month": report_month,
@@ -22043,9 +22320,10 @@ with tab_ancillary:
         if ar_key != "hotel 1620":
             st.markdown("### Multi-Month SNT / Independent Report Builder")
             st.caption(
-                "Select as many months as you need. SNT exports are uploaded separately "
-                "for each month so the existing hotel-specific parsing and journal rules "
-                "remain unchanged. One build creates every selected month tab."
+                "Select as many months as you need. Upload one grouped current-year "
+                "Add On Production file and one grouped Upsell By Day/User file covering "
+                "all selected months. STLY automatically follows this property's configured "
+                "source: grouped SNT files or one grouped Canary export."
             )
 
             ar_month_options = _ar_status_month_options(18)
@@ -22074,8 +22352,53 @@ with tab_ancillary:
                     key="ar_snt_multi_template_upload",
                 )
 
+            st.markdown("**Current-year grouped SNT source**")
+            gcur1, gcur2 = st.columns(2)
+            with gcur1:
+                ar_grouped_addon = st.file_uploader(
+                    "SNT Add On Production — all selected months",
+                    type=["csv", "xlsx"],
+                    key=f"ar_grouped_addon_{ar_key}",
+                    help="Upload one file containing every current-year month selected above.",
+                )
+            with gcur2:
+                ar_grouped_upsell = st.file_uploader(
+                    "SNT Upsell By Day/User — all selected months",
+                    type=["csv", "xlsx"],
+                    key=f"ar_grouped_upsell_{ar_key}",
+                    help="Upload one file containing every current-year month selected above.",
+                )
+
+            ar_grouped_stly_addon = ar_grouped_stly_upsell = ar_grouped_canary_history = None
+            st.markdown(f"**STLY grouped source — {ar_profile.get('stlySource')}**")
+            if ar_profile.get('stlySource') == 'SNT':
+                gstly1, gstly2 = st.columns(2)
+                with gstly1:
+                    ar_grouped_stly_addon = st.file_uploader(
+                        "STLY SNT Add On Production — all matching prior-year months",
+                        type=["csv", "xlsx"],
+                        key=f"ar_grouped_stly_addon_{ar_key}",
+                    )
+                with gstly2:
+                    ar_grouped_stly_upsell = st.file_uploader(
+                        "STLY SNT Upsell By Day/User — all matching prior-year months",
+                        type=["csv", "xlsx"],
+                        key=f"ar_grouped_stly_upsell_{ar_key}",
+                    )
+            else:
+                ar_grouped_canary_history = st.file_uploader(
+                    "Historical Canary Upsells — all matching prior-year months",
+                    type=["csv", "xlsx"],
+                    key=f"ar_grouped_canary_history_{ar_key}",
+                    help="One Canary export can contain all matching STLY months; Arrival Date is used to split them.",
+                )
+
             ar_month_bundles = []
-            ar_all_required = bool(ar_months)
+            ar_all_required = bool(ar_months) and ar_grouped_addon is not None and ar_grouped_upsell is not None
+            if ar_profile.get('stlySource') == 'SNT':
+                ar_all_required = ar_all_required and ar_grouped_stly_addon is not None and ar_grouped_stly_upsell is not None
+            else:
+                ar_all_required = ar_all_required and ar_grouped_canary_history is not None
 
             for month_date in ar_months:
                 ar_month_dt = datetime.datetime(month_date.year, month_date.month, 1)
@@ -22084,41 +22407,10 @@ with tab_ancillary:
 
                 with st.container(border=True):
                     st.markdown(f"#### {ar_month_dt.strftime('%B %Y')}")
-                    src_cur, src_stly = st.columns(2)
-
-                    with src_cur:
-                        st.markdown("**Current-year SNT source**")
-                        ar_addon = st.file_uploader(
-                            f"{ar_month_dt.strftime('%b %Y')} SNT Add On Production",
-                            type=["csv", "xlsx"],
-                            key=f"ar_multi_addon_{ar_key}_{mkey}",
-                        )
-                        ar_upsell = st.file_uploader(
-                            f"{ar_month_dt.strftime('%b %Y')} SNT Upsell By Day/User",
-                            type=["csv", "xlsx"],
-                            key=f"ar_multi_upsell_{ar_key}_{mkey}",
-                        )
-
-                    ar_stly_addon = ar_stly_upsell = ar_canary_history = None
-                    with src_stly:
-                        st.markdown(f"**STLY source — {ar_profile.get('stlySource')}**")
-                        if ar_profile.get('stlySource') == 'SNT':
-                            ar_stly_addon = st.file_uploader(
-                                f"{ar_month_dt.strftime('%b')} {stly_year} SNT Add On Production",
-                                type=["csv", "xlsx"],
-                                key=f"ar_multi_stly_addon_{ar_key}_{mkey}",
-                            )
-                            ar_stly_upsell = st.file_uploader(
-                                f"{ar_month_dt.strftime('%b')} {stly_year} SNT Upsell By Day/User",
-                                type=["csv", "xlsx"],
-                                key=f"ar_multi_stly_upsell_{ar_key}_{mkey}",
-                            )
-                        else:
-                            ar_canary_history = st.file_uploader(
-                                f"{ar_month_dt.strftime('%b')} {stly_year} Historical Canary Upsells",
-                                type=["csv", "xlsx"],
-                                key=f"ar_multi_canary_history_{ar_key}_{mkey}",
-                            )
+                    st.caption(
+                        "Revenue source files are shared above. Enter only this month's "
+                        "journal and messaging information here."
+                    )
 
                     ar_staff = st.file_uploader(
                         f"{ar_month_dt.strftime('%b %Y')} Canary Message Count by Staff (optional)",
@@ -22199,20 +22491,8 @@ with tab_ancillary:
                         'stlyEngagementRate': stly_engagement_ui / 100.0,
                     }
 
-                    month_required = ar_addon is not None and ar_upsell is not None
-                    if ar_profile.get('stlySource') == 'SNT':
-                        month_required = month_required and ar_stly_addon is not None and ar_stly_upsell is not None
-                    else:
-                        month_required = month_required and ar_canary_history is not None
-                    ar_all_required = ar_all_required and month_required
-
                     ar_month_bundles.append({
                         "report_month": ar_month_dt,
-                        "addon_file": ar_addon,
-                        "upsell_file": ar_upsell,
-                        "stly_addon_file": ar_stly_addon,
-                        "stly_upsell_file": ar_stly_upsell,
-                        "canary_history_file": ar_canary_history,
                         "staff_file": ar_staff,
                         "journal_values": ar_journal_values,
                         "stly_journal_values": ar_stly_journal_values,
@@ -22233,6 +22513,11 @@ with tab_ancillary:
                             template_bytes=template_bytes,
                             property_name=ar_property,
                             month_inputs=ar_month_bundles,
+                            current_addon_file=ar_grouped_addon,
+                            current_upsell_file=ar_grouped_upsell,
+                            stly_addon_file=ar_grouped_stly_addon,
+                            stly_upsell_file=ar_grouped_stly_upsell,
+                            canary_history_file=ar_grouped_canary_history,
                         )
                         years = sorted({m.year for m in ar_months})
                         year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
