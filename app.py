@@ -14024,25 +14024,142 @@ def ancillary_status_variance(current_rows, stly_rows, property_name=""):
     return out
 
 
-def _ar_status_apply_table_style(ws, row, start_col, values, header=False, total=False):
-    dark = "1C4587"
-    light = "D9EAF7"
-    stly_fill = "FFF2CC"
-    thin = Side(style="thin", color="B7B7B7")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for offset, value in enumerate(values):
-        cell = ws.cell(row, start_col + offset, value)
-        cell.border = border
-        if header:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor=dark)
-            cell.alignment = Alignment(horizontal="center")
-        elif total:
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill("solid", fgColor=light)
-        else:
-            cell.fill = PatternFill("solid", fgColor="EFEFEF")
-    return row
+def _ar_status_arev_styles():
+    """Shared visual standard used by the completed AREV workbooks.
+
+    These colors/number formats are taken from the completed Margaritaville
+    FEB-APR workbook so the status-based Margaritaville / Marriott / IHG
+    builder visually matches the rest of the AREV reporting outputs.
+    """
+    return {
+        "header_blue": "1155CC",
+        "canary_blue": "1C4587",
+        "oaky_blue": "3C78D8",
+        "section_red": "980000",
+        "metric_gray": "F3F3F3",
+        "unavailable_gray": "CCCCCC",
+        "positive_green": "B6D7A8",
+        "negative_red": "EA9999",
+        "approval_pink": "D5A6BD",
+        "white": "FFFFFF",
+        "black": "000000",
+        "currency": '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);_("$"* "-"??_);_(@_)',
+    }
+
+
+def _ar_status_arev_font(*, bold=False, white=False, size=11, name="Calibri"):
+    s = _ar_status_arev_styles()
+    return Font(
+        name=name,
+        size=size,
+        bold=bold,
+        color=s["white"] if white else s["black"],
+    )
+
+
+def _ar_status_fill(color):
+    return PatternFill(fill_type="solid", fgColor=color)
+
+
+def _ar_status_style_header_cell(cell, *, number_format=None):
+    s = _ar_status_arev_styles()
+    cell.fill = _ar_status_fill(s["header_blue"])
+    cell.font = _ar_status_arev_font(bold=True, white=True)
+    cell.alignment = Alignment(horizontal="center", vertical="bottom")
+    cell.border = Border()
+    if number_format:
+        cell.number_format = number_format
+
+
+def _ar_status_style_name_cell(cell, source="CANARY"):
+    s = _ar_status_arev_styles()
+    fill = s["oaky_blue"] if str(source or "").upper() == "OAKY" else s["canary_blue"]
+    cell.fill = _ar_status_fill(fill)
+    cell.font = _ar_status_arev_font(bold=True, white=True)
+    cell.alignment = Alignment(horizontal="center")
+    cell.border = Border()
+
+
+def _ar_status_style_metric_cell(cell, unavailable=False):
+    s = _ar_status_arev_styles()
+    cell.fill = _ar_status_fill(s["unavailable_gray"] if unavailable else s["metric_gray"])
+    cell.font = _ar_status_arev_font()
+    cell.alignment = Alignment(horizontal="right")
+    cell.border = Border()
+    cell.number_format = s["currency"]
+
+
+def _ar_status_write_status_row(ws, row, item, *, variance=False):
+    """Write one A:E row in the established AREV style."""
+    source = item.get("source", "CANARY")
+    ws.cell(row, 1, item.get("name"))
+    _ar_status_style_name_cell(ws.cell(row, 1), source=source)
+
+    fields = ("requested", "approved", "expired", "denied")
+    for col, field in enumerate(fields, start=2):
+        raw = item.get(field)
+        unavailable = raw is None and not variance
+        ws.cell(row, col, "" if unavailable else (_ar_num(raw) or 0))
+        _ar_status_style_metric_cell(ws.cell(row, col), unavailable=unavailable)
+
+
+def _ar_status_write_table_header(ws, row):
+    s = _ar_status_arev_styles()
+    for col, value in enumerate(CANARY_STATUS_HEADERS, start=1):
+        cell = ws.cell(row, col, value)
+        _ar_status_style_header_cell(
+            cell,
+            number_format=s["currency"] if col > 1 else None,
+        )
+
+
+def _ar_status_write_total_row(ws, row, totals):
+    ws.cell(row, 1, "TOTALS")
+    _ar_status_style_name_cell(ws.cell(row, 1), source="CANARY")
+    for col, field in enumerate(("requested", "approved", "expired", "denied"), start=2):
+        ws.cell(row, col, _ar_num(totals.get(field)) or 0)
+        _ar_status_style_metric_cell(ws.cell(row, col), unavailable=False)
+
+
+def _ar_status_write_section_band(ws, row, label):
+    s = _ar_status_arev_styles()
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    cell = ws.cell(row, 1, label)
+    cell.fill = _ar_status_fill(s["section_red"])
+    cell.font = _ar_status_arev_font(bold=True, white=True)
+    cell.alignment = Alignment(horizontal="center")
+    cell.border = Border()
+    for col in range(2, 6):
+        ws.cell(row, col).fill = _ar_status_fill(s["section_red"])
+
+
+def _ar_status_write_approval_rate(ws, label_row, total_row, totals):
+    s = _ar_status_arev_styles()
+    label = ws.cell(label_row, 6, "Approval Rate")
+    label.fill = _ar_status_fill(s["approval_pink"])
+    label.font = _ar_status_arev_font(bold=True, name="Arial")
+    label.alignment = Alignment(horizontal="center")
+    label.border = Border()
+
+    value = ws.cell(
+        total_row,
+        6,
+        ((_ar_num(totals.get("approved")) or 0) / (_ar_num(totals.get("requested")) or 0))
+        if (_ar_num(totals.get("requested")) or 0)
+        else 0,
+    )
+    value.fill = _ar_status_fill(s["approval_pink"])
+    value.font = _ar_status_arev_font(bold=True, name="Arial")
+    value.alignment = Alignment(horizontal="center")
+    value.number_format = "0.0%"
+    value.border = Border()
+
+
+def _ar_status_short_property_name(property_name):
+    n = _ar_norm(property_name)
+    if "margaritaville" in n:
+        return "Margaritaville"
+    return str(property_name or "").strip()
 
 
 def _ar_status_write_month_sheet(
@@ -14056,175 +14173,217 @@ def _ar_status_write_month_sheet(
     engagement=None,
     staff_messages=None,
 ):
-    """Write one completed status-based ancillary month tab."""
+    """Write one completed status-based ancillary month tab.
+
+    The layout mirrors the completed Margaritaville AREV workbook and is the
+    shared visual standard for status-based Margaritaville / Marriott / IHG
+    outputs.
+    """
+    from openpyxl.formatting.rule import CellIsRule
+
     messaging = messaging or {}
-    engagement = engagement or []
     staff_messages = staff_messages or []
+    styles = _ar_status_arev_styles()
 
     sheet_name = report_month.strftime("%b").upper()
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
     ws = wb.create_sheet(sheet_name)
     ws.sheet_view.showGridLines = False
+    ws.sheet_format.defaultColWidth = 12.63
+    ws.sheet_format.defaultRowHeight = 15.75
 
-    dark = "1C4587"
-    green = "B6D7A8"
-    red = "EA9999"
-    gray = "EFEFEF"
-    stly_fill = "FFF2CC"
-    white = "FFFFFF"
-
-    # Sizing mirrors the established report's three-column-zone layout.
-    widths = {"A": 34, "B": 18, "C": 18, "D": 18, "E": 18, "F": 15,
-              "G": 4, "H": 26, "I": 22, "J": 22, "K": 4, "L": 4,
-              "M": 35, "N": 18, "O": 18, "P": 18}
+    # Exact column proportions from the completed Margaritaville workbook.
+    widths = {
+        "A": 41.38,
+        "B": 18.25,
+        "C": 17.63,
+        "D": 15.88,
+        "E": 15.63,
+        "H": 18.38,
+        "I": 22.75,
+        "J": 20.75,
+        "N": 34.0,
+        "O": 28.38,
+        "P": 28.38,
+        "Q": 28.38,
+    }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
-    ws.merge_cells("A1:E1")
-    ws["A1"] = f"{property_name} Upsell Overview - {report_month.strftime('%B')}"
-    ws["A1"].fill = PatternFill("solid", fgColor=dark)
-    ws["A1"].font = Font(size=16, bold=True, color=white)
-    ws["A1"].alignment = Alignment(horizontal="center")
-    for c in range(1, 6):
-        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
-    ws["A2"] = report_month.year
-    ws["A2"].font = Font(bold=True)
+    short_prop = _ar_status_short_property_name(property_name)
 
-    _ar_status_apply_table_style(ws, 3, 1, CANARY_STATUS_HEADERS, header=True)
+    # ── Current-year title + year bands ────────────────────────────────────
+    ws.merge_cells("A1:E1")
+    ws["A1"] = f"{short_prop} Upsell Overview - {report_month.strftime('%B')}"
+    for col in range(1, 6):
+        cell = ws.cell(1, col)
+        cell.fill = _ar_status_fill(styles["header_blue"])
+    ws["A1"].font = _ar_status_arev_font(bold=True, white=True)
+    ws["A1"].alignment = Alignment(horizontal="center")
+
+    ws.merge_cells("A2:E2")
+    ws["A2"] = report_month.year
+    for col in range(1, 6):
+        ws.cell(2, col).fill = _ar_status_fill(styles["section_red"])
+    ws["A2"].font = _ar_status_arev_font(bold=True, white=True)
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    _ar_status_write_table_header(ws, 3)
     row = 4
-    for x in current["rows"]:
-        vals = [
-            x.get("name"),
-            _ar_num(x.get("requested")) or 0,
-            _ar_num(x.get("approved")) or 0,
-            "" if x.get("expired") is None else (_ar_num(x.get("expired")) or 0),
-            "" if x.get("denied") is None else (_ar_num(x.get("denied")) or 0),
-        ]
-        _ar_status_apply_table_style(ws, row, 1, vals)
+    for item in current["rows"]:
+        _ar_status_write_status_row(ws, row, item)
         row += 1
 
     current_total_row = row
-    t = current["totals"]
-    _ar_status_apply_table_style(
+    _ar_status_write_total_row(ws, current_total_row, current["totals"])
+    # Established reports place the label beside the final detail row and the
+    # percentage beside TOTALS.
+    _ar_status_write_approval_rate(
         ws,
-        row,
-        1,
-        ["TOTALS", t["requested"], t["approved"], t["expired"], t["denied"]],
-        total=True,
+        max(4, current_total_row - 1),
+        current_total_row,
+        current["totals"],
     )
-    ws.cell(row, 6, "Approval Rate")
-    ws.cell(row + 1, 6, (t["approved"] / t["requested"] if t["requested"] else 0))
-    ws.cell(row + 1, 6).number_format = "0.0%"
-    row += 2
+    row += 1
 
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    ws.cell(row, 1, "STLY")
-    ws.cell(row, 1).fill = PatternFill("solid", fgColor=dark)
-    ws.cell(row, 1).font = Font(bold=True, color=white)
-    ws.cell(row, 1).alignment = Alignment(horizontal="center")
+    # ── STLY ───────────────────────────────────────────────────────────────
+    _ar_status_write_section_band(ws, row, "STLY")
     row += 1
-    _ar_status_apply_table_style(ws, row, 1, CANARY_STATUS_HEADERS, header=True)
+    _ar_status_write_table_header(ws, row)
     row += 1
-    for x in stly["rows"]:
-        vals = [
-            x.get("name"),
-            _ar_num(x.get("requested")) or 0,
-            _ar_num(x.get("approved")) or 0,
-            "" if x.get("expired") is None else (_ar_num(x.get("expired")) or 0),
-            "" if x.get("denied") is None else (_ar_num(x.get("denied")) or 0),
-        ]
-        _ar_status_apply_table_style(ws, row, 1, vals)
-        for c in range(1, 6):
-            ws.cell(row, c).fill = PatternFill("solid", fgColor=stly_fill)
+    for item in stly["rows"]:
+        _ar_status_write_status_row(ws, row, item)
         row += 1
 
     stly_total_row = row
-    st = stly["totals"]
-    _ar_status_apply_table_style(
+    _ar_status_write_total_row(ws, stly_total_row, stly["totals"])
+    _ar_status_write_approval_rate(
         ws,
-        row,
-        1,
-        ["TOTALS", st["requested"], st["approved"], st["expired"], st["denied"]],
-        total=True,
+        max(stly_total_row - 1, 1),
+        stly_total_row,
+        stly["totals"],
     )
-    ws.cell(row, 6, "Approval Rate")
-    ws.cell(row + 1, 6, (st["approved"] / st["requested"] if st["requested"] else 0))
-    ws.cell(row + 1, 6).number_format = "0.0%"
-    row += 2
-
-    variance = ancillary_status_variance(current["rows"], stly["rows"], property_name)
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    ws.cell(row, 1, "Variance")
-    ws.cell(row, 1).fill = PatternFill("solid", fgColor=dark)
-    ws.cell(row, 1).font = Font(bold=True, color=white)
-    ws.cell(row, 1).alignment = Alignment(horizontal="center")
     row += 1
-    _ar_status_apply_table_style(ws, row, 1, CANARY_STATUS_HEADERS, header=True)
+
+    # ── Variance ───────────────────────────────────────────────────────────
+    variance = ancillary_status_variance(current["rows"], stly["rows"], property_name)
+    _ar_status_write_section_band(ws, row, "Variance")
+    row += 1
+    _ar_status_write_table_header(ws, row)
     row += 1
     variance_start = row
-    for x in variance:
-        vals = [x.get("name"), x["requested"], x["approved"], x["expired"], x["denied"]]
-        _ar_status_apply_table_style(ws, row, 1, vals)
-        for c in range(2, 6):
-            val = _ar_num(ws.cell(row, c).value) or 0
-            ws.cell(row, c).fill = PatternFill("solid", fgColor=green if val >= 0 else red)
+    for item in variance:
+        # Variance names use the standard dark AREV blue. The numeric cells stay
+        # gray and conditional formatting supplies the approved green/red fills.
+        vitem = dict(item)
+        vitem["source"] = "CANARY"
+        _ar_status_write_status_row(ws, row, vitem, variance=True)
         row += 1
     variance_end = row - 1
     vtot = {
         k: sum(_ar_num(x.get(k)) or 0 for x in variance)
         for k in ("requested", "approved", "expired", "denied")
     }
-    _ar_status_apply_table_style(
-        ws, row, 1,
-        ["TOTALS", vtot["requested"], vtot["approved"], vtot["expired"], vtot["denied"]],
-        total=True,
-    )
-    for c in range(2, 6):
-        val = _ar_num(ws.cell(row, c).value) or 0
-        ws.cell(row, c).fill = PatternFill("solid", fgColor=green if val >= 0 else red)
+    variance_total_row = row
+    _ar_status_write_total_row(ws, variance_total_row, vtot)
 
-    # Currency formatting for every status value in A:E.
-    for r in range(4, row + 1):
-        for c in range(2, 6):
-            ws.cell(r, c).number_format = '$#,##0.00;$(#,##0.00);$-'
-
-    # Current-year staff upsell revenue (from Canary Updated By).
-    _ar_status_apply_table_style(
-        ws, 3, 8,
-        ["User Name", "Upsell Revenue Approved $", "Upsell Revenue Denied $"],
-        header=True,
-    )
-    sr = 4
-    for s in staff_rows:
-        _ar_status_apply_table_style(
-            ws, sr, 8,
-            [s.get("name"), s.get("approved", 0), s.get("denied", 0)],
+    # Existing AREV logic: more requested/approved revenue is positive; more
+    # expired/denied revenue is negative. Apply the same direction to totals.
+    green_fill = _ar_status_fill(styles["positive_green"])
+    red_fill = _ar_status_fill(styles["negative_red"])
+    if variance_end >= variance_start:
+        ws.conditional_formatting.add(
+            f"B{variance_start}:C{variance_end}",
+            CellIsRule(operator="greaterThan", formula=["0"], fill=green_fill),
         )
-        ws.cell(sr, 9).number_format = '$#,##0.00;$(#,##0.00);$-'
-        ws.cell(sr, 10).number_format = '$#,##0.00;$(#,##0.00);$-'
+        ws.conditional_formatting.add(
+            f"B{variance_start}:C{variance_end}",
+            CellIsRule(operator="lessThan", formula=["0"], fill=red_fill),
+        )
+        ws.conditional_formatting.add(
+            f"D{variance_start}:E{variance_end}",
+            CellIsRule(operator="greaterThan", formula=["0"], fill=red_fill),
+        )
+        ws.conditional_formatting.add(
+            f"D{variance_start}:E{variance_end}",
+            CellIsRule(operator="lessThan", formula=["0"], fill=green_fill),
+        )
+    for col in (2, 3):
+        val = _ar_num(ws.cell(variance_total_row, col).value) or 0
+        ws.cell(variance_total_row, col).fill = copy(green_fill if val >= 0 else red_fill)
+    for col in (4, 5):
+        val = _ar_num(ws.cell(variance_total_row, col).value) or 0
+        ws.cell(variance_total_row, col).fill = copy(red_fill if val > 0 else green_fill)
+
+    # ── Current-year staff upsell revenue H:J ──────────────────────────────
+    for col, value in enumerate(
+        ["User Name", "Upsell Revenue Approved $", "Upsell Revenue Denied $"],
+        start=8,
+    ):
+        cell = ws.cell(3, col, value)
+        _ar_status_style_header_cell(
+            cell,
+            number_format=styles["currency"] if col > 8 else None,
+        )
+
+    staff_start = 4
+    sr = staff_start
+    for item in staff_rows:
+        ws.cell(sr, 8, item.get("name"))
+        _ar_status_style_name_cell(ws.cell(sr, 8), source="CANARY")
+        for col, field in ((9, "approved"), (10, "denied")):
+            ws.cell(sr, col, _ar_num(item.get(field)) or 0)
+            _ar_status_style_metric_cell(ws.cell(sr, col))
         sr += 1
 
+    # Completed AREV files show the approved staff total beneath that column.
+    if sr > staff_start:
+        total_cell = ws.cell(sr, 9, f"=SUM(I{staff_start}:I{sr-1})")
+        total_cell.number_format = styles["currency"]
+        total_cell.font = _ar_status_arev_font(name="Arial")
+        total_cell.border = Border()
+
+    # Staff message counts start two rows below the revenue total.
     if staff_messages:
-        sr += 2
-        _ar_status_apply_table_style(ws, sr, 8, ["Staff Name", "Messages"], header=True)
-        sr += 1
-        for s in staff_messages:
-            _ar_status_apply_table_style(ws, sr, 8, [s.get("name"), s.get("messages", 0)])
-            sr += 1
+        msg_header_row = sr + 2
+        for col, value in ((8, "Staff Name"), (9, "Messages")):
+            cell = ws.cell(msg_header_row, col, value)
+            _ar_status_style_header_cell(cell)
+        rr = msg_header_row + 1
+        for item in staff_messages:
+            ws.cell(rr, 8, item.get("name"))
+            _ar_status_style_name_cell(ws.cell(rr, 8), source="CANARY")
+            ws.cell(rr, 9, _ar_num(item.get("messages")) or 0)
+            ws.cell(rr, 9).fill = _ar_status_fill(styles["metric_gray"])
+            ws.cell(rr, 9).font = _ar_status_arev_font()
+            ws.cell(rr, 9).alignment = Alignment(horizontal="center")
+            ws.cell(rr, 9).number_format = "#,##0"
+            ws.cell(rr, 9).border = Border()
+            rr += 1
 
-    # Messaging Overview — same KPI block as the existing universal renderer.
-    ws.merge_cells("M1:P1")
-    ws["M1"] = f"{property_name} Messaging Overview - {report_month.strftime('%B')}"
-    ws["M1"].fill = PatternFill("solid", fgColor=dark)
-    ws["M1"].font = Font(size=16, bold=True, color=white)
-    ws["M1"].alignment = Alignment(horizontal="center")
-    for c in range(13, 17):
-        ws.cell(1, c).fill = PatternFill("solid", fgColor=dark)
-    ws["M2"] = report_month.year
-    ws["N21"] = report_month.strftime("%b %Y").upper()
-    ws["O21"] = "STLY"
-    ws["P21"] = "YoY"
+    # ── Messaging Overview N:Q ─────────────────────────────────────────────
+    ws.merge_cells("N1:Q1")
+    ws["N1"] = f"{short_prop} Messaging Overview - {report_month.strftime('%B')}"
+    for col in range(14, 18):
+        ws.cell(1, col).fill = _ar_status_fill(styles["header_blue"])
+    ws["N1"].font = _ar_status_arev_font(bold=True, white=True)
+    ws["N1"].alignment = Alignment(horizontal="center", vertical="bottom")
+
+    ws.merge_cells("N2:Q2")
+    ws["N2"] = report_month.year
+    for col in range(14, 18):
+        ws.cell(2, col).fill = _ar_status_fill(styles["section_red"])
+    ws["N2"].font = _ar_status_arev_font(bold=True, white=True, size=13)
+    ws["N2"].alignment = Alignment(horizontal="center", vertical="bottom")
+
+    # Keep the established spacing above the KPI comparison table.
+    for col, value in enumerate(
+        ["", report_month.strftime("%b %Y").upper(), "STLY", "YoY"],
+        start=14,
+    ):
+        cell = ws.cell(21, col, value)
+        _ar_status_style_header_cell(cell)
 
     labels = [
         "Total Messages",
@@ -14253,23 +14412,43 @@ def _ar_status_write_month_sheet(
         _ar_num(messaging.get("stlyAvgResponse")) or 0,
         messaging.get("stlyEngagementRate", 0) or 0,
     ]
-    _ar_status_apply_table_style(ws, 21, 13, ["Metric", "Current", "STLY", "YoY"], header=True)
-    for i, label in enumerate(labels, start=22):
-        idx = i - 22
-        values = [label, current_msg[idx], stly_msg[idx], current_msg[idx] - stly_msg[idx]]
-        _ar_status_apply_table_style(ws, i, 13, values)
-    for r in range(22, 25):
-        for c in range(14, 17):
-            ws.cell(r, c).number_format = "0"
-    for r in range(25, 27):
-        for c in range(14, 17):
-            ws.cell(r, c).number_format = "0.0%"
-    for c in range(14, 17):
-        ws.cell(27, c).number_format = "0.0"
-        ws.cell(28, c).number_format = "0.0%"
 
-    # No separate engagement-rate history table: Canary now provides one
-    # summary engagement rate for the selected reporting period.
+    for idx, label in enumerate(labels):
+        r = 22 + idx
+        # Metric label: established dark-blue AREV block.
+        label_cell = ws.cell(r, 14, label)
+        _ar_status_style_name_cell(label_cell, source="CANARY")
+        label_cell.alignment = Alignment(horizontal="center", vertical="bottom")
+
+        cur = current_msg[idx]
+        prev = stly_msg[idx]
+        yoy = cur - prev
+        for col, value in ((15, cur), (16, prev), (17, yoy)):
+            cell = ws.cell(r, col, value)
+            cell.font = _ar_status_arev_font()
+            cell.alignment = Alignment(horizontal="right")
+            cell.border = Border()
+            cell.fill = _ar_status_fill(styles["metric_gray"])
+
+        if idx <= 2:
+            ws.cell(r, 15).number_format = "#,##0"
+            ws.cell(r, 16).number_format = "#,##0"
+            ws.cell(r, 17).number_format = "#,##0"
+        elif idx in (3, 4, 6):
+            for col in range(15, 18):
+                ws.cell(r, col).number_format = "0.0%"
+        else:
+            for col in range(15, 18):
+                ws.cell(r, col).number_format = "0.0"
+
+        # YoY color logic follows the established messaging table. Lower
+        # response time is favorable; every other KPI is favorable when higher.
+        yoy_cell = ws.cell(r, 17)
+        favorable = yoy >= 0 if idx != 5 else yoy <= 0
+        if yoy > 0 or yoy < 0:
+            yoy_cell.fill = _ar_status_fill(
+                styles["positive_green"] if favorable else styles["negative_red"]
+            )
 
     ws.freeze_panes = None
 
