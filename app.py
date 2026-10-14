@@ -7758,18 +7758,21 @@ def _rob_copy_budget_reference_columns(source_wb, dest_wb, cols=(9, 10)):
 
 
 def _hilton_backfill_target_month_history(source_ws, dest_ws, target_month):
-    """Fill only missing Hilton historical B:D cells for the target month.
+    """Backfill Hilton STLY history for the target month.
 
-    Some older current-year Hilton builds left WK2+ historical Revenue,
-    Room Nights, Group, or Permanent values blank even though the mapped
-    historical source week contained them.
+    Historical year values:
+      source C:D:E -> destination B:C:D (fill blanks only).
 
-    The backstop is deliberately narrow:
-      - target month only
-      - source C:D:E -> destination B:C:D
-      - map by metric label instead of physical row number
-      - fill blanks only
-      - never touch current-year destination column E
+    Group Not Picked Up STLY values:
+      source G -> destination H for Group Rms Sold / Group Rm Rev.
+
+    The G -> H mapping is intentional. In the prior-year Hilton ROB, column G
+    is that year's live Group NPU pink-box value; in the newly-created current
+    ROB, column H is the STLY comparison column. This explicit copy prevents
+    template/link behavior from leaving Hilton H blank or carrying a stale
+    value for the target month.
+
+    Current-year destination columns E and G are never changed here.
     """
     if source_ws is None or dest_ws is None:
         return 0
@@ -7805,6 +7808,23 @@ def _hilton_backfill_target_month_history(source_ws, dest_ws, target_month):
                 continue
 
             dest_ws.cell(dr, dest_col).value = value
+            copied += 1
+
+    # Hilton Group NPU STLY: prior-year ROB column G -> current ROB column H.
+    # Do this explicitly for the target month even when H is already populated
+    # by a template/formula, because the matched historical week is the source
+    # of truth for the STLY pink-box comparison.
+    for label in _ROB_SECONDARY_METRIC_LABELS:
+        sr = src_labels.get(label)
+        dr = dst_labels.get(label)
+        if not sr or not dr:
+            continue
+
+        value = source_ws.cell(sr, 7).value
+        if value in (None, "") or is_datelike(value):
+            continue
+
+        if _rob_set_value(dest_ws, dr, 8, value):
             copied += 1
 
     return copied
