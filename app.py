@@ -5491,7 +5491,7 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
 
     Workbook match inside that folder:
       - filename contains REPORT
-      - and contains CANARY or SNT (or both)
+      - and contains CANARY, SNT, or NOR1
 
     Matching is case/punctuation insensitive. If multiple valid workbooks exist,
     use the most recently modified one.
@@ -5606,14 +5606,14 @@ def ancillary_find_drive_report(service, hotel_id, hotel_name, report_month):
         n = _ancillary_normalize_drive_name(f.get("name"))
         if "REPORT" not in n:
             continue
-        if "CANARY" not in n and "SNT" not in n:
+        if "CANARY" not in n and "SNT" not in n and "NOR1" not in n:
             continue
         candidates.append(f)
 
     if not candidates:
         return None, (
             f"{anc_folder['name']}: no report workbook containing "
-            f"'Canary' or 'SNT' was found."
+            f"'Canary', 'SNT', or 'NOR1' was found."
         )
 
     candidates.sort(
@@ -16231,6 +16231,306 @@ def hilton_ancillary_build_report(
     return output, summaries[0]
 
 
+
+
+def _ihg_write_messaging_overview(ws, property_name, report_month, messaging):
+    """Write the standard AREV Canary messaging KPI block on an IHG NOR1 tab."""
+    styles = _ar_status_arev_styles()
+    short_prop = str(property_name or "IHG").strip()
+
+    try:
+        ws.merge_cells("N1:Q1")
+    except Exception:
+        pass
+    ws["N1"] = f"{short_prop} Messaging Overview - {report_month.strftime('%B')}"
+    for col in range(14, 18):
+        ws.cell(1, col).fill = _ar_status_fill(styles["header_blue"])
+    ws["N1"].font = _ar_status_arev_font(bold=True, white=True)
+    ws["N1"].alignment = Alignment(horizontal="center", vertical="bottom")
+
+    try:
+        ws.merge_cells("N2:Q2")
+    except Exception:
+        pass
+    ws["N2"] = report_month.year
+    for col in range(14, 18):
+        ws.cell(2, col).fill = _ar_status_fill(styles["section_red"])
+    ws["N2"].font = _ar_status_arev_font(bold=True, white=True, size=13)
+    ws["N2"].alignment = Alignment(horizontal="center", vertical="bottom")
+
+    for col, value in enumerate(
+        ["", report_month.strftime("%b %Y").upper(), "STLY", "YoY"],
+        start=14,
+    ):
+        _ar_status_style_header_cell(ws.cell(21, col, value))
+
+    labels = [
+        "Total Messages",
+        "# of messages guest sent",
+        "# of messages hotel sent",
+        "% of your guests that sent a message",
+        "Response Rate",
+        "Average minutes to respond",
+        "Engagement Rate",
+    ]
+    current = [
+        _ar_num(messaging.get("msgTotal")) or 0,
+        _ar_num(messaging.get("msgGuest")) or 0,
+        _ar_num(messaging.get("msgHotel")) or 0,
+        messaging.get("msgGuestPct", 0) or 0,
+        messaging.get("responseRate", 0) or 0,
+        _ar_num(messaging.get("avgResponse")) or 0,
+        messaging.get("engagementRate", 0) or 0,
+    ]
+    prior = [
+        _ar_num(messaging.get("stlyMsgTotal")) or 0,
+        _ar_num(messaging.get("stlyMsgGuest")) or 0,
+        _ar_num(messaging.get("stlyMsgHotel")) or 0,
+        messaging.get("stlyMsgGuestPct", 0) or 0,
+        messaging.get("stlyResponseRate", 0) or 0,
+        _ar_num(messaging.get("stlyAvgResponse")) or 0,
+        messaging.get("stlyEngagementRate", 0) or 0,
+    ]
+
+    for idx, label in enumerate(labels):
+        row = 22 + idx
+        label_cell = ws.cell(row, 14, label)
+        _ar_status_style_name_cell(label_cell, source="CANARY")
+        label_cell.alignment = Alignment(horizontal="center", vertical="bottom")
+        yoy = current[idx] - prior[idx]
+        for col, value in ((15, current[idx]), (16, prior[idx]), (17, yoy)):
+            cell = ws.cell(row, col, value)
+            cell.font = _ar_status_arev_font()
+            cell.alignment = Alignment(horizontal="right")
+            cell.border = Border()
+            cell.fill = _ar_status_fill(styles["metric_gray"])
+        if idx <= 2:
+            for col in range(15, 18):
+                ws.cell(row, col).number_format = "#,##0"
+        elif idx in (3, 4, 6):
+            for col in range(15, 18):
+                ws.cell(row, col).number_format = "0.0%"
+        else:
+            for col in range(15, 18):
+                ws.cell(row, col).number_format = "0.0"
+
+        yoy_cell = ws.cell(row, 17)
+        favorable = yoy >= 0 if idx != 5 else yoy <= 0
+        if abs(yoy) > 1e-12:
+            yoy_cell.fill = _ar_status_fill(
+                styles["positive_green"] if favorable else styles["negative_red"]
+            )
+
+    for col, width in {"N": 35.0, "O": 13.0, "P": 13.0, "Q": 13.0}.items():
+        ws.column_dimensions[col].width = width
+
+
+def _ihg_ancillary_add_month_sheet(
+    wb,
+    property_name,
+    report_month,
+    nor1_current_file,
+    nor1_stly_file,
+    messaging=None,
+):
+    """Build one IHG ancillary month from the same NOR1 export format Hilton uses."""
+    messaging = messaging or {}
+    current_nor1 = hilton_ancillary_parse_nor1(
+        nor1_current_file,
+        report_month=report_month,
+    )
+    stly_month = report_month.replace(year=report_month.year - 1)
+    stly_nor1 = hilton_ancillary_parse_nor1(
+        nor1_stly_file,
+        report_month=stly_month,
+    )
+
+    main_rows = [dict(r) for r in current_nor1["rows"]]
+    main_rows.sort(key=_hilton_ar_main_sort_key)
+    stly_rows = [dict(r) for r in stly_nor1["rows"]]
+    stly_rows.sort(
+        key=lambda r: (
+            _ar_norm(r.get("reporting_type")),
+            _ar_norm(r.get("name")),
+        )
+    )
+
+    sheet_name = report_month.strftime("%b").upper()
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+
+    ws["A1"] = f"{property_name} Upsell Overview - {report_month.strftime('%B')}"
+    ws["A2"] = report_month.year
+    headers = [
+        "Upsell Name",
+        "Total number",
+        "Total Revenue",
+        "Average revenue",
+        "Expired Revenue",
+    ]
+    for c, value in enumerate(headers, 1):
+        ws.cell(3, c, value)
+
+    current_start = 4
+    current_row_by_key = {}
+    for i, row in enumerate(main_rows, start=current_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        current_row_by_key.setdefault(_hilton_ar_variance_key(row["name"]), i)
+
+    current_total_row = current_start + len(main_rows)
+    ws.cell(current_total_row, 1, "TOTALS")
+    ws.cell(current_total_row, 2, f"=SUM(B{current_start}:B{current_total_row-1})")
+    ws.cell(current_total_row, 3, f"=SUM(C{current_start}:C{current_total_row-1})")
+    ws.cell(current_total_row, 4, f"=AVERAGE(D{current_start}:D{current_total_row-1})")
+    ws.cell(current_total_row, 5, None)
+    ws.cell(current_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: current-year NOR1 Expired Revenue.", "OpenAI"
+    )
+
+    stly_title_row = current_total_row + 1
+    stly_header_row = stly_title_row + 1
+    stly_start = stly_header_row + 1
+    ws.cell(stly_title_row, 1, "STLY")
+    for c, value in enumerate(headers, 1):
+        ws.cell(stly_header_row, c, value)
+
+    stly_row_by_key = {}
+    for i, row in enumerate(stly_rows, start=stly_start):
+        ws.cell(i, 1, row["name"])
+        ws.cell(i, 2, row["count"])
+        ws.cell(i, 3, row["revenue"])
+        ws.cell(i, 4, f"=C{i}/B{i}")
+        stly_row_by_key.setdefault(_hilton_ar_variance_key(row["name"]), i)
+
+    stly_total_row = stly_start + len(stly_rows)
+    ws.cell(stly_total_row, 1, "TOTALS")
+    ws.cell(stly_total_row, 2, f"=SUM(B{stly_start}:B{stly_total_row-1})")
+    ws.cell(stly_total_row, 3, f"=SUM(C{stly_start}:C{stly_total_row-1})")
+    ws.cell(stly_total_row, 4, f"=AVERAGE(D{stly_start}:D{stly_total_row-1})")
+    ws.cell(stly_total_row, 5, None)
+    ws.cell(stly_total_row, 5).comment = openpyxl.comments.Comment(
+        "Manual entry: STLY NOR1 Expired Revenue.", "OpenAI"
+    )
+
+    variance_title_row = stly_total_row + 1
+    variance_header_row = variance_title_row + 1
+    variance_start = variance_header_row + 1
+    ws.cell(variance_title_row, 1, "Variance")
+    for c, value in enumerate(
+        ["Upsell Name", "Total Count", "Total Revenue", "Average Revenue", "Expired Revenue"],
+        1,
+    ):
+        ws.cell(variance_header_row, c, value)
+
+    specs = []
+    used_stly = set()
+    for cur in main_rows:
+        key = _hilton_ar_variance_key(cur["name"])
+        specs.append({
+            "name": cur["name"],
+            "current_row": current_row_by_key.get(key),
+            "stly_row": stly_row_by_key.get(key),
+        })
+        if key in stly_row_by_key:
+            used_stly.add(key)
+    for prev in stly_rows:
+        key = _hilton_ar_variance_key(prev["name"])
+        if key in used_stly or key in current_row_by_key:
+            continue
+        specs.append({
+            "name": prev["name"],
+            "current_row": None,
+            "stly_row": stly_row_by_key.get(key),
+        })
+
+    variance_rows = []
+    for offset, spec in enumerate(specs):
+        row = variance_start + offset
+        cr, sr = spec["current_row"], spec["stly_row"]
+        ws.cell(row, 1, spec["name"])
+        for letter, col in zip("BCD", range(2, 5)):
+            if cr and sr:
+                formula = f"={letter}{cr}-{letter}{sr}"
+            elif cr:
+                formula = f"={letter}{cr}"
+            else:
+                formula = f"={letter}{sr}*-1"
+            ws.cell(row, col, formula)
+        variance_rows.append(dict(spec))
+
+    variance_total_row = variance_start + len(specs)
+    ws.cell(variance_total_row, 1, "TOTALS")
+    ws.cell(variance_total_row, 2, f"=SUM(B{variance_start}:B{variance_total_row-1})")
+    ws.cell(variance_total_row, 3, f"=SUM(C{variance_start}:C{variance_total_row-1})")
+    ws.cell(variance_total_row, 4, f"=SUM(D{variance_start}:D{variance_total_row-1})")
+    ws.cell(
+        variance_total_row,
+        5,
+        f'=IF(OR(E{current_total_row}<>"",E{stly_total_row}<>""),E{current_total_row}-E{stly_total_row},"")',
+    )
+
+    _hilton_apply_existing_report_format(
+        ws=ws,
+        main_rows=main_rows,
+        current_start=current_start,
+        current_total_row=current_total_row,
+        stly_start=stly_start,
+        stly_total_row=stly_total_row,
+        variance_start=variance_start,
+        variance_total_row=variance_total_row,
+        front_desk_years=[],
+        parking_row=None,
+    )
+    # IHG does not use Hilton's manual Front Desk history table.
+    for row in range(3, 11):
+        for col in range(8, 11):
+            ws.cell(row, col).value = None
+            ws.cell(row, col).fill = PatternFill(fill_type=None)
+            ws.cell(row, col).border = Border()
+
+    _ihg_write_messaging_overview(ws, property_name, report_month, messaging)
+
+    return {
+        "month": report_month,
+        "sheet": sheet_name,
+        "mainRows": main_rows,
+        "stlyRows": stly_rows,
+        "varianceRows": variance_rows,
+        "warnings": [],
+        "currentTotalCount": sum(r["count"] for r in main_rows),
+        "currentTotalRevenue": sum(r["revenue"] for r in main_rows),
+        "stlyTotalCount": sum(r["count"] for r in stly_rows),
+        "stlyTotalRevenue": sum(r["revenue"] for r in stly_rows),
+    }
+
+
+def ihg_ancillary_build_multi_month_report(property_name, month_inputs):
+    """Build a separate IHG multi-month workbook from current/STLY NOR1 + messaging."""
+    wb = openpyxl.Workbook()
+    default = wb.active
+    summaries = []
+    for item in sorted(month_inputs, key=lambda x: x["report_month"]):
+        summaries.append(
+            _ihg_ancillary_add_month_sheet(
+                wb=wb,
+                property_name=property_name,
+                report_month=item["report_month"],
+                nor1_current_file=item["nor1_current_file"],
+                nor1_stly_file=item["nor1_stly_file"],
+                messaging=item.get("messaging") or {},
+            )
+        )
+    if default.title in wb.sheetnames and len(wb.sheetnames) > 1:
+        wb.remove(default)
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), summaries
+
+
 # ── Plymouth / Hotel 1620 weekly ancillary tracking ───────────────────────────
 PLYMOUTH_WEEKLY_COLS = {
     1: (2, 3),   # B/C
@@ -21917,7 +22217,7 @@ with tab_ancillary:
 
     ancillary_platform = st.radio(
         "Choose report type",
-        ["Hilton", "SNT / Independent Hotels", "Margaritaville", "Marriott / IHG"],
+        ["Hilton", "SNT / Independent Hotels", "Margaritaville", "Marriott", "IHG"],
         horizontal=True,
         key="ancillary_platform_choice",
     )
@@ -22861,7 +23161,246 @@ with tab_ancillary:
                             st.error(f"Could not undo multi-month ancillary Drive save: {e}")
 
 
-    elif ancillary_platform in ("Margaritaville", "Marriott / IHG"):
+    elif ancillary_platform == "IHG":
+        st.markdown("### IHG — NOR1 + Canary Messaging Multi-Month Builder")
+        st.caption(
+            "IHG is kept separate from Hilton and Marriott. Revenue uses the same grouped "
+            "NOR1 export format as Hilton for current year and STLY; Canary supplies the "
+            "monthly messaging KPI block. No Hilton Lobby file is required."
+        )
+
+        known_ihg = list(PORTFOLIO_HOTELS.get("IHG", {}).keys())
+        ihg_property_mode = st.radio(
+            "Property entry",
+            ["Known IHG property", "Other property"],
+            horizontal=True,
+            key="ihg_ar_property_mode",
+        )
+        if ihg_property_mode == "Known IHG property" and known_ihg:
+            ihg_ar_property = st.selectbox(
+                "IHG Property",
+                known_ihg,
+                key="ihg_ar_property",
+            )
+        else:
+            ihg_ar_property = st.text_input(
+                "IHG Property name",
+                key="ihg_ar_property_other",
+            )
+
+        ihg_month_options = _ar_status_month_options(18)
+        ihg_ar_months = st.multiselect(
+            "Months to build",
+            options=ihg_month_options,
+            default=ihg_month_options[:3],
+            format_func=lambda d: d.strftime("%B %Y"),
+            key="ihg_ar_months",
+            help="One grouped NOR1 export can contain every selected month.",
+        )
+
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            ihg_nor1_current = st.file_uploader(
+                "Current-Year NOR1 — all selected months",
+                type=["xlsx"],
+                key="ihg_ar_nor1_current",
+            )
+        with nc2:
+            ihg_nor1_stly = st.file_uploader(
+                "STLY NOR1 — matching prior-year months",
+                type=["xlsx"],
+                key="ihg_ar_nor1_stly",
+            )
+
+        ihg_messaging_by_month = {}
+        with st.expander("Canary messaging information by month", expanded=False):
+            st.caption(
+                "Enter the current and STLY messaging summary for each selected month. "
+                "Engagement Rate is the final KPI row."
+            )
+            for month_date in sorted(ihg_ar_months):
+                mkey = f"{month_date.year}-{month_date.month:02d}"
+                st.markdown(f"#### {month_date.strftime('%B %Y')}")
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.markdown("**Current Year**")
+                    cur_total = st.number_input("Total Messages", value=0.0, key=f"ihg_msg_total_{mkey}")
+                    cur_guest = st.number_input("Guest Messages", value=0.0, key=f"ihg_msg_guest_{mkey}")
+                    cur_hotel = st.number_input("Hotel Messages", value=0.0, key=f"ihg_msg_hotel_{mkey}")
+                    cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_msg_pct_{mkey}")
+                    cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_resp_{mkey}")
+                    cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"ihg_avg_{mkey}")
+                    cur_eng = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_eng_{mkey}")
+                with mc2:
+                    st.markdown(f"**STLY — {month_date.year - 1}**")
+                    prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"ihg_stly_total_{mkey}")
+                    prev_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"ihg_stly_guest_{mkey}")
+                    prev_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"ihg_stly_hotel_{mkey}")
+                    prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_pct_{mkey}")
+                    prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_resp_{mkey}")
+                    prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"ihg_stly_avg_{mkey}")
+                    prev_eng = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_eng_{mkey}")
+
+                ihg_messaging_by_month[mkey] = {
+                    "msgTotal": cur_total,
+                    "msgGuest": cur_guest,
+                    "msgHotel": cur_hotel,
+                    "msgGuestPct": cur_pct / 100.0,
+                    "responseRate": cur_resp / 100.0,
+                    "avgResponse": cur_avg,
+                    "engagementRate": cur_eng / 100.0,
+                    "stlyMsgTotal": prev_total,
+                    "stlyMsgGuest": prev_guest,
+                    "stlyMsgHotel": prev_hotel,
+                    "stlyMsgGuestPct": prev_pct / 100.0,
+                    "stlyResponseRate": prev_resp / 100.0,
+                    "stlyAvgResponse": prev_avg,
+                    "stlyEngagementRate": prev_eng / 100.0,
+                }
+
+        ihg_ready = (
+            bool(ihg_ar_months)
+            and bool(str(ihg_ar_property or "").strip())
+            and ihg_nor1_current is not None
+            and ihg_nor1_stly is not None
+        )
+        ihg_month_inputs = []
+        for month_date in sorted(ihg_ar_months):
+            month_dt = datetime.datetime(month_date.year, month_date.month, 1)
+            mkey = f"{month_date.year}-{month_date.month:02d}"
+            ihg_month_inputs.append({
+                "report_month": month_dt,
+                "nor1_current_file": ihg_nor1_current,
+                "nor1_stly_file": ihg_nor1_stly,
+                "messaging": ihg_messaging_by_month.get(mkey, {}),
+            })
+
+        if st.button(
+            "Build IHG Ancillary Workbook",
+            type="primary",
+            key="ihg_ar_build_multi",
+            disabled=not ihg_ready,
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner("Building IHG ancillary workbook..."):
+                    ihg_output, ihg_summaries = ihg_ancillary_build_multi_month_report(
+                        property_name=str(ihg_ar_property).strip(),
+                        month_inputs=ihg_month_inputs,
+                    )
+                    years = sorted({m.year for m in ihg_ar_months})
+                    year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
+                    st.session_state["ihg_ar_output"] = ihg_output
+                    st.session_state["ihg_ar_summaries"] = ihg_summaries
+                    st.session_state["ihg_ar_filename"] = (
+                        f"{year_label} {str(ihg_ar_property).strip()} Ancillary Revenue NOR1 Report.xlsx"
+                    )
+                st.success(f"Built {len(ihg_summaries)} IHG month tab(s).")
+            except Exception as e:
+                st.error(f"IHG ancillary report build error: {e}")
+
+        if "ihg_ar_output" in st.session_state:
+            summaries = st.session_state.get("ihg_ar_summaries", [])
+            if summaries:
+                preview_rows = [
+                    {
+                        "Month": x["month"].strftime("%b %Y"),
+                        "Current NOR1 Revenue": x.get("currentTotalRevenue", 0),
+                        "STLY NOR1 Revenue": x.get("stlyTotalRevenue", 0),
+                        "YoY Revenue Variance": x.get("currentTotalRevenue", 0) - x.get("stlyTotalRevenue", 0),
+                    }
+                    for x in summaries
+                ]
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "Download IHG Ancillary Workbook",
+                data=st.session_state["ihg_ar_output"],
+                file_name=st.session_state.get("ihg_ar_filename", "IHG Ancillary Revenue NOR1 Report.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ihg_ar_download_multi",
+                use_container_width=True,
+            )
+
+            if st.button(
+                "Save Built IHG Months to Existing Drive Report",
+                key="ihg_ar_drive_save",
+                type="primary",
+                use_container_width=True,
+            ):
+                try:
+                    svc = get_drive_service()
+                    discovered = dict(get_hotels_from_drive())
+                    target_name = str(ihg_ar_property or "").strip()
+                    target_norm = _ancillary_normalize_drive_name(target_name)
+                    exact = [
+                        (name, hid) for name, hid in discovered.items()
+                        if _ancillary_normalize_drive_name(name) == target_norm
+                    ]
+                    contains = [
+                        (name, hid) for name, hid in discovered.items()
+                        if target_norm and (
+                            target_norm in _ancillary_normalize_drive_name(name)
+                            or _ancillary_normalize_drive_name(name) in target_norm
+                        )
+                    ]
+                    match = exact[0] if len(exact) == 1 else None
+                    if match is None and len(contains) == 1:
+                        match = contains[0]
+                    if match is None:
+                        raise ValueError(
+                            f"Could not uniquely match {target_name} to a Drive hotel folder."
+                        )
+                    drive_label, hotel_id = match
+                    reference_month = datetime.datetime(
+                        max(ihg_ar_months).year,
+                        max(ihg_ar_months).month,
+                        1,
+                    )
+                    target, target_err = ancillary_find_drive_report(
+                        svc,
+                        hotel_id,
+                        drive_label,
+                        reference_month,
+                    )
+                    if target_err or not target:
+                        raise ValueError(target_err or "IHG ancillary Drive report not found.")
+                    original_bytes = drive_download(svc, target["file_id"])
+                    merged_bytes, inserted_tabs = hilton_ancillary_merge_month_sheets(
+                        original_bytes,
+                        st.session_state["ihg_ar_output"],
+                        destination_name=target["file_name"],
+                    )
+                    st.session_state["ihg_ar_drive_undo"] = {
+                        "file_id": target["file_id"],
+                        "file_name": target["file_name"],
+                        "bytes": original_bytes,
+                    }
+                    drive_upload(svc, target["file_id"], merged_bytes, target["file_name"])
+                    st.success(
+                        f"Updated **{target['file_name']}** in **{target['folder_name']}** "
+                        f"with {', '.join(inserted_tabs)}."
+                    )
+                except Exception as e:
+                    st.error(f"Could not save IHG ancillary report to Drive: {e}")
+
+            if st.session_state.get("ihg_ar_drive_undo"):
+                if st.button("↩ Undo Last IHG Drive Save", key="ihg_ar_undo"):
+                    try:
+                        undo = st.session_state["ihg_ar_drive_undo"]
+                        drive_upload(
+                            get_drive_service(),
+                            undo["file_id"],
+                            undo["bytes"],
+                            undo["file_name"],
+                        )
+                        st.session_state.pop("ihg_ar_drive_undo", None)
+                        st.success("Restored the IHG ancillary workbook to its previous version.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not undo IHG ancillary Drive save: {e}")
+
+    elif ancillary_platform in ("Margaritaville", "Marriott"):
         is_margaritaville = ancillary_platform == "Margaritaville"
         if is_margaritaville:
             st.markdown("### Margaritaville — Canary + Oaky Multi-Month Builder")
@@ -22877,45 +23416,17 @@ with tab_ancillary:
             )
             status_brand = "Margaritaville"
         else:
-            st.markdown("### Marriott / IHG — Canary Multi-Month Builder")
+            st.markdown("### Marriott — Canary Multi-Month Builder")
             st.caption(
-                "For branded properties whose ancillary revenue is entirely in Canary. "
-                "Current year and STLY use the same grouped Canary parsing and each selected "
-                "month receives the full messaging KPI block."
+                "Marriott ancillary revenue is built from grouped current-year and STLY "
+                "Canary upsell exports, with the monthly Canary messaging KPI block."
             )
-            status_brand = st.radio(
-                "Brand",
-                ["Marriott", "IHG"],
-                horizontal=True,
-                key="status_brand",
+            status_brand = "Marriott"
+            status_property = st.text_input(
+                "Property name",
+                key="status_marriott_property",
+                placeholder="e.g. Sheraton Tampa Brandon",
             )
-            known_ihg = list(PORTFOLIO_HOTELS.get("IHG", {}).keys())
-            if status_brand == "IHG" and known_ihg:
-                property_mode = st.radio(
-                    "Property entry",
-                    ["Known IHG property", "Other property"],
-                    horizontal=True,
-                    key="status_ihg_property_mode",
-                )
-                if property_mode == "Known IHG property":
-                    status_property = st.selectbox(
-                        "Property",
-                        known_ihg,
-                        key="status_ihg_property",
-                    )
-                else:
-                    status_property = st.text_input(
-                        "Property name",
-                        key="status_ihg_property_other",
-                    )
-            else:
-                # Marriott is intentionally free-text so new properties do not need
-                # to be coded into a profile before the builder can be used.
-                status_property = st.text_input(
-                    "Property name",
-                    key="status_marriott_property",
-                    placeholder="e.g. Sheraton Tampa Brandon",
-                )
 
         status_month_options = _ar_status_month_options(18)
         status_months = st.multiselect(
