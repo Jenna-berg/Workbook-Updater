@@ -4641,13 +4641,14 @@ def get_hotels_from_drive():
                     break
 
             if not canonical:
-                # Margaritaville is not part of the normal Revenue Reports
-                # portfolio selectors, but its ancillary builder still needs a
-                # stable Drive identity for saving generated AREV tabs.
-                if "MARGARITAVILLE" in haystack and "CAPE COD" in haystack:
-                    canonical = "Margaritaville Resort Cape Cod"
-                elif "MARGARITAVILLE" in haystack:
-                    canonical = "Margaritaville Resort Cape Cod"
+                # AREV-only branded hotels are intentionally excluded from the
+                # operational portfolio selectors, but still need stable Drive
+                # identities so generated ancillary month tabs can be written
+                # back into their existing workbooks.
+                for hotel_label, keywords in ANCILLARY_EXTRA_DRIVE_HOTELS.items():
+                    if any(keyword.upper() in haystack for keyword in keywords):
+                        canonical = hotel_label
+                        break
 
             if not canonical:
                 continue
@@ -4756,6 +4757,19 @@ PORTFOLIO_HOTELS = {
         "Weirton":        ["WEIRTON"],
     },
 }
+
+# Extra hotel labels used by the AREV-only branded builders. These are kept
+# outside PORTFOLIO_HOTELS so they do not appear in the operational Revenue
+# Reports portfolio selectors, but Drive discovery can still resolve their
+# existing ancillary workbooks.
+ANCILLARY_EXTRA_DRIVE_HOTELS = {
+    "Macon": ["MACON"],
+    "Tampa": ["TAMPA"],
+    "Rutland": ["RUTLAND"],
+    "Springfield": ["SPRINGFIELD"],
+    "Margaritaville Resort Cape Cod": ["MARGARITAVILLE"],
+}
+
 
 # Property codes as they appear in the SRP Activity export's 'Property -
 # InnCode' column, which is how one shared export gets split per hotel.
@@ -13997,11 +14011,46 @@ def ancillary_parse_oaky_status(uploaded_file, report_month):
     }
 
 
-def ancillary_combine_status_sources(canary, oaky=None):
+def ancillary_parse_nor1_status(uploaded_file, report_month):
+    """Convert one month of the grouped NOR1 export into AREV status rows.
+
+    IHG uses the same NOR1 export structure as Hilton, but its combined AREV
+    report also includes Canary upsells. NOR1 represents realized/awarded
+    revenue, so each category is treated as Requested = Approved = revenue;
+    Denied/Expired are unavailable for the detail row.
+    """
+    parsed = hilton_ancillary_parse_nor1(uploaded_file, report_month=report_month)
+    rows = []
+    for r in parsed.get("rows", []):
+        revenue = _ar_num(r.get("revenue")) or 0.0
+        rows.append({
+            "name": r.get("name") or "NOR1",
+            "requested": revenue,
+            "approved": revenue,
+            "expired": None,
+            "denied": None,
+            "source": "NOR1",
+            "count": _ar_num(r.get("count")) or 0.0,
+            "reporting_type": r.get("reporting_type", ""),
+        })
+    rows.sort(key=lambda x: (-(_ar_num(x.get("approved")) or 0), str(x.get("name") or "").lower()))
+    total = sum(_ar_num(x.get("approved")) or 0 for x in rows)
+    return {
+        "rows": rows,
+        "byItem": {_ar_norm(x["name"]): x for x in rows},
+        "totals": {"requested": total, "approved": total, "expired": 0.0, "denied": 0.0},
+        "matched": len(rows),
+        "sourceType": "NOR1",
+    }
+
+
+def ancillary_combine_status_sources(canary, oaky=None, nor1=None):
     """Combine Canary and optional Oaky rows without collapsing unlike sources."""
     rows = [dict(x) for x in canary.get("rows", [])]
     if oaky:
         rows.extend(dict(x) for x in oaky.get("rows", []))
+    if nor1:
+        rows.extend(dict(x) for x in nor1.get("rows", []))
     rows.sort(
         key=lambda x: (
             -(_ar_num(x.get("approved")) or 0),
@@ -14512,6 +14561,8 @@ def ancillary_status_build_multi_month_report(
     stly_canary_file,
     current_oaky_file=None,
     stly_oaky_file=None,
+    current_nor1_file=None,
+    stly_nor1_file=None,
     messaging_by_month=None,
     engagement_by_month=None,
     staff_messages_by_month=None,
@@ -14573,8 +14624,17 @@ def ancillary_status_build_multi_month_report(
                     "that STLY month was built from Canary only."
                 )
 
-        current = ancillary_combine_status_sources(current_canary, current_oaky)
-        stly = ancillary_combine_status_sources(stly_canary, stly_oaky)
+        current_nor1 = (
+            ancillary_parse_nor1_status(current_nor1_file, report_month)
+            if current_nor1_file is not None else None
+        )
+        stly_nor1 = (
+            ancillary_parse_nor1_status(stly_nor1_file, stly_month)
+            if stly_nor1_file is not None else None
+        )
+
+        current = ancillary_combine_status_sources(current_canary, current_oaky, current_nor1)
+        stly = ancillary_combine_status_sources(stly_canary, stly_oaky, stly_nor1)
 
         mkey = f"{report_month.year}-{report_month.month:02d}"
         summary = _ar_status_write_month_sheet(
@@ -22212,1504 +22272,1283 @@ with tab_weekly:
                     st.error(f"Undo error: {e}")
 
 
-with tab_ancillary:
-    st.subheader("Monthly Ancillary Revenue Report Builder")
 
-    ancillary_platform = st.radio(
-        "Choose report type",
-        ["Hilton", "SNT / Independent Hotels", "Margaritaville", "Marriott", "IHG"],
-        horizontal=True,
-        key="ancillary_platform_choice",
+# ── AREV tab renderers ───────────────────────────────────────────────────────
+def _render_arev_hilton_tab():
+    st.markdown("### Hilton — NOR1 + Lobby Report Builder")
+    st.caption(
+        "Build several Hilton ancillary months at once using three "
+        "grouped source files for the hotel: current NOR1, Lobby Add-ons, "
+        "and STLY NOR1. Front Desk Upsell and Expired Revenue cells are built "
+        "into the report but left blank for manual entry in Excel."
     )
 
-    if ancillary_platform == "Hilton":
-        st.markdown("### Hilton — NOR1 + Lobby Report Builder")
-        st.caption(
-            "Build several Hilton ancillary months at once using three "
-            "grouped source files for the hotel: current NOR1, Lobby Add-ons, "
-            "and STLY NOR1. Front Desk Upsell and Expired Revenue cells are built "
-            "into the report but left blank for manual entry in Excel."
+    har_property = st.selectbox(
+        "Hilton Property",
+        list(PORTFOLIO_HOTELS["Hilton"].keys()),
+        key="har_property",
+    )
+
+    today_month = datetime.date.today().replace(day=1)
+    month_options = []
+    cursor = today_month
+    for _ in range(18):
+        month_options.append(cursor)
+        cursor = (
+            cursor.replace(day=1) - datetime.timedelta(days=1)
+        ).replace(day=1)
+
+    default_months = month_options[:3]
+    har_months = st.multiselect(
+        "Months to build",
+        options=month_options,
+        default=default_months,
+        format_func=lambda d: d.strftime("%B %Y"),
+        key="har_months_multi",
+        help=(
+            "Select as many months as you want. The download will contain "
+            "one tab per month."
+        ),
+    )
+
+    st.markdown("**Upload three grouped source files**")
+    st.caption(
+        "Each file can contain every month selected above. The tool "
+        "splits NOR1 by Report Date and Lobby by Stay Date."
+    )
+
+    gc1, gc2, gc3 = st.columns(3)
+
+    with gc1:
+        har_nor1_current = st.file_uploader(
+            "Current-Year NOR1 — all selected months",
+            type=["xlsx"],
+            key="har_nor1_current_grouped",
         )
 
-        har_property = st.selectbox(
-            "Hilton Property",
-            list(PORTFOLIO_HOTELS["Hilton"].keys()),
-            key="har_property",
+    with gc2:
+        har_lobby = st.file_uploader(
+            "Lobby Add-ons — all selected months",
+            type=["xlsx"],
+            key="har_lobby_grouped",
         )
 
-        today_month = datetime.date.today().replace(day=1)
-        month_options = []
-        cursor = today_month
-        for _ in range(18):
-            month_options.append(cursor)
-            cursor = (
-                cursor.replace(day=1) - datetime.timedelta(days=1)
-            ).replace(day=1)
-
-        default_months = month_options[:3]
-        har_months = st.multiselect(
-            "Months to build",
-            options=month_options,
-            default=default_months,
-            format_func=lambda d: d.strftime("%B %Y"),
-            key="har_months_multi",
-            help=(
-                "Select as many months as you want. The download will contain "
-                "one tab per month."
-            ),
+    with gc3:
+        har_nor1_stly = st.file_uploader(
+            "STLY NOR1 — matching prior-year months",
+            type=["xlsx"],
+            key="har_nor1_stly_grouped",
         )
 
-        st.markdown("**Upload three grouped source files**")
-        st.caption(
-            "Each file can contain every month selected above. The tool "
-            "splits NOR1 by Report Date and Lobby by Stay Date."
+    all_ready = bool(har_months) and all([
+        har_nor1_current is not None,
+        har_lobby is not None,
+        har_nor1_stly is not None,
+    ])
+
+    month_uploads = []
+    for month_date in sorted(har_months):
+        month_dt = datetime.datetime(
+            month_date.year,
+            month_date.month,
+            1,
         )
+        month_uploads.append({
+            "report_month": month_dt,
+            "nor1_current_file": har_nor1_current,
+            "lobby_file": har_lobby,
+            "nor1_stly_file": har_nor1_stly,
+        })
 
-        gc1, gc2, gc3 = st.columns(3)
-
-        with gc1:
-            har_nor1_current = st.file_uploader(
-                "Current-Year NOR1 — all selected months",
-                type=["xlsx"],
-                key="har_nor1_current_grouped",
-            )
-
-        with gc2:
-            har_lobby = st.file_uploader(
-                "Lobby Add-ons — all selected months",
-                type=["xlsx"],
-                key="har_lobby_grouped",
-            )
-
-        with gc3:
-            har_nor1_stly = st.file_uploader(
-                "STLY NOR1 — matching prior-year months",
-                type=["xlsx"],
-                key="har_nor1_stly_grouped",
-            )
-
-        all_ready = bool(har_months) and all([
-            har_nor1_current is not None,
-            har_lobby is not None,
-            har_nor1_stly is not None,
-        ])
-
-        month_uploads = []
-        for month_date in sorted(har_months):
-            month_dt = datetime.datetime(
-                month_date.year,
-                month_date.month,
-                1,
-            )
-            month_uploads.append({
-                "report_month": month_dt,
-                "nor1_current_file": har_nor1_current,
-                "lobby_file": har_lobby,
-                "nor1_stly_file": har_nor1_stly,
-            })
-
-        if st.button(
-            "Build Hilton Ancillary Workbook",
-            type="primary",
-            key="har_build_multi",
-            disabled=not all_ready,
-            use_container_width=True,
-        ):
-            try:
-                with st.spinner("Building Hilton ancillary workbook..."):
-                    har_output, har_summaries = (
-                        hilton_ancillary_build_multi_month_report(
-                            property_name=har_property,
-                            month_inputs=month_uploads,
-                        )
+    if st.button(
+        "Build Hilton Ancillary Workbook",
+        type="primary",
+        key="har_build_multi",
+        disabled=not all_ready,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("Building Hilton ancillary workbook..."):
+                har_output, har_summaries = (
+                    hilton_ancillary_build_multi_month_report(
+                        property_name=har_property,
+                        month_inputs=month_uploads,
                     )
+                )
 
-                    years = sorted({
-                        item["report_month"].year
+                years = sorted({
+                    item["report_month"].year
+                    for item in month_uploads
+                })
+                year_label = (
+                    str(years[0])
+                    if len(years) == 1
+                    else f"{years[0]}-{years[-1]}"
+                )
+
+                st.session_state["har_output"] = har_output
+                st.session_state["har_summaries"] = har_summaries
+                st.session_state["har_filename"] = (
+                    f"{year_label} {har_property} NOR1 Upsell Report.xlsx"
+                )
+
+                # Save/merge the generated month tabs into the hotel's
+                # existing Hilton ancillary workbook in Drive.
+                drive_status = None
+                drive_warning = None
+                try:
+                    svc = get_drive_service()
+                    discovered = dict(get_hotels_from_drive())
+                    hotel_id = discovered.get(har_property, "")
+
+                    if not hotel_id:
+                        raise ValueError(
+                            f"Could not find {har_property}'s Drive folder "
+                            f"with the current Drive connection."
+                        )
+
+                    reference_month = max(
+                        item["report_month"]
                         for item in month_uploads
-                    })
-                    year_label = (
-                        str(years[0])
-                        if len(years) == 1
-                        else f"{years[0]}-{years[-1]}"
                     )
-
-                    st.session_state["har_output"] = har_output
-                    st.session_state["har_summaries"] = har_summaries
-                    st.session_state["har_filename"] = (
-                        f"{year_label} {har_property} NOR1 Upsell Report.xlsx"
-                    )
-
-                    # Save/merge the generated month tabs into the hotel's
-                    # existing Hilton ancillary workbook in Drive.
-                    drive_status = None
-                    drive_warning = None
-                    try:
-                        svc = get_drive_service()
-                        discovered = dict(get_hotels_from_drive())
-                        hotel_id = discovered.get(har_property, "")
-
-                        if not hotel_id:
-                            raise ValueError(
-                                f"Could not find {har_property}'s Drive folder "
-                                f"with the current Drive connection."
-                            )
-
-                        reference_month = max(
-                            item["report_month"]
-                            for item in month_uploads
+                    target, target_err = (
+                        hilton_ancillary_find_drive_report(
+                            svc,
+                            hotel_id,
+                            har_property,
+                            reference_month,
                         )
-                        target, target_err = (
-                            hilton_ancillary_find_drive_report(
-                                svc,
-                                hotel_id,
-                                har_property,
-                                reference_month,
+                    )
+                    if target_err or not target:
+                        raise ValueError(
+                            target_err
+                            or "Hilton ancillary Drive folder not found."
+                        )
+
+                    if target.get("file_id"):
+                        original_bytes = drive_download(
+                            svc,
+                            target["file_id"],
+                        )
+                        merged_bytes, inserted_tabs = (
+                            hilton_ancillary_merge_month_sheets(
+                                original_bytes,
+                                har_output,
+                                destination_name=target["file_name"],
                             )
+                        )
+                        drive_upload(
+                            svc,
+                            target["file_id"],
+                            merged_bytes,
+                            target["file_name"],
+                        )
+                        drive_status = (
+                            f"Updated **{target['file_name']}** in "
+                            f"**{target['folder_name']}** with "
+                            f"{', '.join(inserted_tabs)}."
+                        )
+                    else:
+                        created = drive_create_excel_file(
+                            svc,
+                            target["folder_id"],
+                            har_output,
+                            st.session_state["har_filename"],
+                        )
+                        drive_status = (
+                            f"Created **{created.get('name', st.session_state['har_filename'])}** "
+                            f"in **{target['folder_name']}**."
+                        )
+
+                except Exception as drive_exc:
+                    drive_warning = (
+                        "Hilton ancillary report was not updated in Drive: "
+                        f"{drive_exc}\n\n"
+                        "The monthly workbook was still built successfully. "
+                        "You can download it below while the Drive target "
+                        "is corrected."
+                    )
+
+                st.session_state["har_drive_status"] = drive_status
+                st.session_state["har_drive_warning"] = drive_warning
+
+            st.success(
+                f"Built {len(har_summaries)} Hilton month tab(s). "
+                "Front Desk and Expired Revenue cells are ready for "
+                "manual entry in the downloaded workbook."
+            )
+
+            if st.session_state.get("har_drive_status"):
+                st.success(st.session_state["har_drive_status"])
+
+            if st.session_state.get("har_drive_warning"):
+                st.warning(st.session_state["har_drive_warning"])
+        except Exception as e:
+            st.error(
+                f"Hilton ancillary report build error: {e}"
+            )
+
+    if "har_output" in st.session_state:
+        summaries = st.session_state.get("har_summaries", [])
+
+        if summaries:
+            preview_rows = []
+            for hs in summaries:
+                preview_rows.append({
+                    "Month": hs["month"].strftime("%b %Y"),
+                    "Current Revenue": hs.get(
+                        "currentTotalRevenue",
+                        0,
+                    ),
+                    "STLY NOR1 Revenue": hs.get(
+                        "stlyTotalRevenue",
+                        0,
+                    ),
+                    "YoY Revenue Variance": (
+                        hs.get("currentTotalRevenue", 0)
+                        - hs.get("stlyTotalRevenue", 0)
+                    ),
+                })
+
+            st.dataframe(
+                pd.DataFrame(preview_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            for hs in summaries:
+                for warning in hs.get("warnings", []):
+                    st.warning(
+                        f"{hs['month']:%b %Y}: {warning}"
+                    )
+
+        st.download_button(
+            "Download Hilton Ancillary Workbook",
+            data=st.session_state["har_output"],
+            file_name=st.session_state["har_filename"],
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            key="har_download_multi",
+            use_container_width=True,
+        )
+
+
+def _render_arev_independent_tab():
+    st.markdown("### SNT / Independent Hotels")
+    st.caption(
+        "Builds the monthly report from the universal template. After reviewing "
+        "the result, you can save the month directly into the hotel's existing "
+        "Canary and/or SNT Report workbook in Drive."
+    )
+
+    ar_properties = [p['display'] for p in ANCILLARY_PROPERTY_PROFILES.values()]
+    # Remove duplicate display names while preserving order.
+    ar_properties = list(dict.fromkeys(ar_properties))
+    ar_property = st.selectbox("Property", ar_properties, key="ar_monthly_property")
+    ar_profile, ar_key = ancillary_profile(ar_property)
+
+    # Hotel 1620 is tracked as cumulative MTD weekly snapshots inside one
+    # month tab. Keep this separate from the standard monthly report builder.
+    if ar_key == "hotel 1620":
+        st.info(
+            "Hotel 1620 / Plymouth uses the weekly tracking format. "
+            "Use this section for weekly updates and month-end tracking."
+        )
+
+        with st.expander("Hotel 1620 — Weekly Ancillary Update", expanded=True):
+            pw_month_date = st.date_input(
+                "Plymouth report month",
+                value=datetime.date.today().replace(day=1),
+                key="pw_month",
+            )
+            pw_month_dt = datetime.datetime(
+                pw_month_date.year, pw_month_date.month, 1
+            )
+
+            wcol1, wcol2, wcol3 = st.columns(3)
+            with wcol1:
+                pw_week = st.selectbox(
+                    "Week slot",
+                    [1, 2, 3, 4, 5],
+                    key="pw_week_slot",
+                    help=(
+                        "Each upload is month-to-date. Week 1 writes B/C, "
+                        "Week 2 D/E, Week 3 F/G, Week 4 H/I, Week 5 J/K."
+                    ),
+                )
+            with wcol2:
+                pw_week_date = st.date_input(
+                    "As-of date",
+                    value=datetime.date.today(),
+                    key="pw_week_date",
+                )
+            with wcol3:
+                pw_month_end = st.checkbox(
+                    "Month End",
+                    value=False,
+                    key="pw_month_end",
+                )
+
+            st.caption(
+                "Upload SNT reports covering the **1st of the month through "
+                "this as-of date**. The updater writes the cumulative MTD "
+                "snapshot into the selected week pair."
+            )
+
+            st.markdown("**Current-year MTD source**")
+            pw_addon = st.file_uploader(
+                "Plymouth SNT Add On Production",
+                type=["csv", "xlsx"],
+                key="pw_addon",
+            )
+            pw_upsell = st.file_uploader(
+                "Plymouth SNT Upsell By Day/User",
+                type=["csv", "xlsx"],
+                key="pw_upsell",
+            )
+
+            st.markdown(f"**STLY MTD source — {pw_month_dt.year - 1}**")
+            pw_stly_addon = st.file_uploader(
+                f"Plymouth {pw_month_dt.year - 1} SNT Add On Production",
+                type=["csv", "xlsx"],
+                key="pw_stly_addon",
+            )
+            pw_stly_upsell = st.file_uploader(
+                f"Plymouth {pw_month_dt.year - 1} SNT Upsell By Day/User",
+                type=["csv", "xlsx"],
+                key="pw_stly_upsell",
+            )
+
+            st.markdown("**Revenue by Agent source**")
+            pw_commission = st.file_uploader(
+                "1620 Employee Commission Recognition Form Responses",
+                type=["xlsx", "csv"],
+                key="pw_commission",
+                help=(
+                    "Upload the current Google Form response export. "
+                    "The tool filters Add On Revenue Posting Date from the "
+                    "1st of the selected month through the as-of date."
+                ),
+            )
+
+            st.markdown("**Journal totals — MTD as of this week**")
+            pjc1, pjc2 = st.columns(2)
+            with pjc1:
+                pw_eci = st.number_input(
+                    "Early Check In — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_eci",
+                )
+                pw_stly_eci = st.number_input(
+                    "STLY Early Check In — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_stly_eci",
+                )
+            with pjc2:
+                pw_lco = st.number_input(
+                    "Late Checkout — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_lco",
+                )
+                pw_stly_lco = st.number_input(
+                    "STLY Late Checkout — Journal Total",
+                    value=0.0,
+                    step=1.0,
+                    key="pw_stly_lco",
+                )
+
+            st.markdown("**Weekly Canary messaging KPI update (optional)**")
+            with st.container(border=True):
+                pm1, pm2 = st.columns(2)
+                with pm1:
+                    pw_msg_total = st.number_input(
+                        "Plymouth Total Messages", value=0.0, key="pw_msg_total"
+                    )
+                    pw_msg_guest = st.number_input(
+                        "Plymouth Guest Messages", value=0.0, key="pw_msg_guest"
+                    )
+                    pw_msg_hotel = st.number_input(
+                        "Plymouth Hotel Messages", value=0.0, key="pw_msg_hotel"
+                    )
+                    pw_msg_pct = st.number_input(
+                        "Plymouth % Guests Messaged",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_msg_pct",
+                    )
+                with pm2:
+                    pw_resp = st.number_input(
+                        "Plymouth Response Rate %",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_resp",
+                    )
+                    pw_avg = st.number_input(
+                        "Plymouth Avg Minutes to Respond",
+                        value=0.0,
+                        key="pw_avg",
+                    )
+                    pw_med = st.number_input(
+                        "Plymouth Median Minutes to Respond",
+                        value=0.0,
+                        key="pw_med",
+                    )
+                    pw_engagement = st.number_input(
+                        "Engagement Rate % for this week",
+                        min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                        key="pw_engagement",
+                    )
+
+            pw_ready = all([
+                pw_addon is not None,
+                pw_upsell is not None,
+                pw_stly_addon is not None,
+                pw_stly_upsell is not None,
+                pw_commission is not None,
+            ])
+
+            if st.button(
+                "Build Plymouth Weekly Update",
+                type="primary",
+                key="pw_build",
+                disabled=not pw_ready,
+            ):
+                try:
+                    svc = get_drive_service()
+                    with st.spinner(
+                        "Loading Plymouth tracker from Drive and updating the selected week..."
+                    ):
+                        target, target_err = _plymouth_resolve_drive_target(
+                            svc, pw_month_dt
                         )
                         if target_err or not target:
                             raise ValueError(
-                                target_err
-                                or "Hilton ancillary Drive folder not found."
+                                target_err or "Plymouth tracking workbook not found."
                             )
 
-                        if target.get("file_id"):
-                            original_bytes = drive_download(
-                                svc,
-                                target["file_id"],
-                            )
-                            merged_bytes, inserted_tabs = (
-                                hilton_ancillary_merge_month_sheets(
-                                    original_bytes,
-                                    har_output,
-                                    destination_name=target["file_name"],
-                                )
-                            )
-                            drive_upload(
-                                svc,
-                                target["file_id"],
-                                merged_bytes,
-                                target["file_name"],
-                            )
-                            drive_status = (
-                                f"Updated **{target['file_name']}** in "
-                                f"**{target['folder_name']}** with "
-                                f"{', '.join(inserted_tabs)}."
-                            )
-                        else:
-                            created = drive_create_excel_file(
-                                svc,
-                                target["folder_id"],
-                                har_output,
-                                st.session_state["har_filename"],
-                            )
-                            drive_status = (
-                                f"Created **{created.get('name', st.session_state['har_filename'])}** "
-                                f"in **{target['folder_name']}**."
-                            )
-
-                    except Exception as drive_exc:
-                        drive_warning = (
-                            "Hilton ancillary report was not updated in Drive: "
-                            f"{drive_exc}\n\n"
-                            "The monthly workbook was still built successfully. "
-                            "You can download it below while the Drive target "
-                            "is corrected."
+                        original_bytes = drive_download(
+                            svc, target["file_id"]
                         )
 
-                    st.session_state["har_drive_status"] = drive_status
-                    st.session_state["har_drive_warning"] = drive_warning
+                        pw_messaging = {
+                            "msgTotal": pw_msg_total,
+                            "msgGuest": pw_msg_guest,
+                            "msgHotel": pw_msg_hotel,
+                            "msgGuestPct": pw_msg_pct / 100.0,
+                            "responseRate": pw_resp / 100.0,
+                            "avgResponse": pw_avg,
+                            "medianResponse": pw_med,
+                        }
 
-                st.success(
-                    f"Built {len(har_summaries)} Hilton month tab(s). "
-                    "Front Desk and Expired Revenue cells are ready for "
-                    "manual entry in the downloaded workbook."
-                )
-
-                if st.session_state.get("har_drive_status"):
-                    st.success(st.session_state["har_drive_status"])
-
-                if st.session_state.get("har_drive_warning"):
-                    st.warning(st.session_state["har_drive_warning"])
-            except Exception as e:
-                st.error(
-                    f"Hilton ancillary report build error: {e}"
-                )
-
-        if "har_output" in st.session_state:
-            summaries = st.session_state.get("har_summaries", [])
-
-            if summaries:
-                preview_rows = []
-                for hs in summaries:
-                    preview_rows.append({
-                        "Month": hs["month"].strftime("%b %Y"),
-                        "Current Revenue": hs.get(
-                            "currentTotalRevenue",
-                            0,
-                        ),
-                        "STLY NOR1 Revenue": hs.get(
-                            "stlyTotalRevenue",
-                            0,
-                        ),
-                        "YoY Revenue Variance": (
-                            hs.get("currentTotalRevenue", 0)
-                            - hs.get("stlyTotalRevenue", 0)
-                        ),
-                    })
-
-                st.dataframe(
-                    pd.DataFrame(preview_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                for hs in summaries:
-                    for warning in hs.get("warnings", []):
-                        st.warning(
-                            f"{hs['month']:%b %Y}: {warning}"
+                        updated_bytes, pw_summary = plymouth_build_weekly_update(
+                            workbook_bytes=original_bytes,
+                            report_month=pw_month_dt,
+                            week_slot=pw_week,
+                            week_date=pw_week_date,
+                            addon_file=pw_addon,
+                            upsell_file=pw_upsell,
+                            stly_addon_file=pw_stly_addon,
+                            stly_upsell_file=pw_stly_upsell,
+                            commission_file=pw_commission,
+                            journal_values=[pw_eci, pw_lco],
+                            stly_journal_values=[pw_stly_eci, pw_stly_lco],
+                            messaging=pw_messaging,
+                            engagement_rate=pw_engagement / 100.0,
+                            month_end=pw_month_end,
                         )
 
-            st.download_button(
-                "Download Hilton Ancillary Workbook",
-                data=st.session_state["har_output"],
-                file_name=st.session_state["har_filename"],
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                key="har_download_multi",
-                use_container_width=True,
-            )
-    elif ancillary_platform == "SNT / Independent Hotels":
-        st.markdown("### SNT / Independent Hotels")
-        st.caption(
-            "Builds the monthly report from the universal template. After reviewing "
-            "the result, you can save the month directly into the hotel's existing "
-            "Canary and/or SNT Report workbook in Drive."
-        )
+                        st.session_state["pw_output"] = updated_bytes
+                        st.session_state["pw_summary"] = pw_summary
+                        st.session_state["pw_target"] = target
+                        st.session_state["pw_original"] = original_bytes
 
-        ar_properties = [p['display'] for p in ANCILLARY_PROPERTY_PROFILES.values()]
-        # Remove duplicate display names while preserving order.
-        ar_properties = list(dict.fromkeys(ar_properties))
-        ar_property = st.selectbox("Property", ar_properties, key="ar_monthly_property")
-        ar_profile, ar_key = ancillary_profile(ar_property)
-
-        # Hotel 1620 is tracked as cumulative MTD weekly snapshots inside one
-        # month tab. Keep this separate from the standard monthly report builder.
-        if ar_key == "hotel 1620":
-            st.info(
-                "Hotel 1620 / Plymouth uses the weekly tracking format. "
-                "Use this section for weekly updates and month-end tracking."
-            )
-
-            with st.expander("Hotel 1620 — Weekly Ancillary Update", expanded=True):
-                pw_month_date = st.date_input(
-                    "Plymouth report month",
-                    value=datetime.date.today().replace(day=1),
-                    key="pw_month",
-                )
-                pw_month_dt = datetime.datetime(
-                    pw_month_date.year, pw_month_date.month, 1
-                )
-
-                wcol1, wcol2, wcol3 = st.columns(3)
-                with wcol1:
-                    pw_week = st.selectbox(
-                        "Week slot",
-                        [1, 2, 3, 4, 5],
-                        key="pw_week_slot",
-                        help=(
-                            "Each upload is month-to-date. Week 1 writes B/C, "
-                            "Week 2 D/E, Week 3 F/G, Week 4 H/I, Week 5 J/K."
-                        ),
+                    st.success(
+                        f"Built {pw_summary['sheet']} — "
+                        f"{pw_summary['weekLabel']}."
                     )
-                with wcol2:
-                    pw_week_date = st.date_input(
-                        "As-of date",
-                        value=datetime.date.today(),
-                        key="pw_week_date",
-                    )
-                with wcol3:
-                    pw_month_end = st.checkbox(
-                        "Month End",
-                        value=False,
-                        key="pw_month_end",
-                    )
-
-                st.caption(
-                    "Upload SNT reports covering the **1st of the month through "
-                    "this as-of date**. The updater writes the cumulative MTD "
-                    "snapshot into the selected week pair."
-                )
-
-                st.markdown("**Current-year MTD source**")
-                pw_addon = st.file_uploader(
-                    "Plymouth SNT Add On Production",
-                    type=["csv", "xlsx"],
-                    key="pw_addon",
-                )
-                pw_upsell = st.file_uploader(
-                    "Plymouth SNT Upsell By Day/User",
-                    type=["csv", "xlsx"],
-                    key="pw_upsell",
-                )
-
-                st.markdown(f"**STLY MTD source — {pw_month_dt.year - 1}**")
-                pw_stly_addon = st.file_uploader(
-                    f"Plymouth {pw_month_dt.year - 1} SNT Add On Production",
-                    type=["csv", "xlsx"],
-                    key="pw_stly_addon",
-                )
-                pw_stly_upsell = st.file_uploader(
-                    f"Plymouth {pw_month_dt.year - 1} SNT Upsell By Day/User",
-                    type=["csv", "xlsx"],
-                    key="pw_stly_upsell",
-                )
-
-                st.markdown("**Revenue by Agent source**")
-                pw_commission = st.file_uploader(
-                    "1620 Employee Commission Recognition Form Responses",
-                    type=["xlsx", "csv"],
-                    key="pw_commission",
-                    help=(
-                        "Upload the current Google Form response export. "
-                        "The tool filters Add On Revenue Posting Date from the "
-                        "1st of the selected month through the as-of date."
-                    ),
-                )
-
-                st.markdown("**Journal totals — MTD as of this week**")
-                pjc1, pjc2 = st.columns(2)
-                with pjc1:
-                    pw_eci = st.number_input(
-                        "Early Check In — Journal Total",
-                        value=0.0,
-                        step=1.0,
-                        key="pw_eci",
-                    )
-                    pw_stly_eci = st.number_input(
-                        "STLY Early Check In — Journal Total",
-                        value=0.0,
-                        step=1.0,
-                        key="pw_stly_eci",
-                    )
-                with pjc2:
-                    pw_lco = st.number_input(
-                        "Late Checkout — Journal Total",
-                        value=0.0,
-                        step=1.0,
-                        key="pw_lco",
-                    )
-                    pw_stly_lco = st.number_input(
-                        "STLY Late Checkout — Journal Total",
-                        value=0.0,
-                        step=1.0,
-                        key="pw_stly_lco",
-                    )
-
-                st.markdown("**Weekly Canary messaging KPI update (optional)**")
-                with st.container(border=True):
-                    pm1, pm2 = st.columns(2)
-                    with pm1:
-                        pw_msg_total = st.number_input(
-                            "Plymouth Total Messages", value=0.0, key="pw_msg_total"
-                        )
-                        pw_msg_guest = st.number_input(
-                            "Plymouth Guest Messages", value=0.0, key="pw_msg_guest"
-                        )
-                        pw_msg_hotel = st.number_input(
-                            "Plymouth Hotel Messages", value=0.0, key="pw_msg_hotel"
-                        )
-                        pw_msg_pct = st.number_input(
-                            "Plymouth % Guests Messaged",
-                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
-                            key="pw_msg_pct",
-                        )
-                    with pm2:
-                        pw_resp = st.number_input(
-                            "Plymouth Response Rate %",
-                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
-                            key="pw_resp",
-                        )
-                        pw_avg = st.number_input(
-                            "Plymouth Avg Minutes to Respond",
-                            value=0.0,
-                            key="pw_avg",
-                        )
-                        pw_med = st.number_input(
-                            "Plymouth Median Minutes to Respond",
-                            value=0.0,
-                            key="pw_med",
-                        )
-                        pw_engagement = st.number_input(
-                            "Engagement Rate % for this week",
-                            min_value=0.0, max_value=100.0, value=0.0, step=0.1,
-                            key="pw_engagement",
-                        )
-
-                pw_ready = all([
-                    pw_addon is not None,
-                    pw_upsell is not None,
-                    pw_stly_addon is not None,
-                    pw_stly_upsell is not None,
-                    pw_commission is not None,
-                ])
-
-                if st.button(
-                    "Build Plymouth Weekly Update",
-                    type="primary",
-                    key="pw_build",
-                    disabled=not pw_ready,
-                ):
-                    try:
-                        svc = get_drive_service()
-                        with st.spinner(
-                            "Loading Plymouth tracker from Drive and updating the selected week..."
-                        ):
-                            target, target_err = _plymouth_resolve_drive_target(
-                                svc, pw_month_dt
-                            )
-                            if target_err or not target:
-                                raise ValueError(
-                                    target_err or "Plymouth tracking workbook not found."
-                                )
-
-                            original_bytes = drive_download(
-                                svc, target["file_id"]
-                            )
-
-                            pw_messaging = {
-                                "msgTotal": pw_msg_total,
-                                "msgGuest": pw_msg_guest,
-                                "msgHotel": pw_msg_hotel,
-                                "msgGuestPct": pw_msg_pct / 100.0,
-                                "responseRate": pw_resp / 100.0,
-                                "avgResponse": pw_avg,
-                                "medianResponse": pw_med,
-                            }
-
-                            updated_bytes, pw_summary = plymouth_build_weekly_update(
-                                workbook_bytes=original_bytes,
-                                report_month=pw_month_dt,
-                                week_slot=pw_week,
-                                week_date=pw_week_date,
-                                addon_file=pw_addon,
-                                upsell_file=pw_upsell,
-                                stly_addon_file=pw_stly_addon,
-                                stly_upsell_file=pw_stly_upsell,
-                                commission_file=pw_commission,
-                                journal_values=[pw_eci, pw_lco],
-                                stly_journal_values=[pw_stly_eci, pw_stly_lco],
-                                messaging=pw_messaging,
-                                engagement_rate=pw_engagement / 100.0,
-                                month_end=pw_month_end,
-                            )
-
-                            st.session_state["pw_output"] = updated_bytes
-                            st.session_state["pw_summary"] = pw_summary
-                            st.session_state["pw_target"] = target
-                            st.session_state["pw_original"] = original_bytes
-
-                        st.success(
-                            f"Built {pw_summary['sheet']} — "
-                            f"{pw_summary['weekLabel']}."
-                        )
-                    except Exception as e:
-                        st.error(f"Plymouth weekly build error: {e}")
-
-                if st.session_state.get("pw_output"):
-                    ps = st.session_state.get("pw_summary", {})
-                    pc1, pc2, pc3, pc4 = st.columns(4)
-                    pc1.metric("Current rows", ps.get("currentWritten", 0))
-                    pc2.metric("STLY rows", ps.get("stlyWritten", 0))
-                    pc3.metric("Current itemized", ps.get("itemizedWritten", 0))
-                    pc4.metric("STLY itemized", ps.get("stlyItemizedWritten", 0))
-
-                    missing = (
-                        ps.get("missingCurrent", [])
-                        + ps.get("missingSTLY", [])
-                        + ps.get("missingItemized", [])
-                        + ps.get("missingSTLYItemized", [])
-                    )
-                    dynamic_added = ps.get("addedDynamicRows", {})
-                    added_names = (
-                        dynamic_added.get("current", [])
-                        + dynamic_added.get("stly", [])
-                        + dynamic_added.get("variance", [])
-                    )
-                    if added_names:
-                        st.success(
-                            "Added new month tracking rows automatically: "
-                            + ", ".join(sorted(set(added_names)))
-                        )
-
-                    if ps.get("topAgent"):
-                        st.info(
-                            f"Top staff upseller for this MTD snapshot: "
-                            f"**{ps['topAgent']}**"
-                        )
-
-                    if missing:
-                        st.markdown(
-                            "**Items in the uploaded reports not found on this month tab**"
-                        )
-                        with st.container(border=True):
-                            st.write(sorted(set(x for x in missing if x)))
-                            st.caption(
-                                "These are not silently inserted because inserting "
-                                "rows can disturb Plymouth's side tables/charts. "
-                                "Add the new row to the month template once, then "
-                                "rerun the same week."
-                            )
-
-                    pdl, psv, pundo = st.columns(3)
-                    with pdl:
-                        st.download_button(
-                            "Download Plymouth Weekly Workbook",
-                            data=st.session_state["pw_output"],
-                            file_name=(
-                                f"{pw_month_dt.year} Plymouth Ancillary "
-                                f"{pw_month_dt.strftime('%b').upper()} "
-                                f"WK{pw_week}.xlsx"
-                            ),
-                            mime=(
-                                "application/vnd.openxmlformats-officedocument."
-                                "spreadsheetml.sheet"
-                            ),
-                            key="pw_download",
-                            use_container_width=True,
-                        )
-
-                    with psv:
-                        if st.button(
-                            "Save Plymouth Weekly Update to Drive",
-                            key="pw_save_drive",
-                            type="primary",
-                            use_container_width=True,
-                        ):
-                            try:
-                                svc = get_drive_service()
-                                target = st.session_state["pw_target"]
-                                original = st.session_state["pw_original"]
-
-                                st.session_state["pw_drive_undo"] = {
-                                    "file_id": target["file_id"],
-                                    "file_name": target["file_name"],
-                                    "bytes": original,
-                                }
-
-                                drive_upload(
-                                    svc,
-                                    target["file_id"],
-                                    st.session_state["pw_output"],
-                                    target["file_name"],
-                                )
-                                st.success(
-                                    f"Saved {ps.get('sheet')} "
-                                    f"{ps.get('weekLabel')} into "
-                                    f"**{target['file_name']}**."
-                                )
-                            except Exception as e:
-                                st.error(
-                                    f"Could not save Plymouth weekly update: {e}"
-                                )
-
-                    with pundo:
-                        if st.button(
-                            "↩ Undo Last 1620 Upload",
-                            key="pw_undo_drive",
-                            type="secondary",
-                            use_container_width=True,
-                            disabled=not bool(
-                                st.session_state.get("pw_drive_undo")
-                            ),
-                        ):
-                            try:
-                                undo = st.session_state["pw_drive_undo"]
-                                drive_upload(
-                                    get_drive_service(),
-                                    undo["file_id"],
-                                    undo["bytes"],
-                                    undo["file_name"],
-                                )
-                                st.session_state.pop("pw_drive_undo", None)
-                                st.session_state.pop("pw_output", None)
-                                st.success(
-                                    "Restored the Plymouth workbook to the version "
-                                    "from immediately before the last 1620 upload."
-                                )
-                            except Exception as e:
-                                st.error(
-                                    f"Could not undo the last Plymouth upload: {e}"
-                                )
-
-            st.divider()
-
-        if ar_key != "hotel 1620":
-            st.markdown("### Multi-Month SNT / Independent Report Builder")
-            st.caption(
-                "Select as many months as you need. Upload one grouped current-year "
-                "Add On Production file and one grouped Upsell By Day/User file covering "
-                "all selected months. STLY automatically follows this property's configured "
-                "source: grouped SNT files or one grouped Canary export."
-            )
-
-            ar_month_options = _ar_status_month_options(18)
-            ar_default_months = ar_month_options[:1]
-            ar_months = st.multiselect(
-                "Months to build",
-                options=ar_month_options,
-                default=ar_default_months,
-                format_func=lambda d: d.strftime("%B %Y"),
-                key="ar_snt_months_multi",
-            )
-            ar_months = sorted(ar_months)
-
-            local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
-            ar_template_upload = None
-            if local_template.exists():
-                st.success(f"Using bundled template: {ANCILLARY_TEMPLATE_FILENAME}")
-            else:
-                st.info(
-                    f"Add **{ANCILLARY_TEMPLATE_FILENAME}** to the GitHub repo beside app.py "
-                    "for permanent use. For testing, upload it here."
-                )
-                ar_template_upload = st.file_uploader(
-                    "Ancillary Report Builder template workbook",
-                    type=["xlsx"],
-                    key="ar_snt_multi_template_upload",
-                )
-
-            st.markdown("**Current-year grouped SNT source**")
-            gcur1, gcur2 = st.columns(2)
-            with gcur1:
-                ar_grouped_addon = st.file_uploader(
-                    "SNT Add On Production — all selected months",
-                    type=["csv", "xlsx"],
-                    key=f"ar_grouped_addon_{ar_key}",
-                    help="Upload one file containing every current-year month selected above.",
-                )
-            with gcur2:
-                ar_grouped_upsell = st.file_uploader(
-                    "SNT Upsell By Day/User — all selected months",
-                    type=["csv", "xlsx"],
-                    key=f"ar_grouped_upsell_{ar_key}",
-                    help="Upload one file containing every current-year month selected above.",
-                )
-
-            ar_grouped_stly_addon = ar_grouped_stly_upsell = ar_grouped_canary_history = None
-            st.markdown(f"**STLY grouped source — {ar_profile.get('stlySource')}**")
-            if ar_profile.get('stlySource') == 'SNT':
-                gstly1, gstly2 = st.columns(2)
-                with gstly1:
-                    ar_grouped_stly_addon = st.file_uploader(
-                        "STLY SNT Add On Production — all matching prior-year months",
-                        type=["csv", "xlsx"],
-                        key=f"ar_grouped_stly_addon_{ar_key}",
-                    )
-                with gstly2:
-                    ar_grouped_stly_upsell = st.file_uploader(
-                        "STLY SNT Upsell By Day/User — all matching prior-year months",
-                        type=["csv", "xlsx"],
-                        key=f"ar_grouped_stly_upsell_{ar_key}",
-                    )
-            else:
-                ar_grouped_canary_history = st.file_uploader(
-                    "Historical Canary Upsells — all matching prior-year months",
-                    type=["csv", "xlsx"],
-                    key=f"ar_grouped_canary_history_{ar_key}",
-                    help="One Canary export can contain all matching STLY months; Arrival Date is used to split them.",
-                )
-
-            ar_month_bundles = []
-            ar_all_required = bool(ar_months) and ar_grouped_addon is not None and ar_grouped_upsell is not None
-            if ar_profile.get('stlySource') == 'SNT':
-                ar_all_required = ar_all_required and ar_grouped_stly_addon is not None and ar_grouped_stly_upsell is not None
-            else:
-                ar_all_required = ar_all_required and ar_grouped_canary_history is not None
-
-            for month_date in ar_months:
-                ar_month_dt = datetime.datetime(month_date.year, month_date.month, 1)
-                mkey = f"{ar_month_dt.year}_{ar_month_dt.month:02d}"
-                stly_year = ar_month_dt.year - 1
-
-                with st.container(border=True):
-                    st.markdown(f"#### {ar_month_dt.strftime('%B %Y')}")
-                    st.caption(
-                        "Revenue source files are shared above. Enter only this month's "
-                        "journal and messaging information here."
-                    )
-
-                    ar_staff = st.file_uploader(
-                        f"{ar_month_dt.strftime('%b %Y')} Canary Message Count by Staff (optional)",
-                        type=["csv", "xlsx"],
-                        key=f"ar_multi_staff_{ar_key}_{mkey}",
-                    )
-
-                    if ar_profile.get('journal', []):
-                        st.markdown("**SNT Journal revenue**")
-                    ar_journal_values = []
-                    journals = ar_profile.get('journal', [])
-                    journal_cols = st.columns(2) if journals else []
-                    for i, journal in enumerate(journals):
-                        with journal_cols[i % 2]:
-                            value = st.number_input(
-                                journal['label'],
-                                min_value=-1000000.0,
-                                max_value=1000000.0,
-                                value=0.0,
-                                step=1.0,
-                                key=f"ar_multi_journal_{ar_key}_{mkey}_{i}",
-                                help=f"Main report line: {journal['report']}",
-                            )
-                            ar_journal_values.append(value)
-
-                    ar_stly_journal_values = []
-                    if ar_profile.get('stlySource') == 'SNT' and ar_profile.get('stlyJournal'):
-                        st.markdown(f"**{stly_year} STLY Journal revenue**")
-                        stly_cols = st.columns(2)
-                        for i, journal in enumerate(journals[:2]):
-                            with stly_cols[i % 2]:
-                                value = st.number_input(
-                                    f"STLY — {journal['report']}",
-                                    min_value=-1000000.0,
-                                    max_value=1000000.0,
-                                    value=0.0,
-                                    step=1.0,
-                                    key=f"ar_multi_stly_journal_{ar_key}_{mkey}_{i}",
-                                )
-                                ar_stly_journal_values.append(value)
-
-                    st.markdown("**Canary Messaging Overview**")
-                    msg_cur, msg_stly = st.columns(2)
-                    with msg_cur:
-                        st.markdown(f"**{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year}**")
-                        msg_total = st.number_input("Total Messages", value=0.0, key=f"ar_multi_msg_total_{ar_key}_{mkey}")
-                        msg_guest = st.number_input("Guest Messages", value=0.0, key=f"ar_multi_msg_guest_{ar_key}_{mkey}")
-                        msg_hotel = st.number_input("Hotel Messages", value=0.0, key=f"ar_multi_msg_hotel_{ar_key}_{mkey}")
-                        msg_pct_ui = st.number_input("% Guests Messaged", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_msg_pct_{ar_key}_{mkey}")
-                        resp_ui = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_resp_{ar_key}_{mkey}")
-                        avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"ar_multi_avg_{ar_key}_{mkey}")
-                        engagement_ui = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_engagement_{ar_key}_{mkey}")
-
-                    with msg_stly:
-                        st.markdown(f"**STLY — {stly_year}**")
-                        stly_total = st.number_input("STLY Total Messages", value=0.0, key=f"ar_multi_stly_total_{ar_key}_{mkey}")
-                        stly_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"ar_multi_stly_guest_{ar_key}_{mkey}")
-                        stly_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"ar_multi_stly_hotel_{ar_key}_{mkey}")
-                        stly_pct_ui = st.number_input("STLY % Guests Messaged", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_pct_{ar_key}_{mkey}")
-                        stly_resp_ui = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_resp_{ar_key}_{mkey}")
-                        stly_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"ar_multi_stly_avg_{ar_key}_{mkey}")
-                        stly_engagement_ui = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_engagement_{ar_key}_{mkey}")
-
-                    ar_messaging = {
-                        'msgTotal': msg_total,
-                        'msgGuest': msg_guest,
-                        'msgHotel': msg_hotel,
-                        'msgGuestPct': msg_pct_ui / 100.0,
-                        'responseRate': resp_ui / 100.0,
-                        'avgResponse': avg,
-                        'engagementRate': engagement_ui / 100.0,
-                        'stlyMsgTotal': stly_total,
-                        'stlyMsgGuest': stly_guest,
-                        'stlyMsgHotel': stly_hotel,
-                        'stlyMsgGuestPct': stly_pct_ui / 100.0,
-                        'stlyResponseRate': stly_resp_ui / 100.0,
-                        'stlyAvgResponse': stly_avg,
-                        'stlyEngagementRate': stly_engagement_ui / 100.0,
-                    }
-
-                    ar_month_bundles.append({
-                        "report_month": ar_month_dt,
-                        "staff_file": ar_staff,
-                        "journal_values": ar_journal_values,
-                        "stly_journal_values": ar_stly_journal_values,
-                        "messaging": ar_messaging,
-                    })
-
-            template_ok = local_template.exists() or ar_template_upload is not None
-            if st.button(
-                "Build Selected Ancillary Months",
-                type="primary",
-                key="ar_build_snt_multi",
-                disabled=not (ar_all_required and template_ok),
-            ):
-                try:
-                    with st.spinner("Building selected ancillary months..."):
-                        template_bytes = local_template.read_bytes() if local_template.exists() else ar_template_upload.getvalue()
-                        ar_output, ar_summaries, ar_generated = ancillary_build_snt_multi_month_report(
-                            template_bytes=template_bytes,
-                            property_name=ar_property,
-                            month_inputs=ar_month_bundles,
-                            current_addon_file=ar_grouped_addon,
-                            current_upsell_file=ar_grouped_upsell,
-                            stly_addon_file=ar_grouped_stly_addon,
-                            stly_upsell_file=ar_grouped_stly_upsell,
-                            canary_history_file=ar_grouped_canary_history,
-                        )
-                        years = sorted({m.year for m in ar_months})
-                        year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
-                        st.session_state['ar_snt_multi_output'] = ar_output
-                        st.session_state['ar_snt_multi_summaries'] = ar_summaries
-                        st.session_state['ar_snt_multi_generated'] = ar_generated
-                        st.session_state['ar_snt_multi_months'] = list(ar_months)
-                        st.session_state['ar_snt_multi_property'] = ar_property
-                        st.session_state['ar_snt_multi_key'] = ar_key
-                        st.session_state['ar_snt_multi_filename'] = f"{year_label} Ancillary Revenue - {ar_property}.xlsx"
-                    st.success(f"Built {len(ar_summaries)} month tab(s).")
                 except Exception as e:
-                    st.error(f"Multi-month ancillary report build error: {e}")
+                    st.error(f"Plymouth weekly build error: {e}")
 
-            if 'ar_snt_multi_output' in st.session_state:
-                summaries = st.session_state.get('ar_snt_multi_summaries', [])
-                preview_rows = []
-                for item in summaries:
-                    summary = item.get('summary', {})
-                    main = summary.get('mainRows', [])
-                    stly = summary.get('stly', {})
-                    variance = summary.get('variance', [])
-                    preview_rows.append({
-                        "Month": item['month'].strftime('%b %Y'),
-                        "Current Revenue": sum(_ar_num(x.get('revenue')) or 0 for x in main),
-                        "STLY Revenue": sum(_ar_num(x.get('approved')) or 0 for x in stly.get('rows', [])),
-                        "YoY Variance": sum(_ar_num(x.get('variance')) or 0 for x in variance),
-                    })
-                if preview_rows:
-                    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+            if st.session_state.get("pw_output"):
+                ps = st.session_state.get("pw_summary", {})
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                pc1.metric("Current rows", ps.get("currentWritten", 0))
+                pc2.metric("STLY rows", ps.get("stlyWritten", 0))
+                pc3.metric("Current itemized", ps.get("itemizedWritten", 0))
+                pc4.metric("STLY itemized", ps.get("stlyItemizedWritten", 0))
 
-                download_col, drive_col = st.columns(2)
-                with download_col:
+                missing = (
+                    ps.get("missingCurrent", [])
+                    + ps.get("missingSTLY", [])
+                    + ps.get("missingItemized", [])
+                    + ps.get("missingSTLYItemized", [])
+                )
+                dynamic_added = ps.get("addedDynamicRows", {})
+                added_names = (
+                    dynamic_added.get("current", [])
+                    + dynamic_added.get("stly", [])
+                    + dynamic_added.get("variance", [])
+                )
+                if added_names:
+                    st.success(
+                        "Added new month tracking rows automatically: "
+                        + ", ".join(sorted(set(added_names)))
+                    )
+
+                if ps.get("topAgent"):
+                    st.info(
+                        f"Top staff upseller for this MTD snapshot: "
+                        f"**{ps['topAgent']}**"
+                    )
+
+                if missing:
+                    st.markdown(
+                        "**Items in the uploaded reports not found on this month tab**"
+                    )
+                    with st.container(border=True):
+                        st.write(sorted(set(x for x in missing if x)))
+                        st.caption(
+                            "These are not silently inserted because inserting "
+                            "rows can disturb Plymouth's side tables/charts. "
+                            "Add the new row to the month template once, then "
+                            "rerun the same week."
+                        )
+
+                pdl, psv, pundo = st.columns(3)
+                with pdl:
                     st.download_button(
-                        "Download Multi-Month Ancillary Workbook",
-                        data=st.session_state['ar_snt_multi_output'],
-                        file_name=st.session_state.get('ar_snt_multi_filename', 'Ancillary Revenue Report.xlsx'),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="ar_download_snt_multi",
+                        "Download Plymouth Weekly Workbook",
+                        data=st.session_state["pw_output"],
+                        file_name=(
+                            f"{pw_month_dt.year} Plymouth Ancillary "
+                            f"{pw_month_dt.strftime('%b').upper()} "
+                            f"WK{pw_week}.xlsx"
+                        ),
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        key="pw_download",
                         use_container_width=True,
                     )
 
-                with drive_col:
+                with psv:
                     if st.button(
-                        "Save Built Months to Existing Drive Report",
-                        key="ar_save_snt_multi_drive",
+                        "Save Plymouth Weekly Update to Drive",
+                        key="pw_save_drive",
                         type="primary",
                         use_container_width=True,
                     ):
                         try:
                             svc = get_drive_service()
-                            stored_key = st.session_state.get('ar_snt_multi_key', ar_key)
-                            stored_property = st.session_state.get('ar_snt_multi_property', ar_property)
-                            discovered = dict(get_hotels_from_drive())
-                            drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(stored_key)
-                            hotel_id = discovered.get(drive_label, "") if drive_label else ""
+                            target = st.session_state["pw_target"]
+                            original = st.session_state["pw_original"]
 
-                            if not drive_label:
-                                raise ValueError(f"No Drive hotel mapping is configured for {stored_property}.")
-                            if not hotel_id:
-                                raise ValueError(
-                                    f"Could not find {drive_label}'s Revenue Reports folders with the current Drive connection."
-                                )
-
-                            saved_months = st.session_state.get('ar_snt_multi_months', [])
-                            if not saved_months:
-                                raise ValueError("No built months are available to save.")
-                            ref = max(saved_months)
-                            reference_month = datetime.datetime(ref.year, ref.month, 1)
-                            target, target_err = ancillary_find_drive_report(
-                                svc,
-                                hotel_id,
-                                drive_label,
-                                reference_month,
-                            )
-                            if target_err or not target:
-                                raise ValueError(target_err or "Ancillary Drive report not found.")
-
-                            original_bytes = drive_download(svc, target['file_id'])
-                            merged_bytes, inserted = ancillary_merge_snt_multi_months_into_existing(
-                                original_bytes,
-                                st.session_state.get('ar_snt_multi_generated', {}),
-                                saved_months,
-                                destination_name=target['file_name'],
-                            )
-                            st.session_state['ar_snt_multi_drive_undo'] = {
-                                'file_id': target['file_id'],
-                                'file_name': target['file_name'],
-                                'bytes': original_bytes,
+                            st.session_state["pw_drive_undo"] = {
+                                "file_id": target["file_id"],
+                                "file_name": target["file_name"],
+                                "bytes": original,
                             }
-                            drive_upload(svc, target['file_id'], merged_bytes, target['file_name'])
+
+                            drive_upload(
+                                svc,
+                                target["file_id"],
+                                st.session_state["pw_output"],
+                                target["file_name"],
+                            )
                             st.success(
-                                f"Updated **{target['file_name']}** in **{target['folder_name']}** with {', '.join(inserted)}."
+                                f"Saved {ps.get('sheet')} "
+                                f"{ps.get('weekLabel')} into "
+                                f"**{target['file_name']}**."
                             )
                         except Exception as e:
-                            st.error(f"Could not save multi-month ancillary report to Drive: {e}")
+                            st.error(
+                                f"Could not save Plymouth weekly update: {e}"
+                            )
 
-                if st.session_state.get('ar_snt_multi_drive_undo'):
-                    if st.button("↩ Undo Last SNT Multi-Month Drive Save", key="ar_snt_multi_undo"):
+                with pundo:
+                    if st.button(
+                        "↩ Undo Last 1620 Upload",
+                        key="pw_undo_drive",
+                        type="secondary",
+                        use_container_width=True,
+                        disabled=not bool(
+                            st.session_state.get("pw_drive_undo")
+                        ),
+                    ):
                         try:
-                            undo = st.session_state['ar_snt_multi_drive_undo']
+                            undo = st.session_state["pw_drive_undo"]
                             drive_upload(
                                 get_drive_service(),
-                                undo['file_id'],
-                                undo['bytes'],
-                                undo['file_name'],
+                                undo["file_id"],
+                                undo["bytes"],
+                                undo["file_name"],
                             )
-                            st.session_state.pop('ar_snt_multi_drive_undo', None)
-                            st.success("Restored the ancillary workbook to its previous version.")
-                            st.rerun()
+                            st.session_state.pop("pw_drive_undo", None)
+                            st.session_state.pop("pw_output", None)
+                            st.success(
+                                "Restored the Plymouth workbook to the version "
+                                "from immediately before the last 1620 upload."
+                            )
                         except Exception as e:
-                            st.error(f"Could not undo multi-month ancillary Drive save: {e}")
+                            st.error(
+                                f"Could not undo the last Plymouth upload: {e}"
+                            )
 
+        st.divider()
 
-    elif ancillary_platform == "IHG":
-        st.markdown("### IHG — NOR1 + Canary Messaging Multi-Month Builder")
+    if ar_key != "hotel 1620":
+        st.markdown("### Multi-Month SNT / Independent Report Builder")
         st.caption(
-            "IHG is kept separate from Hilton and Marriott. Revenue uses the same grouped "
-            "NOR1 export format as Hilton for current year and STLY; Canary supplies the "
-            "monthly messaging KPI block. No Hilton Lobby file is required."
+            "Select as many months as you need. Upload one grouped current-year "
+            "Add On Production file and one grouped Upsell By Day/User file covering "
+            "all selected months. STLY automatically follows this property's configured "
+            "source: grouped SNT files or one grouped Canary export."
         )
 
-        known_ihg = list(PORTFOLIO_HOTELS.get("IHG", {}).keys())
-        ihg_property_mode = st.radio(
-            "Property entry",
-            ["Known IHG property", "Other property"],
-            horizontal=True,
-            key="ihg_ar_property_mode",
-        )
-        if ihg_property_mode == "Known IHG property" and known_ihg:
-            ihg_ar_property = st.selectbox(
-                "IHG Property",
-                known_ihg,
-                key="ihg_ar_property",
-            )
-        else:
-            ihg_ar_property = st.text_input(
-                "IHG Property name",
-                key="ihg_ar_property_other",
-            )
-
-        ihg_month_options = _ar_status_month_options(18)
-        ihg_ar_months = st.multiselect(
+        ar_month_options = _ar_status_month_options(18)
+        ar_default_months = ar_month_options[:1]
+        ar_months = st.multiselect(
             "Months to build",
-            options=ihg_month_options,
-            default=ihg_month_options[:3],
+            options=ar_month_options,
+            default=ar_default_months,
             format_func=lambda d: d.strftime("%B %Y"),
-            key="ihg_ar_months",
-            help="One grouped NOR1 export can contain every selected month.",
+            key="ar_snt_months_multi",
         )
+        ar_months = sorted(ar_months)
 
-        nc1, nc2 = st.columns(2)
-        with nc1:
-            ihg_nor1_current = st.file_uploader(
-                "Current-Year NOR1 — all selected months",
+        local_template = Path(__file__).resolve().with_name(ANCILLARY_TEMPLATE_FILENAME)
+        ar_template_upload = None
+        if local_template.exists():
+            st.success(f"Using bundled template: {ANCILLARY_TEMPLATE_FILENAME}")
+        else:
+            st.info(
+                f"Add **{ANCILLARY_TEMPLATE_FILENAME}** to the GitHub repo beside app.py "
+                "for permanent use. For testing, upload it here."
+            )
+            ar_template_upload = st.file_uploader(
+                "Ancillary Report Builder template workbook",
                 type=["xlsx"],
-                key="ihg_ar_nor1_current",
-            )
-        with nc2:
-            ihg_nor1_stly = st.file_uploader(
-                "STLY NOR1 — matching prior-year months",
-                type=["xlsx"],
-                key="ihg_ar_nor1_stly",
+                key="ar_snt_multi_template_upload",
             )
 
-        ihg_messaging_by_month = {}
-        with st.expander("Canary messaging information by month", expanded=False):
-            st.caption(
-                "Enter the current and STLY messaging summary for each selected month. "
-                "Engagement Rate is the final KPI row."
+        st.markdown("**Current-year grouped SNT source**")
+        gcur1, gcur2 = st.columns(2)
+        with gcur1:
+            ar_grouped_addon = st.file_uploader(
+                "SNT Add On Production — all selected months",
+                type=["csv", "xlsx"],
+                key=f"ar_grouped_addon_{ar_key}",
+                help="Upload one file containing every current-year month selected above.",
             )
-            for month_date in sorted(ihg_ar_months):
-                mkey = f"{month_date.year}-{month_date.month:02d}"
-                st.markdown(f"#### {month_date.strftime('%B %Y')}")
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    st.markdown("**Current Year**")
-                    cur_total = st.number_input("Total Messages", value=0.0, key=f"ihg_msg_total_{mkey}")
-                    cur_guest = st.number_input("Guest Messages", value=0.0, key=f"ihg_msg_guest_{mkey}")
-                    cur_hotel = st.number_input("Hotel Messages", value=0.0, key=f"ihg_msg_hotel_{mkey}")
-                    cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_msg_pct_{mkey}")
-                    cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_resp_{mkey}")
-                    cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"ihg_avg_{mkey}")
-                    cur_eng = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_eng_{mkey}")
-                with mc2:
-                    st.markdown(f"**STLY — {month_date.year - 1}**")
-                    prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"ihg_stly_total_{mkey}")
-                    prev_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"ihg_stly_guest_{mkey}")
-                    prev_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"ihg_stly_hotel_{mkey}")
-                    prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_pct_{mkey}")
-                    prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_resp_{mkey}")
-                    prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"ihg_stly_avg_{mkey}")
-                    prev_eng = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ihg_stly_eng_{mkey}")
+        with gcur2:
+            ar_grouped_upsell = st.file_uploader(
+                "SNT Upsell By Day/User — all selected months",
+                type=["csv", "xlsx"],
+                key=f"ar_grouped_upsell_{ar_key}",
+                help="Upload one file containing every current-year month selected above.",
+            )
 
-                ihg_messaging_by_month[mkey] = {
-                    "msgTotal": cur_total,
-                    "msgGuest": cur_guest,
-                    "msgHotel": cur_hotel,
-                    "msgGuestPct": cur_pct / 100.0,
-                    "responseRate": cur_resp / 100.0,
-                    "avgResponse": cur_avg,
-                    "engagementRate": cur_eng / 100.0,
-                    "stlyMsgTotal": prev_total,
-                    "stlyMsgGuest": prev_guest,
-                    "stlyMsgHotel": prev_hotel,
-                    "stlyMsgGuestPct": prev_pct / 100.0,
-                    "stlyResponseRate": prev_resp / 100.0,
-                    "stlyAvgResponse": prev_avg,
-                    "stlyEngagementRate": prev_eng / 100.0,
+        ar_grouped_stly_addon = ar_grouped_stly_upsell = ar_grouped_canary_history = None
+        st.markdown(f"**STLY grouped source — {ar_profile.get('stlySource')}**")
+        if ar_profile.get('stlySource') == 'SNT':
+            gstly1, gstly2 = st.columns(2)
+            with gstly1:
+                ar_grouped_stly_addon = st.file_uploader(
+                    "STLY SNT Add On Production — all matching prior-year months",
+                    type=["csv", "xlsx"],
+                    key=f"ar_grouped_stly_addon_{ar_key}",
+                )
+            with gstly2:
+                ar_grouped_stly_upsell = st.file_uploader(
+                    "STLY SNT Upsell By Day/User — all matching prior-year months",
+                    type=["csv", "xlsx"],
+                    key=f"ar_grouped_stly_upsell_{ar_key}",
+                )
+        else:
+            ar_grouped_canary_history = st.file_uploader(
+                "Historical Canary Upsells — all matching prior-year months",
+                type=["csv", "xlsx"],
+                key=f"ar_grouped_canary_history_{ar_key}",
+                help="One Canary export can contain all matching STLY months; Arrival Date is used to split them.",
+            )
+
+        ar_month_bundles = []
+        ar_all_required = bool(ar_months) and ar_grouped_addon is not None and ar_grouped_upsell is not None
+        if ar_profile.get('stlySource') == 'SNT':
+            ar_all_required = ar_all_required and ar_grouped_stly_addon is not None and ar_grouped_stly_upsell is not None
+        else:
+            ar_all_required = ar_all_required and ar_grouped_canary_history is not None
+
+        for month_date in ar_months:
+            ar_month_dt = datetime.datetime(month_date.year, month_date.month, 1)
+            mkey = f"{ar_month_dt.year}_{ar_month_dt.month:02d}"
+            stly_year = ar_month_dt.year - 1
+
+            with st.container(border=True):
+                st.markdown(f"#### {ar_month_dt.strftime('%B %Y')}")
+                st.caption(
+                    "Revenue source files are shared above. Enter only this month's "
+                    "journal and messaging information here."
+                )
+
+                ar_staff = st.file_uploader(
+                    f"{ar_month_dt.strftime('%b %Y')} Canary Message Count by Staff (optional)",
+                    type=["csv", "xlsx"],
+                    key=f"ar_multi_staff_{ar_key}_{mkey}",
+                )
+
+                if ar_profile.get('journal', []):
+                    st.markdown("**SNT Journal revenue**")
+                ar_journal_values = []
+                journals = ar_profile.get('journal', [])
+                journal_cols = st.columns(2) if journals else []
+                for i, journal in enumerate(journals):
+                    with journal_cols[i % 2]:
+                        value = st.number_input(
+                            journal['label'],
+                            min_value=-1000000.0,
+                            max_value=1000000.0,
+                            value=0.0,
+                            step=1.0,
+                            key=f"ar_multi_journal_{ar_key}_{mkey}_{i}",
+                            help=f"Main report line: {journal['report']}",
+                        )
+                        ar_journal_values.append(value)
+
+                ar_stly_journal_values = []
+                if ar_profile.get('stlySource') == 'SNT' and ar_profile.get('stlyJournal'):
+                    st.markdown(f"**{stly_year} STLY Journal revenue**")
+                    stly_cols = st.columns(2)
+                    for i, journal in enumerate(journals[:2]):
+                        with stly_cols[i % 2]:
+                            value = st.number_input(
+                                f"STLY — {journal['report']}",
+                                min_value=-1000000.0,
+                                max_value=1000000.0,
+                                value=0.0,
+                                step=1.0,
+                                key=f"ar_multi_stly_journal_{ar_key}_{mkey}_{i}",
+                            )
+                            ar_stly_journal_values.append(value)
+
+                st.markdown("**Canary Messaging Overview**")
+                msg_cur, msg_stly = st.columns(2)
+                with msg_cur:
+                    st.markdown(f"**{ar_month_dt.strftime('%b').upper()} {ar_month_dt.year}**")
+                    msg_total = st.number_input("Total Messages", value=0.0, key=f"ar_multi_msg_total_{ar_key}_{mkey}")
+                    msg_guest = st.number_input("Guest Messages", value=0.0, key=f"ar_multi_msg_guest_{ar_key}_{mkey}")
+                    msg_hotel = st.number_input("Hotel Messages", value=0.0, key=f"ar_multi_msg_hotel_{ar_key}_{mkey}")
+                    msg_pct_ui = st.number_input("% Guests Messaged", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_msg_pct_{ar_key}_{mkey}")
+                    resp_ui = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_resp_{ar_key}_{mkey}")
+                    avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"ar_multi_avg_{ar_key}_{mkey}")
+                    engagement_ui = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_engagement_{ar_key}_{mkey}")
+
+                with msg_stly:
+                    st.markdown(f"**STLY — {stly_year}**")
+                    stly_total = st.number_input("STLY Total Messages", value=0.0, key=f"ar_multi_stly_total_{ar_key}_{mkey}")
+                    stly_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"ar_multi_stly_guest_{ar_key}_{mkey}")
+                    stly_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"ar_multi_stly_hotel_{ar_key}_{mkey}")
+                    stly_pct_ui = st.number_input("STLY % Guests Messaged", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_pct_{ar_key}_{mkey}")
+                    stly_resp_ui = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_resp_{ar_key}_{mkey}")
+                    stly_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"ar_multi_stly_avg_{ar_key}_{mkey}")
+                    stly_engagement_ui = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"ar_multi_stly_engagement_{ar_key}_{mkey}")
+
+                ar_messaging = {
+                    'msgTotal': msg_total,
+                    'msgGuest': msg_guest,
+                    'msgHotel': msg_hotel,
+                    'msgGuestPct': msg_pct_ui / 100.0,
+                    'responseRate': resp_ui / 100.0,
+                    'avgResponse': avg,
+                    'engagementRate': engagement_ui / 100.0,
+                    'stlyMsgTotal': stly_total,
+                    'stlyMsgGuest': stly_guest,
+                    'stlyMsgHotel': stly_hotel,
+                    'stlyMsgGuestPct': stly_pct_ui / 100.0,
+                    'stlyResponseRate': stly_resp_ui / 100.0,
+                    'stlyAvgResponse': stly_avg,
+                    'stlyEngagementRate': stly_engagement_ui / 100.0,
                 }
 
-        ihg_ready = (
-            bool(ihg_ar_months)
-            and bool(str(ihg_ar_property or "").strip())
-            and ihg_nor1_current is not None
-            and ihg_nor1_stly is not None
-        )
-        ihg_month_inputs = []
-        for month_date in sorted(ihg_ar_months):
-            month_dt = datetime.datetime(month_date.year, month_date.month, 1)
-            mkey = f"{month_date.year}-{month_date.month:02d}"
-            ihg_month_inputs.append({
-                "report_month": month_dt,
-                "nor1_current_file": ihg_nor1_current,
-                "nor1_stly_file": ihg_nor1_stly,
-                "messaging": ihg_messaging_by_month.get(mkey, {}),
-            })
+                ar_month_bundles.append({
+                    "report_month": ar_month_dt,
+                    "staff_file": ar_staff,
+                    "journal_values": ar_journal_values,
+                    "stly_journal_values": ar_stly_journal_values,
+                    "messaging": ar_messaging,
+                })
 
+        template_ok = local_template.exists() or ar_template_upload is not None
         if st.button(
-            "Build IHG Ancillary Workbook",
+            "Build Selected Ancillary Months",
             type="primary",
-            key="ihg_ar_build_multi",
-            disabled=not ihg_ready,
-            use_container_width=True,
+            key="ar_build_snt_multi",
+            disabled=not (ar_all_required and template_ok),
         ):
             try:
-                with st.spinner("Building IHG ancillary workbook..."):
-                    ihg_output, ihg_summaries = ihg_ancillary_build_multi_month_report(
-                        property_name=str(ihg_ar_property).strip(),
-                        month_inputs=ihg_month_inputs,
+                with st.spinner("Building selected ancillary months..."):
+                    template_bytes = local_template.read_bytes() if local_template.exists() else ar_template_upload.getvalue()
+                    ar_output, ar_summaries, ar_generated = ancillary_build_snt_multi_month_report(
+                        template_bytes=template_bytes,
+                        property_name=ar_property,
+                        month_inputs=ar_month_bundles,
+                        current_addon_file=ar_grouped_addon,
+                        current_upsell_file=ar_grouped_upsell,
+                        stly_addon_file=ar_grouped_stly_addon,
+                        stly_upsell_file=ar_grouped_stly_upsell,
+                        canary_history_file=ar_grouped_canary_history,
                     )
-                    years = sorted({m.year for m in ihg_ar_months})
+                    years = sorted({m.year for m in ar_months})
                     year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
-                    st.session_state["ihg_ar_output"] = ihg_output
-                    st.session_state["ihg_ar_summaries"] = ihg_summaries
-                    st.session_state["ihg_ar_filename"] = (
-                        f"{year_label} {str(ihg_ar_property).strip()} Ancillary Revenue NOR1 Report.xlsx"
-                    )
-                st.success(f"Built {len(ihg_summaries)} IHG month tab(s).")
+                    st.session_state['ar_snt_multi_output'] = ar_output
+                    st.session_state['ar_snt_multi_summaries'] = ar_summaries
+                    st.session_state['ar_snt_multi_generated'] = ar_generated
+                    st.session_state['ar_snt_multi_months'] = list(ar_months)
+                    st.session_state['ar_snt_multi_property'] = ar_property
+                    st.session_state['ar_snt_multi_key'] = ar_key
+                    st.session_state['ar_snt_multi_filename'] = f"{year_label} Ancillary Revenue - {ar_property}.xlsx"
+                st.success(f"Built {len(ar_summaries)} month tab(s).")
             except Exception as e:
-                st.error(f"IHG ancillary report build error: {e}")
+                st.error(f"Multi-month ancillary report build error: {e}")
 
-        if "ihg_ar_output" in st.session_state:
-            summaries = st.session_state.get("ihg_ar_summaries", [])
-            if summaries:
-                preview_rows = [
-                    {
-                        "Month": x["month"].strftime("%b %Y"),
-                        "Current NOR1 Revenue": x.get("currentTotalRevenue", 0),
-                        "STLY NOR1 Revenue": x.get("stlyTotalRevenue", 0),
-                        "YoY Revenue Variance": x.get("currentTotalRevenue", 0) - x.get("stlyTotalRevenue", 0),
-                    }
-                    for x in summaries
-                ]
-                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+        if 'ar_snt_multi_output' in st.session_state:
+            summaries = st.session_state.get('ar_snt_multi_summaries', [])
+            preview_rows = []
+            for item in summaries:
+                summary = item.get('summary', {})
+                main = summary.get('mainRows', [])
+                stly = summary.get('stly', {})
+                variance = summary.get('variance', [])
+                preview_rows.append({
+                    "Month": item['month'].strftime('%b %Y'),
+                    "Current Revenue": sum(_ar_num(x.get('revenue')) or 0 for x in main),
+                    "STLY Revenue": sum(_ar_num(x.get('approved')) or 0 for x in stly.get('rows', [])),
+                    "YoY Variance": sum(_ar_num(x.get('variance')) or 0 for x in variance),
+                })
+            if preview_rows:
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
-            st.download_button(
-                "Download IHG Ancillary Workbook",
-                data=st.session_state["ihg_ar_output"],
-                file_name=st.session_state.get("ihg_ar_filename", "IHG Ancillary Revenue NOR1 Report.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="ihg_ar_download_multi",
-                use_container_width=True,
-            )
-
-            if st.button(
-                "Save Built IHG Months to Existing Drive Report",
-                key="ihg_ar_drive_save",
-                type="primary",
-                use_container_width=True,
-            ):
-                try:
-                    svc = get_drive_service()
-                    discovered = dict(get_hotels_from_drive())
-                    target_name = str(ihg_ar_property or "").strip()
-                    target_norm = _ancillary_normalize_drive_name(target_name)
-                    exact = [
-                        (name, hid) for name, hid in discovered.items()
-                        if _ancillary_normalize_drive_name(name) == target_norm
-                    ]
-                    contains = [
-                        (name, hid) for name, hid in discovered.items()
-                        if target_norm and (
-                            target_norm in _ancillary_normalize_drive_name(name)
-                            or _ancillary_normalize_drive_name(name) in target_norm
-                        )
-                    ]
-                    match = exact[0] if len(exact) == 1 else None
-                    if match is None and len(contains) == 1:
-                        match = contains[0]
-                    if match is None:
-                        raise ValueError(
-                            f"Could not uniquely match {target_name} to a Drive hotel folder."
-                        )
-                    drive_label, hotel_id = match
-                    reference_month = datetime.datetime(
-                        max(ihg_ar_months).year,
-                        max(ihg_ar_months).month,
-                        1,
-                    )
-                    target, target_err = ancillary_find_drive_report(
-                        svc,
-                        hotel_id,
-                        drive_label,
-                        reference_month,
-                    )
-                    if target_err or not target:
-                        raise ValueError(target_err or "IHG ancillary Drive report not found.")
-                    original_bytes = drive_download(svc, target["file_id"])
-                    merged_bytes, inserted_tabs = hilton_ancillary_merge_month_sheets(
-                        original_bytes,
-                        st.session_state["ihg_ar_output"],
-                        destination_name=target["file_name"],
-                    )
-                    st.session_state["ihg_ar_drive_undo"] = {
-                        "file_id": target["file_id"],
-                        "file_name": target["file_name"],
-                        "bytes": original_bytes,
-                    }
-                    drive_upload(svc, target["file_id"], merged_bytes, target["file_name"])
-                    st.success(
-                        f"Updated **{target['file_name']}** in **{target['folder_name']}** "
-                        f"with {', '.join(inserted_tabs)}."
-                    )
-                except Exception as e:
-                    st.error(f"Could not save IHG ancillary report to Drive: {e}")
-
-            if st.session_state.get("ihg_ar_drive_undo"):
-                if st.button("↩ Undo Last IHG Drive Save", key="ihg_ar_undo"):
-                    try:
-                        undo = st.session_state["ihg_ar_drive_undo"]
-                        drive_upload(
-                            get_drive_service(),
-                            undo["file_id"],
-                            undo["bytes"],
-                            undo["file_name"],
-                        )
-                        st.session_state.pop("ihg_ar_drive_undo", None)
-                        st.success("Restored the IHG ancillary workbook to its previous version.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not undo IHG ancillary Drive save: {e}")
-
-    elif ancillary_platform in ("Margaritaville", "Marriott"):
-        is_margaritaville = ancillary_platform == "Margaritaville"
-        if is_margaritaville:
-            st.markdown("### Margaritaville — Canary + Oaky Multi-Month Builder")
-            st.caption(
-                "Build several months at once from one grouped current-year Canary export, "
-                "one grouped STLY Canary export, and matching Oaky exports. Canary and Oaky "
-                "are combined into the same status-based monthly table."
-            )
-            status_property = st.text_input(
-                "Property name",
-                value="Margaritaville Resort Cape Cod",
-                key="status_marg_property",
-            )
-            status_brand = "Margaritaville"
-        else:
-            st.markdown("### Marriott — Canary Multi-Month Builder")
-            st.caption(
-                "Marriott ancillary revenue is built from grouped current-year and STLY "
-                "Canary upsell exports, with the monthly Canary messaging KPI block."
-            )
-            status_brand = "Marriott"
-            status_property = st.text_input(
-                "Property name",
-                key="status_marriott_property",
-                placeholder="e.g. Sheraton Tampa Brandon",
-            )
-
-        status_month_options = _ar_status_month_options(18)
-        status_months = st.multiselect(
-            "Months to build",
-            options=status_month_options,
-            default=status_month_options[:3],
-            format_func=lambda d: d.strftime("%B %Y"),
-            key=f"status_months_{ancillary_platform}",
-            help="One grouped source file can contain every selected month.",
-        )
-
-        st.markdown("**Revenue source files**")
-        c1, c2 = st.columns(2)
-        with c1:
-            status_current_canary = st.file_uploader(
-                "Current-Year Canary Upsells — all selected months",
-                type=["csv", "xlsx"],
-                key=f"status_current_canary_{ancillary_platform}",
-            )
-        with c2:
-            status_stly_canary = st.file_uploader(
-                "STLY Canary Upsells — matching prior-year months",
-                type=["csv", "xlsx"],
-                key=f"status_stly_canary_{ancillary_platform}",
-            )
-
-        status_current_oaky = status_stly_oaky = None
-        if is_margaritaville:
-            oc1, oc2 = st.columns(2)
-            with oc1:
-                status_current_oaky = st.file_uploader(
-                    "Current-Year Oaky Revenue — all selected months",
-                    type=["csv", "xlsx"],
-                    key="status_current_oaky_marg",
+            download_col, drive_col = st.columns(2)
+            with download_col:
+                st.download_button(
+                    "Download Multi-Month Ancillary Workbook",
+                    data=st.session_state['ar_snt_multi_output'],
+                    file_name=st.session_state.get('ar_snt_multi_filename', 'Ancillary Revenue Report.xlsx'),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="ar_download_snt_multi",
+                    use_container_width=True,
                 )
-            with oc2:
-                status_stly_oaky = st.file_uploader(
-                    "STLY Oaky Revenue — matching prior-year months",
-                    type=["csv", "xlsx"],
-                    key="status_stly_oaky_marg",
-                )
-            st.caption(
-                "If an Oaky upload does not contain one of the selected months, the builder "
-                "will flag that month and build its Canary portion only instead of treating "
-                "missing Oaky data as $0."
-            )
 
-        # Messaging values are month-specific. Keeping them beside each month avoids
-        # accidentally copying one month's KPI values into every tab in a batch.
-        status_messaging_by_month = {}
-        status_engagement_by_month = {}  # retained for backward-compatible builder signature; no dated points are collected
-        status_staff_messages_by_month = {}
-        with st.expander("Messaging information by month", expanded=False):
-            st.caption(
-                "Enter the current and STLY Canary messaging KPIs for each selected month. "
-                "Staff message counts are optional and can be uploaded per month."
-            )
-            for month_date in sorted(status_months):
-                mkey = f"{month_date.year}-{month_date.month:02d}"
-                st.markdown(f"#### {month_date.strftime('%B %Y')}")
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    st.markdown("**Current Year**")
-                    cur_total = st.number_input("Total Messages", value=0.0, key=f"status_msg_total_{mkey}_{ancillary_platform}")
-                    cur_guest = st.number_input("Guest Messages", value=0.0, key=f"status_msg_guest_{mkey}_{ancillary_platform}")
-                    cur_hotel = st.number_input("Hotel Messages", value=0.0, key=f"status_msg_hotel_{mkey}_{ancillary_platform}")
-                    cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_msg_pct_{mkey}_{ancillary_platform}")
-                    cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_resp_{mkey}_{ancillary_platform}")
-                    cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"status_avg_{mkey}_{ancillary_platform}")
-                    cur_engagement = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_engagement_{mkey}_{ancillary_platform}")
-                with mc2:
-                    st.markdown(f"**STLY — {month_date.year - 1}**")
-                    prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"status_stly_total_{mkey}_{ancillary_platform}")
-                    prev_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"status_stly_guest_{mkey}_{ancillary_platform}")
-                    prev_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"status_stly_hotel_{mkey}_{ancillary_platform}")
-                    prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_pct_{mkey}_{ancillary_platform}")
-                    prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_resp_{mkey}_{ancillary_platform}")
-                    prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"status_stly_avg_{mkey}_{ancillary_platform}")
-                    prev_engagement = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_engagement_{mkey}_{ancillary_platform}")
-
-                status_messaging_by_month[mkey] = {
-                    "msgTotal": cur_total,
-                    "msgGuest": cur_guest,
-                    "msgHotel": cur_hotel,
-                    "msgGuestPct": cur_pct / 100.0,
-                    "responseRate": cur_resp / 100.0,
-                    "avgResponse": cur_avg,
-                    "engagementRate": cur_engagement / 100.0,
-                    "stlyMsgTotal": prev_total,
-                    "stlyMsgGuest": prev_guest,
-                    "stlyMsgHotel": prev_hotel,
-                    "stlyMsgGuestPct": prev_pct / 100.0,
-                    "stlyResponseRate": prev_resp / 100.0,
-                    "stlyAvgResponse": prev_avg,
-                    "stlyEngagementRate": prev_engagement / 100.0,
-                }
-
-                staff_msg_file = st.file_uploader(
-                    f"{month_date.strftime('%b %Y')} Canary Message Count by Staff (optional)",
-                    type=["csv", "xlsx"],
-                    key=f"status_staff_msg_{mkey}_{ancillary_platform}",
-                )
-                if staff_msg_file is not None:
-                    status_staff_messages_by_month[mkey] = _ar_status_staff_message_rows(staff_msg_file)
-
-                status_engagement_by_month[mkey] = []
-
-        status_ready = bool(status_months) and bool(str(status_property or "").strip()) and status_current_canary is not None and status_stly_canary is not None
-        if is_margaritaville:
-            status_ready = status_ready and status_current_oaky is not None and status_stly_oaky is not None
-
-        if st.button(
-            "Build Multi-Month Ancillary Workbook",
-            type="primary",
-            key=f"status_build_{ancillary_platform}",
-            disabled=not status_ready,
-            use_container_width=True,
-        ):
-            try:
-                with st.spinner("Building multi-month ancillary workbook..."):
-                    status_output, status_summaries, status_warnings = ancillary_status_build_multi_month_report(
-                        property_name=str(status_property).strip(),
-                        report_months=status_months,
-                        current_canary_file=status_current_canary,
-                        stly_canary_file=status_stly_canary,
-                        current_oaky_file=status_current_oaky if is_margaritaville else None,
-                        stly_oaky_file=status_stly_oaky if is_margaritaville else None,
-                        messaging_by_month=status_messaging_by_month,
-                        engagement_by_month=status_engagement_by_month,
-                        staff_messages_by_month=status_staff_messages_by_month,
-                    )
-                    years = sorted({m.year for m in status_months})
-                    year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
-                    status_filename = f"{year_label} {str(status_property).strip()} Ancillary Revenue Report.xlsx"
-                    st.session_state[f"status_output_{ancillary_platform}"] = status_output
-                    st.session_state[f"status_summaries_{ancillary_platform}"] = status_summaries
-                    st.session_state[f"status_warnings_{ancillary_platform}"] = status_warnings
-                    st.session_state[f"status_filename_{ancillary_platform}"] = status_filename
-                st.success(f"Built {len(status_summaries)} month tab(s).")
-            except Exception as e:
-                st.error(f"Multi-month ancillary build error: {e}")
-
-        output_key = f"status_output_{ancillary_platform}"
-        if output_key in st.session_state:
-            for warning in st.session_state.get(f"status_warnings_{ancillary_platform}", []):
-                st.warning(warning)
-
-            summaries = st.session_state.get(f"status_summaries_{ancillary_platform}", [])
-            if summaries:
-                preview = []
-                for s in summaries:
-                    preview.append({
-                        "Month": s["month"].strftime("%b %Y"),
-                        "Current Approved": s["current"].get("approved", 0),
-                        "STLY Approved": s["stly"].get("approved", 0),
-                        "YoY Approved Variance": s["variance"].get("approved", 0),
-                        "Current Approval Rate": (
-                            s["current"].get("approved", 0) / s["current"].get("requested", 1)
-                            if s["current"].get("requested", 0) else 0
-                        ),
-                    })
-                st.dataframe(pd.DataFrame(preview), use_container_width=True)
-
-            st.download_button(
-                "Download Multi-Month Ancillary Workbook",
-                data=st.session_state[output_key],
-                file_name=st.session_state.get(f"status_filename_{ancillary_platform}", "Ancillary Revenue Report.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"status_download_{ancillary_platform}",
-                use_container_width=True,
-            )
-
-
-            if st.button(
-                "Save Built Months to Existing Drive Report",
-                key=f"status_drive_save_{ancillary_platform}",
-                type="primary",
-                use_container_width=True,
-            ):
-                try:
-                    svc = get_drive_service()
-                    discovered = dict(get_hotels_from_drive())
-                    target_name = str(status_property or "").strip()
-                    if is_margaritaville:
-                        target_name = "Margaritaville Resort Cape Cod"
-                    target_norm = _ancillary_normalize_drive_name(target_name)
-
-                    # First prefer an exact normalized property label; then allow
-                    # one unambiguous contains-match so a new Marriott property or
-                    # Margaritaville can work without being hard-coded in a profile.
-                    exact = [
-                        (name, hid)
-                        for name, hid in discovered.items()
-                        if _ancillary_normalize_drive_name(name) == target_norm
-                    ]
-                    contains = [
-                        (name, hid)
-                        for name, hid in discovered.items()
-                        if target_norm
-                        and (
-                            target_norm in _ancillary_normalize_drive_name(name)
-                            or _ancillary_normalize_drive_name(name) in target_norm
-                        )
-                    ]
-
-                    match = exact[0] if len(exact) == 1 else None
-                    if match is None and len(contains) == 1:
-                        match = contains[0]
-                    if match is None and is_margaritaville:
-                        marg = [
-                            (name, hid)
-                            for name, hid in discovered.items()
-                            if "MARGARITAVILLE" in _ancillary_normalize_drive_name(name)
-                        ]
-                        if len(marg) == 1:
-                            match = marg[0]
-
-                    if match is None:
-                        raise ValueError(
-                            f"Could not uniquely match {target_name} to a Drive hotel folder. "
-                            "Download the workbook for now, or use the property name exactly as it appears in Drive."
-                        )
-
-                    drive_label, hotel_id = match
-                    reference_month = datetime.datetime(
-                        max(status_months).year,
-                        max(status_months).month,
-                        1,
-                    )
-                    target, target_err = ancillary_find_drive_report(
-                        svc,
-                        hotel_id,
-                        drive_label,
-                        reference_month,
-                    )
-                    if target_err or not target:
-                        raise ValueError(target_err or "Ancillary Drive report not found.")
-
-                    original_bytes = drive_download(svc, target["file_id"])
-                    merged_bytes, inserted_tabs = ancillary_status_merge_month_sheets(
-                        original_bytes,
-                        st.session_state[output_key],
-                        destination_name=target["file_name"],
-                    )
-
-                    undo_key = f"status_drive_undo_{ancillary_platform}"
-                    st.session_state[undo_key] = {
-                        "file_id": target["file_id"],
-                        "file_name": target["file_name"],
-                        "bytes": original_bytes,
-                    }
-                    drive_upload(
-                        svc,
-                        target["file_id"],
-                        merged_bytes,
-                        target["file_name"],
-                    )
-                    st.success(
-                        f"Updated **{target['file_name']}** in **{target['folder_name']}** "
-                        f"with {', '.join(inserted_tabs)}."
-                    )
-                except Exception as e:
-                    st.error(f"Could not save the multi-month ancillary report to Drive: {e}")
-
-            status_undo_key = f"status_drive_undo_{ancillary_platform}"
-            if st.session_state.get(status_undo_key):
+            with drive_col:
                 if st.button(
-                    "↩ Undo Last Multi-Month Ancillary Drive Save",
-                    key=f"status_drive_undo_btn_{ancillary_platform}",
+                    "Save Built Months to Existing Drive Report",
+                    key="ar_save_snt_multi_drive",
+                    type="primary",
+                    use_container_width=True,
                 ):
                     try:
-                        undo = st.session_state[status_undo_key]
+                        svc = get_drive_service()
+                        stored_key = st.session_state.get('ar_snt_multi_key', ar_key)
+                        stored_property = st.session_state.get('ar_snt_multi_property', ar_property)
+                        discovered = dict(get_hotels_from_drive())
+                        drive_label = ANCILLARY_DRIVE_HOTEL_MAP.get(stored_key)
+                        hotel_id = discovered.get(drive_label, "") if drive_label else ""
+
+                        if not drive_label:
+                            raise ValueError(f"No Drive hotel mapping is configured for {stored_property}.")
+                        if not hotel_id:
+                            raise ValueError(
+                                f"Could not find {drive_label}'s Revenue Reports folders with the current Drive connection."
+                            )
+
+                        saved_months = st.session_state.get('ar_snt_multi_months', [])
+                        if not saved_months:
+                            raise ValueError("No built months are available to save.")
+                        ref = max(saved_months)
+                        reference_month = datetime.datetime(ref.year, ref.month, 1)
+                        target, target_err = ancillary_find_drive_report(
+                            svc,
+                            hotel_id,
+                            drive_label,
+                            reference_month,
+                        )
+                        if target_err or not target:
+                            raise ValueError(target_err or "Ancillary Drive report not found.")
+
+                        original_bytes = drive_download(svc, target['file_id'])
+                        merged_bytes, inserted = ancillary_merge_snt_multi_months_into_existing(
+                            original_bytes,
+                            st.session_state.get('ar_snt_multi_generated', {}),
+                            saved_months,
+                            destination_name=target['file_name'],
+                        )
+                        st.session_state['ar_snt_multi_drive_undo'] = {
+                            'file_id': target['file_id'],
+                            'file_name': target['file_name'],
+                            'bytes': original_bytes,
+                        }
+                        drive_upload(svc, target['file_id'], merged_bytes, target['file_name'])
+                        st.success(
+                            f"Updated **{target['file_name']}** in **{target['folder_name']}** with {', '.join(inserted)}."
+                        )
+                    except Exception as e:
+                        st.error(f"Could not save multi-month ancillary report to Drive: {e}")
+
+            if st.session_state.get('ar_snt_multi_drive_undo'):
+                if st.button("↩ Undo Last SNT Multi-Month Drive Save", key="ar_snt_multi_undo"):
+                    try:
+                        undo = st.session_state['ar_snt_multi_drive_undo']
                         drive_upload(
                             get_drive_service(),
-                            undo["file_id"],
-                            undo["bytes"],
-                            undo["file_name"],
+                            undo['file_id'],
+                            undo['bytes'],
+                            undo['file_name'],
                         )
-                        st.session_state.pop(status_undo_key, None)
+                        st.session_state.pop('ar_snt_multi_drive_undo', None)
                         st.success("Restored the ancillary workbook to its previous version.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Could not undo the multi-month ancillary Drive save: {e}")
+                        st.error(f"Could not undo multi-month ancillary Drive save: {e}")
+
+
+def _render_arev_status_brand_tab(brand, properties, *, use_oaky=False, use_nor1=False):
+    is_margaritaville = bool(use_oaky)
+    if brand == "IHG":
+        st.markdown("### IHG — Canary + NOR1 Multi-Month Builder")
+        st.caption("Manchester, Salem, and Weirton use grouped Canary and NOR1 exports for current year and STLY. One upload from each system can cover every selected month.")
+    elif brand == "Marriott":
+        st.markdown("### Marriott — Canary Multi-Month Builder")
+        st.caption("Macon and Tampa use grouped current-year and STLY Canary upsell exports.")
+    elif brand == "Best Western":
+        st.markdown("### Best Western — Canary Multi-Month Builder")
+        st.caption("Rutland and Springfield use grouped current-year and STLY Canary upsell exports.")
+    else:
+        st.markdown("### Margaritaville — Canary + Oaky Multi-Month Builder")
+        st.caption("Margaritaville combines grouped Canary and Oaky exports for current year and STLY.")
+
+    status_property = st.selectbox(f"{brand} Property", list(properties), key=f"status_property_{brand}")
+
+    status_month_options = _ar_status_month_options(18)
+    status_months = st.multiselect(
+        "Months to build",
+        options=status_month_options,
+        default=status_month_options[:3],
+        format_func=lambda d: d.strftime("%B %Y"),
+        key=f"status_months_{brand}",
+        help="One grouped source file can contain every selected month.",
+    )
+
+    st.markdown("**Revenue source files**")
+    c1, c2 = st.columns(2)
+    with c1:
+        status_current_canary = st.file_uploader(
+            "Current-Year Canary Upsells — all selected months",
+            type=["csv", "xlsx"],
+            key=f"status_current_canary_{brand}",
+        )
+    with c2:
+        status_stly_canary = st.file_uploader(
+            "STLY Canary Upsells — matching prior-year months",
+            type=["csv", "xlsx"],
+            key=f"status_stly_canary_{brand}",
+        )
+
+    status_current_oaky = status_stly_oaky = None
+    status_current_nor1 = status_stly_nor1 = None
+    if use_nor1:
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            status_current_nor1 = st.file_uploader(
+                "Current-Year NOR1 — all selected months", type=["xlsx"], key=f"status_current_nor1_{brand}"
+            )
+        with nc2:
+            status_stly_nor1 = st.file_uploader(
+                "STLY NOR1 — matching prior-year months", type=["xlsx"], key=f"status_stly_nor1_{brand}"
+            )
+
+    if is_margaritaville:
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            status_current_oaky = st.file_uploader(
+                "Current-Year Oaky Revenue — all selected months",
+                type=["csv", "xlsx"],
+                key="status_current_oaky_marg",
+            )
+        with oc2:
+            status_stly_oaky = st.file_uploader(
+                "STLY Oaky Revenue — matching prior-year months",
+                type=["csv", "xlsx"],
+                key="status_stly_oaky_marg",
+            )
+        st.caption(
+            "If an Oaky upload does not contain one of the selected months, the builder "
+            "will flag that month and build its Canary portion only instead of treating "
+            "missing Oaky data as $0."
+        )
+
+    # Messaging values are month-specific. Keeping them beside each month avoids
+    # accidentally copying one month's KPI values into every tab in a batch.
+    status_messaging_by_month = {}
+    status_engagement_by_month = {}  # retained for backward-compatible builder signature; no dated points are collected
+    status_staff_messages_by_month = {}
+    with st.expander("Messaging information by month", expanded=False):
+        st.caption(
+            "Enter the current and STLY Canary messaging KPIs for each selected month. "
+            "Staff message counts are optional and can be uploaded per month."
+        )
+        for month_date in sorted(status_months):
+            mkey = f"{month_date.year}-{month_date.month:02d}"
+            st.markdown(f"#### {month_date.strftime('%B %Y')}")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.markdown("**Current Year**")
+                cur_total = st.number_input("Total Messages", value=0.0, key=f"status_msg_total_{mkey}_{brand}")
+                cur_guest = st.number_input("Guest Messages", value=0.0, key=f"status_msg_guest_{mkey}_{brand}")
+                cur_hotel = st.number_input("Hotel Messages", value=0.0, key=f"status_msg_hotel_{mkey}_{brand}")
+                cur_pct = st.number_input("% Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_msg_pct_{mkey}_{brand}")
+                cur_resp = st.number_input("Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_resp_{mkey}_{brand}")
+                cur_avg = st.number_input("Average Minutes to Respond", value=0.0, key=f"status_avg_{mkey}_{brand}")
+                cur_engagement = st.number_input("Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_engagement_{mkey}_{brand}")
+            with mc2:
+                st.markdown(f"**STLY — {month_date.year - 1}**")
+                prev_total = st.number_input("STLY Total Messages", value=0.0, key=f"status_stly_total_{mkey}_{brand}")
+                prev_guest = st.number_input("STLY Guest Messages", value=0.0, key=f"status_stly_guest_{mkey}_{brand}")
+                prev_hotel = st.number_input("STLY Hotel Messages", value=0.0, key=f"status_stly_hotel_{mkey}_{brand}")
+                prev_pct = st.number_input("STLY % Guests That Sent a Message", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_pct_{mkey}_{brand}")
+                prev_resp = st.number_input("STLY Response Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_resp_{mkey}_{brand}")
+                prev_avg = st.number_input("STLY Average Minutes to Respond", value=0.0, key=f"status_stly_avg_{mkey}_{brand}")
+                prev_engagement = st.number_input("STLY Engagement Rate %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"status_stly_engagement_{mkey}_{brand}")
+
+            status_messaging_by_month[mkey] = {
+                "msgTotal": cur_total,
+                "msgGuest": cur_guest,
+                "msgHotel": cur_hotel,
+                "msgGuestPct": cur_pct / 100.0,
+                "responseRate": cur_resp / 100.0,
+                "avgResponse": cur_avg,
+                "engagementRate": cur_engagement / 100.0,
+                "stlyMsgTotal": prev_total,
+                "stlyMsgGuest": prev_guest,
+                "stlyMsgHotel": prev_hotel,
+                "stlyMsgGuestPct": prev_pct / 100.0,
+                "stlyResponseRate": prev_resp / 100.0,
+                "stlyAvgResponse": prev_avg,
+                "stlyEngagementRate": prev_engagement / 100.0,
+            }
+
+            staff_msg_file = st.file_uploader(
+                f"{month_date.strftime('%b %Y')} Canary Message Count by Staff (optional)",
+                type=["csv", "xlsx"],
+                key=f"status_staff_msg_{mkey}_{brand}",
+            )
+            if staff_msg_file is not None:
+                status_staff_messages_by_month[mkey] = _ar_status_staff_message_rows(staff_msg_file)
+
+            status_engagement_by_month[mkey] = []
+
+    status_ready = bool(status_months) and bool(str(status_property or "").strip()) and status_current_canary is not None and status_stly_canary is not None
+    if is_margaritaville:
+        status_ready = status_ready and status_current_oaky is not None and status_stly_oaky is not None
+    if use_nor1:
+        status_ready = status_ready and status_current_nor1 is not None and status_stly_nor1 is not None
+
+    if st.button(
+        "Build Multi-Month Ancillary Workbook",
+        type="primary",
+        key=f"status_build_{brand}",
+        disabled=not status_ready,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("Building multi-month ancillary workbook..."):
+                status_output, status_summaries, status_warnings = ancillary_status_build_multi_month_report(
+                    property_name=str(status_property).strip(),
+                    report_months=status_months,
+                    current_canary_file=status_current_canary,
+                    stly_canary_file=status_stly_canary,
+                    current_oaky_file=status_current_oaky if is_margaritaville else None,
+                    stly_oaky_file=status_stly_oaky if is_margaritaville else None,
+                    current_nor1_file=status_current_nor1 if use_nor1 else None,
+                    stly_nor1_file=status_stly_nor1 if use_nor1 else None,
+                    messaging_by_month=status_messaging_by_month,
+                    engagement_by_month=status_engagement_by_month,
+                    staff_messages_by_month=status_staff_messages_by_month,
+                )
+                years = sorted({m.year for m in status_months})
+                year_label = str(years[0]) if len(years) == 1 else f"{years[0]}-{years[-1]}"
+                status_filename = f"{year_label} {str(status_property).strip()} Ancillary Revenue Report.xlsx"
+                st.session_state[f"status_output_{brand}"] = status_output
+                st.session_state[f"status_summaries_{brand}"] = status_summaries
+                st.session_state[f"status_warnings_{brand}"] = status_warnings
+                st.session_state[f"status_filename_{brand}"] = status_filename
+            st.success(f"Built {len(status_summaries)} month tab(s).")
+        except Exception as e:
+            st.error(f"Multi-month ancillary build error: {e}")
+
+    output_key = f"status_output_{brand}"
+    if output_key in st.session_state:
+        for warning in st.session_state.get(f"status_warnings_{brand}", []):
+            st.warning(warning)
+
+        summaries = st.session_state.get(f"status_summaries_{brand}", [])
+        if summaries:
+            preview = []
+            for s in summaries:
+                preview.append({
+                    "Month": s["month"].strftime("%b %Y"),
+                    "Current Approved": s["current"].get("approved", 0),
+                    "STLY Approved": s["stly"].get("approved", 0),
+                    "YoY Approved Variance": s["variance"].get("approved", 0),
+                    "Current Approval Rate": (
+                        s["current"].get("approved", 0) / s["current"].get("requested", 1)
+                        if s["current"].get("requested", 0) else 0
+                    ),
+                })
+            st.dataframe(pd.DataFrame(preview), use_container_width=True)
+
+        st.download_button(
+            "Download Multi-Month Ancillary Workbook",
+            data=st.session_state[output_key],
+            file_name=st.session_state.get(f"status_filename_{brand}", "Ancillary Revenue Report.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"status_download_{brand}",
+            use_container_width=True,
+        )
+
+
+        if st.button(
+            "Save Built Months to Existing Drive Report",
+            key=f"status_drive_save_{brand}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                svc = get_drive_service()
+                discovered = dict(get_hotels_from_drive())
+                target_name = str(status_property or "").strip()
+                if is_margaritaville:
+                    target_name = "Margaritaville Resort Cape Cod"
+                target_norm = _ancillary_normalize_drive_name(target_name)
+
+                # First prefer an exact normalized property label; then allow
+                # one unambiguous contains-match so a new Marriott property or
+                # Margaritaville can work without being hard-coded in a profile.
+                exact = [
+                    (name, hid)
+                    for name, hid in discovered.items()
+                    if _ancillary_normalize_drive_name(name) == target_norm
+                ]
+                contains = [
+                    (name, hid)
+                    for name, hid in discovered.items()
+                    if target_norm
+                    and (
+                        target_norm in _ancillary_normalize_drive_name(name)
+                        or _ancillary_normalize_drive_name(name) in target_norm
+                    )
+                ]
+
+                match = exact[0] if len(exact) == 1 else None
+                if match is None and len(contains) == 1:
+                    match = contains[0]
+                if match is None and is_margaritaville:
+                    marg = [
+                        (name, hid)
+                        for name, hid in discovered.items()
+                        if "MARGARITAVILLE" in _ancillary_normalize_drive_name(name)
+                    ]
+                    if len(marg) == 1:
+                        match = marg[0]
+
+                if match is None:
+                    raise ValueError(
+                        f"Could not uniquely match {target_name} to a Drive hotel folder. "
+                        "Download the workbook for now, or use the property name exactly as it appears in Drive."
+                    )
+
+                drive_label, hotel_id = match
+                reference_month = datetime.datetime(
+                    max(status_months).year,
+                    max(status_months).month,
+                    1,
+                )
+                target, target_err = ancillary_find_drive_report(
+                    svc,
+                    hotel_id,
+                    drive_label,
+                    reference_month,
+                )
+                if target_err or not target:
+                    raise ValueError(target_err or "Ancillary Drive report not found.")
+
+                original_bytes = drive_download(svc, target["file_id"])
+                merged_bytes, inserted_tabs = ancillary_status_merge_month_sheets(
+                    original_bytes,
+                    st.session_state[output_key],
+                    destination_name=target["file_name"],
+                )
+
+                undo_key = f"status_drive_undo_{brand}"
+                st.session_state[undo_key] = {
+                    "file_id": target["file_id"],
+                    "file_name": target["file_name"],
+                    "bytes": original_bytes,
+                }
+                drive_upload(
+                    svc,
+                    target["file_id"],
+                    merged_bytes,
+                    target["file_name"],
+                )
+                st.success(
+                    f"Updated **{target['file_name']}** in **{target['folder_name']}** "
+                    f"with {', '.join(inserted_tabs)}."
+                )
+            except Exception as e:
+                st.error(f"Could not save the multi-month ancillary report to Drive: {e}")
+
+        status_undo_key = f"status_drive_undo_{brand}"
+        if st.session_state.get(status_undo_key):
+            if st.button(
+                "↩ Undo Last Multi-Month Ancillary Drive Save",
+                key=f"status_drive_undo_btn_{brand}",
+            ):
+                try:
+                    undo = st.session_state[status_undo_key]
+                    drive_upload(
+                        get_drive_service(),
+                        undo["file_id"],
+                        undo["bytes"],
+                        undo["file_name"],
+                    )
+                    st.session_state.pop(status_undo_key, None)
+                    st.success("Restored the ancillary workbook to its previous version.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not undo the multi-month ancillary Drive save: {e}")
+
+with tab_ancillary:
+    st.subheader("Monthly Ancillary Revenue Report Builder")
+    (arev_hilton_tab, arev_independent_tab, arev_ihg_tab, arev_marriott_tab, arev_best_western_tab, arev_margaritaville_tab) = st.tabs([
+        "Hilton", "Independent", "IHG", "Marriott", "Best Western", "Margaritaville"
+    ])
+
+    with arev_hilton_tab:
+        _render_arev_hilton_tab()
+    with arev_independent_tab:
+        _render_arev_independent_tab()
+    with arev_ihg_tab:
+        _render_arev_status_brand_tab("IHG", ["Manchester", "Salem", "Weirton"], use_nor1=True)
+    with arev_marriott_tab:
+        _render_arev_status_brand_tab("Marriott", ["Macon", "Tampa"])
+    with arev_best_western_tab:
+        _render_arev_status_brand_tab("Best Western", ["Rutland", "Springfield"])
+    with arev_margaritaville_tab:
+        _render_arev_status_brand_tab("Margaritaville", ["Margaritaville Resort Cape Cod"], use_oaky=True)
 
         with tab_ooo:
             st.caption(
