@@ -14072,7 +14072,11 @@ def ancillary_parse_nor1_status(uploaded_file, report_month):
     revenue, so each category is treated as Requested = Approved = revenue;
     Denied/Expired are unavailable for the detail row.
     """
-    parsed = hilton_ancillary_parse_nor1(uploaded_file, report_month=report_month)
+    parsed = hilton_ancillary_parse_nor1(
+        uploaded_file,
+        report_month=report_month,
+        allow_missing_month_zero=True,
+    )
     rows = []
     for r in parsed.get("rows", []):
         revenue = _ar_num(r.get("revenue")) or 0.0
@@ -15221,8 +15225,16 @@ def _hilton_ar_round_revenue(value):
     return float(math.floor(n + 0.5)) if n >= 0 else float(math.ceil(n - 0.5))
 
 
-def hilton_ancillary_parse_nor1(uploaded_file, report_month=None):
-    """Parse a NOR1 Custom Export, optionally filtering one month."""
+def hilton_ancillary_parse_nor1(uploaded_file, report_month=None, allow_missing_month_zero=False):
+    """Parse a NOR1 Custom Export, optionally filtering one month.
+
+    ``allow_missing_month_zero`` is used by the IHG ancillary workflow only.
+    NOR1 can omit a month entirely when the property had no production (for
+    example, before the hotel began using NOR1). In that workflow a structurally
+    valid export with no rows for the requested month represents a true zero.
+    Hilton keeps the stricter default so missing grouped months still surface as
+    upload/report-range errors there.
+    """
     raw = _ar_file_rows(uploaded_file)
     if not raw:
         raise ValueError("NOR1 report is empty.")
@@ -15329,6 +15341,13 @@ def hilton_ancillary_parse_nor1(uploaded_file, report_month=None):
         item["revenue"] += revenue
 
     if report_month is not None and matched == 0:
+        if allow_missing_month_zero:
+            return {
+                "rows": [],
+                "property_name": property_name,
+                "total_count": 0.0,
+                "total_revenue": 0.0,
+            }
         raise ValueError(
             f"NOR1 grouped file has no rows for "
             f"{report_month.strftime('%B %Y')}."
