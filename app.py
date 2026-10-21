@@ -13819,20 +13819,53 @@ def _ar_upload_bytes(uploaded_file):
 
 
 def ancillary_canary_status_months(uploaded_file):
-    """Return sorted (year, month) pairs present in a grouped Canary export."""
+    """Return sorted (year, month) pairs present in a grouped Canary export.
+
+    A structurally valid header-only export is allowed and returns an empty list.
+    Validate the core Canary columns here so a malformed file is never mistaken
+    for a legitimate zero-production export.
+    """
     raw = _ar_file_rows(uploaded_file)
     if not raw:
-        return []
+        raise ValueError("Canary upsell export is empty and has no header row.")
     h = _ar_header_map(raw[0])
     date_i = _ar_col(h, ["Arrival Date"])
-    if date_i < 0:
-        raise ValueError("Canary upsell export is missing Arrival Date.")
+    status_i = _ar_col(h, ["Status"])
+    item_i = _ar_col(h, ["Item"])
+    revenue_i = _ar_col(h, ["Revenue"])
+    if min(date_i, status_i, item_i, revenue_i) < 0:
+        raise ValueError(
+            "Canary upsell export must contain Arrival Date, Status, Item, and Revenue."
+        )
     months = set()
     for row in raw[1:]:
         dt = _ar_date(row[date_i] if date_i < len(row) else None)
         if dt:
             months.add((dt.year, dt.month))
     return sorted(months)
+
+
+def _ar_month_ordinal(month_key):
+    """Convert a (year, month) tuple to a sortable integer."""
+    return int(month_key[0]) * 12 + int(month_key[1])
+
+
+def ancillary_canary_missing_month_is_zero(available_months, target_key):
+    """Return True when a missing Canary month can safely represent $0.
+
+    Rules:
+      * A valid header-only export (no dated rows at all) represents zero
+        production for the selected reporting period(s).
+      * If the grouped export has dated rows, a gap between its earliest and
+        latest represented months is treated as a genuine zero-production month.
+      * A requested month before/after the uploaded span remains an error so an
+        accidentally incomplete export is not silently converted to zero.
+    """
+    months = sorted(set(available_months or []))
+    if not months:
+        return True
+    target = _ar_month_ordinal(target_key)
+    return _ar_month_ordinal(months[0]) <= target <= _ar_month_ordinal(months[-1])
 
 
 def ancillary_oaky_status_months(uploaded_file):
@@ -14614,13 +14647,27 @@ def ancillary_status_build_multi_month_report(
         stly_key = (stly_month.year, stly_month.month)
 
         if cur_key not in current_canary_months:
-            raise ValueError(
-                f"Current Canary export has no rows for {report_month.strftime('%B %Y')}."
-            )
+            if ancillary_canary_missing_month_is_zero(current_canary_months, cur_key):
+                warnings.append(
+                    f"Current Canary export has no rows for {report_month.strftime('%B %Y')}; "
+                    "that month was treated as $0 Canary revenue."
+                )
+            else:
+                raise ValueError(
+                    f"Current Canary export has no rows for {report_month.strftime('%B %Y')} "
+                    "and that month falls outside the date span covered by the upload."
+                )
         if stly_key not in stly_canary_months:
-            raise ValueError(
-                f"STLY Canary export has no rows for {stly_month.strftime('%B %Y')}."
-            )
+            if ancillary_canary_missing_month_is_zero(stly_canary_months, stly_key):
+                warnings.append(
+                    f"STLY Canary export has no rows for {stly_month.strftime('%B %Y')}; "
+                    "that STLY month was treated as $0 Canary revenue."
+                )
+            else:
+                raise ValueError(
+                    f"STLY Canary export has no rows for {stly_month.strftime('%B %Y')} "
+                    "and that month falls outside the date span covered by the upload."
+                )
 
         current_canary = ancillary_parse_canary_status(current_canary_file, report_month)
         stly_canary = ancillary_parse_canary_status(stly_canary_file, stly_month)
