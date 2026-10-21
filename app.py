@@ -15202,6 +15202,24 @@ def hilton_ancillary_parse_nor1(uploaded_file, report_month=None):
             "Grouped NOR1 file must contain Report Date."
         )
 
+    # A structurally valid NOR1 export can legitimately contain only the
+    # header row when the property had no NOR1 production for the selected
+    # period (for example, before the hotel went live on NOR1). Treat that
+    # as a true zero rather than a missing-month error. We intentionally do
+    # this only after validating the expected NOR1 headers so malformed or
+    # unrelated files still fail loudly.
+    has_data_rows = any(
+        any(value not in (None, "") for value in row)
+        for row in raw[1:]
+    )
+    if not has_data_rows:
+        return {
+            "rows": [],
+            "property_name": None,
+            "total_count": 0.0,
+            "total_revenue": 0.0,
+        }
+
     by_key = collections.OrderedDict()
     property_name = None
     matched = 0
