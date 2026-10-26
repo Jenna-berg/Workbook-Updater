@@ -2973,6 +2973,415 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
     return out
 
 
+
+def _strategy_audit_values_equal(actual, expected, tolerance=0.01):
+    """Loose value comparison for Strategy historical audit.
+
+    Numeric values are compared with a penny-level tolerance. Text is compared
+    after trimming whitespace. Formulas in LY destination cells are treated as
+    mismatches because Strategy historical values are expected to be pasted
+    values, not formulas.
+    """
+    if is_formula(actual):
+        return False
+    if actual is None and expected is None:
+        return True
+    if actual is None or expected is None:
+        return False
+
+    a_num = safe_float(actual)
+    e_num = safe_float(expected)
+    if a_num is not None and e_num is not None:
+        return abs(a_num - e_num) <= tolerance
+
+    return str(actual).strip() == str(expected).strip()
+
+
+def _strategy_sheet_has_real_ty_data(wb, sheet_name):
+    """Return True when a Strategy week tab appears to have been used.
+
+    Audit only completed/used weekly tabs. Untouched master tabs often contain
+    formulas and formatting but no actual TY data; auditing those would create
+    false-positive LY mismatches.
+    """
+    if sheet_name not in wb.sheetnames:
+        return False
+
+    ws = wb[sheet_name]
+    col_map = detect_strategy_columns(ws)
+    date_map = build_date_row_map(
+        wb,
+        prefer_sheet=sheet_name,
+        fallback_to_wkone=False,
+    )
+    if not date_map:
+        return False
+
+    # A tab marked done by this app counts as used even when its literal source
+    # values happen to be all zero/blank.
+    tc = ws.sheet_properties.tabColor
+    if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+        return True
+
+    # Match the same signal used by first_undone_strategy_sheet(): real OTB TY
+    # transaction values near the top of the sheet. Do not use comp-set/rate
+    # columns here because untouched master tabs can already contain those and
+    # would be falsely classified as completed weeks.
+    otb_col = col_map.get("otb_trans")
+    if not otb_col:
+        return False
+
+    for row_num in range(5, min(ws.max_row, 14) + 1):
+        value = ws.cell(row_num, otb_col).value
+        if value is not None and not is_formula(value):
+            if safe_float(value) is not None:
+                return True
+
+    return False
+
+
+def _strategy_audit_source_date(ly_wb, sheet_name, ty_date):
+    """Return the historical source date used for one Strategy TY date."""
+    ly_map = _build_strategy_historical_date_row_map(ly_wb, sheet_name)
+    if not ly_map:
+        return None
+
+    comparable = ty_date - datetime.timedelta(days=364)
+    if comparable in ly_map:
+        return comparable
+
+    candidates = [
+        d for d in ly_map
+        if d.weekday() == ty_date.weekday()
+        and abs((d - comparable).days) <= 7
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda d: (abs((d - comparable).days), d))
+
+
+def strategy_audit_workbook(
+    current_wb,
+    historical_wb,
+    report_month,
+    *,
+    sample_limit=100,
+    sheets=None,
+):
+    """Compare one Strategy workbook's LY columns with its historical source.
+
+    The expected values use the exact same Strategy-only DOW mapping as the
+    normal Strategy updater. Returns a compact summary plus a sample of
+    mismatches. Set sample_limit=None to collect every mismatch for repair.
+    """
+    sheets = sheets or STRATEGY_SHEETS
+    issues = []
+    mismatch_count = 0
+    cells_checked = 0
+    weeks_checked = 0
+    missing_source_rows = 0
+
+    scope_start = report_month.replace(day=1)
+    scope_end = report_month.replace(
+        day=calendar.monthrange(report_month.year, report_month.month)[1]
+    )
+
+    for sheet_name in sheets:
+        if sheet_name not in current_wb.sheetnames:
+            continue
+        if sheet_name not in historical_wb.sheetnames:
+            continue
+        if not _strategy_sheet_has_real_ty_data(current_wb, sheet_name):
+            continue
+
+        ws = current_wb[sheet_name]
+        col_map = detect_strategy_columns(ws)
+        _, comp_ly_col = detect_comp_set_columns(ws, col_map)
+
+        current_date_map = build_date_row_map(
+            current_wb,
+            prefer_sheet=sheet_name,
+            fallback_to_wkone=False,
+        )
+        current_date_map = {
+            d: r for d, r in current_date_map.items()
+            if scope_start <= d <= scope_end
+        }
+        if not current_date_map:
+            continue
+
+        expected_map = _extract_ly_data_from_wb(
+            historical_wb,
+            sheet_name,
+            ty_wb=current_wb,
+        )
+        weeks_checked += 1
+
+        for ty_date, row_num in sorted(current_date_map.items()):
+            expected_row = expected_map.get(ty_date)
+            if not expected_row:
+                missing_source_rows += 1
+                continue
+
+            source_date = _strategy_audit_source_date(
+                historical_wb,
+                sheet_name,
+                ty_date,
+            )
+
+            for field, expected in expected_row.items():
+                if field == "comp_set_ly":
+                    dest_col = comp_ly_col
+                else:
+                    dest_col = col_map.get(field)
+                if not dest_col:
+                    continue
+
+                actual = ws.cell(row_num, dest_col).value
+                cells_checked += 1
+                if _strategy_audit_values_equal(actual, expected):
+                    continue
+
+                mismatch_count += 1
+                if sample_limit is None or len(issues) < sample_limit:
+                    issues.append({
+                        "sheet": sheet_name,
+                        "ty_date": ty_date,
+                        "source_date": source_date,
+                        "field": field,
+                        "row": row_num,
+                        "col": dest_col,
+                        "actual": actual,
+                        "expected": expected,
+                    })
+
+    return {
+        "weeks_checked": weeks_checked,
+        "cells_checked": cells_checked,
+        "mismatch_count": mismatch_count,
+        "missing_source_rows": missing_source_rows,
+        "issues": issues,
+    }
+
+
+def _strategy_audit_targets(discovered_hotels):
+    """Return every portfolio hotel that uses a Strategy Report."""
+    targets = []
+
+    for portfolio in ("Stay In Touch", "IHG"):
+        for hotel_name, hotel_id in hotels_in_portfolio(
+            portfolio,
+            discovered_hotels,
+        ):
+            targets.append((hotel_name, hotel_id, portfolio))
+
+    # Best Western has monthly Strategy setup even though it is not part of the
+    # operational portfolio discovery map.
+    for hotel_name, hotel_id in BEST_WESTERN_MONTHLY_HOTELS.items():
+        targets.append((hotel_name.title(), hotel_id, "Best Western"))
+
+    # De-duplicate by hotel label while preserving the declared portfolio order.
+    seen = set()
+    out = []
+    for hotel_name, hotel_id, portfolio in targets:
+        key = hotel_name.strip().upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((hotel_name, hotel_id, portfolio))
+    return out
+
+
+def _strategy_audit_drive_month(
+    service,
+    hotel_name,
+    hotel_id,
+    report_month,
+    *,
+    collect_limit=100,
+):
+    """Audit one Drive Strategy report month without modifying it."""
+    current_result, current_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "Strategy Report",
+        report_month,
+        force_refresh=True,
+    )
+    if current_err or not current_result:
+        return {
+            "status": "Current Strategy not found",
+            "error": current_err or "No current Strategy workbook found",
+            "report_month": report_month,
+            "hotel": hotel_name,
+        }
+
+    historical_month = report_month.replace(year=report_month.year - 1)
+    historical_result, historical_err = _resolve_drive_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        "Strategy Report",
+        historical_month,
+        force_refresh=True,
+    )
+    if historical_err or not historical_result:
+        return {
+            "status": "Historical Strategy not found",
+            "error": historical_err or "No historical Strategy workbook found",
+            "report_month": report_month,
+            "hotel": hotel_name,
+            "file_id": current_result[0],
+            "file_name": current_result[1],
+        }
+
+    try:
+        current_bytes = drive_download(service, current_result[0])
+        historical_bytes = drive_download(service, historical_result[0])
+        current_wb = openpyxl.load_workbook(
+            io.BytesIO(current_bytes),
+            data_only=False,
+        )
+        historical_wb = openpyxl.load_workbook(
+            io.BytesIO(historical_bytes),
+            data_only=False,
+        )
+    except Exception as exc:
+        return {
+            "status": "Could not read workbook",
+            "error": str(exc),
+            "report_month": report_month,
+            "hotel": hotel_name,
+            "file_id": current_result[0],
+            "file_name": current_result[1],
+            "historical_file_id": historical_result[0],
+            "historical_file_name": historical_result[1],
+        }
+
+    audit = strategy_audit_workbook(
+        current_wb,
+        historical_wb,
+        report_month,
+        sample_limit=collect_limit,
+    )
+
+    # Missing source rows take precedence over ordinary mismatches.  A report
+    # that cannot be fully validated must never enter the automatic repair
+    # queue, even when some other cells are repairable.
+    if audit["missing_source_rows"]:
+        status = "Source rows missing"
+    elif audit["mismatch_count"]:
+        status = "Needs repair"
+    elif audit["weeks_checked"] == 0:
+        status = "No completed weeks to audit"
+    else:
+        status = "OK"
+
+    return {
+        "status": status,
+        "error": None,
+        "report_month": report_month,
+        "hotel": hotel_name,
+        "file_id": current_result[0],
+        "file_name": current_result[1],
+        "historical_file_id": historical_result[0],
+        "historical_file_name": historical_result[1],
+        **audit,
+    }
+
+
+def _strategy_repair_drive_month(service, audit_record):
+    """Re-audit and repair one flagged Strategy workbook in Drive.
+
+    The workbook is downloaded again immediately before repair so an old audit
+    result cannot overwrite changes made after the diagnostic ran.
+    """
+    hotel_name = audit_record["hotel"]
+    report_month = audit_record["report_month"]
+    file_id = audit_record["file_id"]
+    file_name = audit_record["file_name"]
+    historical_file_id = audit_record["historical_file_id"]
+
+    current_bytes = drive_download(service, file_id)
+    historical_bytes = drive_download(service, historical_file_id)
+    current_wb = openpyxl.load_workbook(
+        io.BytesIO(current_bytes),
+        data_only=False,
+    )
+    historical_wb = openpyxl.load_workbook(
+        io.BytesIO(historical_bytes),
+        data_only=False,
+    )
+
+    fresh = strategy_audit_workbook(
+        current_wb,
+        historical_wb,
+        report_month,
+        sample_limit=None,
+    )
+    if fresh["missing_source_rows"]:
+        raise ValueError(
+            f"Repair blocked: {fresh['missing_source_rows']} Strategy date row(s) "
+            "could not be matched to the historical source."
+        )
+    if not fresh["mismatch_count"]:
+        return {
+            "hotel": hotel_name,
+            "report_month": report_month,
+            "file_name": file_name,
+            "cells_fixed": 0,
+            "status": "Already correct",
+        }
+
+    for issue in fresh["issues"]:
+        ws = current_wb[issue["sheet"]]
+        ws.cell(issue["row"], issue["col"]).value = issue["expected"]
+
+    strip_tables(current_wb)
+    out = io.BytesIO()
+    current_wb.save(out)
+    drive_upload(
+        service,
+        file_id,
+        out.getvalue(),
+        file_name,
+    )
+
+    # Verify the exact file that Drive now serves, not merely the in-memory
+    # workbook that was sent to the API.  This catches upload/version problems
+    # before the report is marked repaired.
+    persisted_bytes = drive_download(service, file_id)
+    persisted_wb = openpyxl.load_workbook(
+        io.BytesIO(persisted_bytes),
+        data_only=False,
+    )
+    verify = strategy_audit_workbook(
+        persisted_wb,
+        historical_wb,
+        report_month,
+        sample_limit=10,
+    )
+    if verify["missing_source_rows"]:
+        raise ValueError(
+            f"Post-repair validation found {verify['missing_source_rows']} "
+            "Strategy date row(s) without a historical source match."
+        )
+    if verify["mismatch_count"]:
+        raise ValueError(
+            f"Post-repair validation still found "
+            f"{verify['mismatch_count']} Strategy LY mismatches."
+        )
+
+    return {
+        "hotel": hotel_name,
+        "report_month": report_month,
+        "file_name": file_name,
+        "cells_fixed": fresh["mismatch_count"],
+        "status": "Repaired",
+    }
+
+
 def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=None,
                                scope_start=None, scope_end=None):
     """Build strategy changes.
@@ -21499,6 +21908,304 @@ def render_best_western_monthly_setup():
     render_ihg_strategy_month_setup(hotel_name, hotel_id)
 
 
+
+def render_strategy_historical_audit(discovered_hotels):
+    """Read-only portfolio Strategy LY diagnostic with optional batch repair."""
+    with st.expander("🧪 Strategy Historical LY Audit", expanded=False):
+        st.markdown("### Strategy Historical LY Audit")
+        st.caption(
+            "Checks completed Strategy week tabs against the prior Strategy "
+            "report using the same DOW-aligned TY→LY mapping as the live Strategy "
+            "updater. Running the audit is read-only. Repairs are a separate action."
+        )
+
+        today = datetime.date.today()
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            audit_year = st.number_input(
+                "Audit year",
+                min_value=2023,
+                max_value=today.year + 2,
+                value=today.year,
+                step=1,
+                key="strategy_audit_year",
+            )
+
+        month_labels = [datetime.date(2000, m, 1).strftime("%B") for m in range(1, 13)]
+        if int(audit_year) == today.year:
+            default_months = month_labels[:today.month]
+        elif int(audit_year) < today.year:
+            default_months = month_labels
+        else:
+            default_months = []
+
+        with c2:
+            selected_month_labels = st.multiselect(
+                "Months to audit",
+                month_labels,
+                default=default_months,
+                key="strategy_audit_months",
+            )
+
+        targets = _strategy_audit_targets(discovered_hotels)
+        target_options = [
+            f"{portfolio} — {hotel_name}"
+            for hotel_name, _hotel_id, portfolio in targets
+        ]
+        target_lookup = {
+            f"{portfolio} — {hotel_name}": (hotel_name, hotel_id, portfolio)
+            for hotel_name, hotel_id, portfolio in targets
+        }
+
+        selected_targets = st.multiselect(
+            "Hotels",
+            target_options,
+            default=target_options,
+            key="strategy_audit_hotels",
+            help=(
+                "Includes every property in the app that uses a Strategy Report: "
+                "Independent/StayNTouch, IHG, and Best Western. Hilton is excluded "
+                "because Hilton does not use Strategy Reports."
+            ),
+        )
+
+        selected_month_numbers = [
+            month_labels.index(label) + 1
+            for label in selected_month_labels
+        ]
+
+        if st.button(
+            "Run Strategy Historical Audit",
+            key="run_strategy_historical_audit",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_targets or not selected_month_numbers,
+        ):
+            svc = get_drive_service()
+            total_jobs = max(
+                1,
+                len(selected_targets) * len(selected_month_numbers),
+            )
+            progress = st.progress(0.0)
+            status_box = st.empty()
+            results = []
+            done = 0
+
+            for target_label in selected_targets:
+                hotel_name, hotel_id, portfolio = target_lookup[target_label]
+                if not hotel_id:
+                    for month_num in selected_month_numbers:
+                        results.append({
+                            "status": "Drive folder missing",
+                            "error": "No Drive folder ID is available for this hotel.",
+                            "report_month": datetime.date(
+                                int(audit_year), month_num, 1
+                            ),
+                            "hotel": hotel_name,
+                            "portfolio": portfolio,
+                        })
+                        done += 1
+                        progress.progress(done / total_jobs)
+                    continue
+
+                for month_num in selected_month_numbers:
+                    report_month = datetime.date(
+                        int(audit_year),
+                        month_num,
+                        1,
+                    )
+                    status_box.caption(
+                        f"Checking {hotel_name} — {report_month:%B %Y}"
+                    )
+                    record = _strategy_audit_drive_month(
+                        svc,
+                        hotel_name,
+                        hotel_id,
+                        report_month,
+                        collect_limit=100,
+                    )
+                    record["portfolio"] = portfolio
+                    results.append(record)
+                    done += 1
+                    progress.progress(done / total_jobs)
+
+            status_box.empty()
+            progress.empty()
+            st.session_state["strategy_hist_audit_results_v1"] = results
+
+        results = st.session_state.get(
+            "strategy_hist_audit_results_v1",
+            [],
+        )
+        if not results:
+            return
+
+        summary_rows = []
+        for rec in results:
+            summary_rows.append({
+                "Portfolio": rec.get("portfolio", ""),
+                "Hotel": rec.get("hotel", ""),
+                "Month": (
+                    rec["report_month"].strftime("%b %Y")
+                    if isinstance(rec.get("report_month"), datetime.date)
+                    else str(rec.get("report_month", ""))
+                ),
+                "Status": rec.get("status", ""),
+                "Weeks Checked": rec.get("weeks_checked", 0),
+                "Cells Checked": rec.get("cells_checked", 0),
+                "Mismatches": rec.get("mismatch_count", 0),
+                "Missing Source Rows": rec.get("missing_source_rows", 0),
+                "Workbook": rec.get("file_name", ""),
+                "Historical Source": rec.get("historical_file_name", ""),
+                "Error": rec.get("error", "") or "",
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        problem_count = sum(
+            1 for rec in results
+            if rec.get("status") in {
+                "Needs repair",
+                "Source rows missing",
+                "Could not read workbook",
+            }
+        )
+        repairable = [
+            rec for rec in results
+            if rec.get("status") == "Needs repair"
+        ]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Reports checked", len(results))
+        m2.metric("Reports needing attention", problem_count)
+        m3.metric("Reports safe to auto-repair", len(repairable))
+
+        st.dataframe(
+            summary_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Show a concise mismatch sample so the user can verify the pattern
+        # before any repair is allowed.
+        issue_rows = []
+        for rec in repairable:
+            for issue in rec.get("issues", []):
+                issue_rows.append({
+                    "Hotel": rec.get("hotel", ""),
+                    "Month": rec["report_month"].strftime("%b %Y"),
+                    "Week": issue.get("sheet", ""),
+                    "TY Date": (
+                        issue["ty_date"].strftime("%m/%d/%Y")
+                        if issue.get("ty_date") else ""
+                    ),
+                    "Historical DOW Date": (
+                        issue["source_date"].strftime("%m/%d/%Y")
+                        if issue.get("source_date") else ""
+                    ),
+                    "Field": issue.get("field", ""),
+                    "Current LY": issue.get("actual"),
+                    "Expected LY": issue.get("expected"),
+                    "Cell": (
+                        f"{get_column_letter(issue['col'])}{issue['row']}"
+                        if issue.get("col") and issue.get("row") else ""
+                    ),
+                })
+
+        if issue_rows:
+            with st.expander("Mismatch sample", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(issue_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download audit summary CSV",
+            data=csv_bytes,
+            file_name=f"strategy_historical_audit_{int(audit_year)}.csv",
+            mime="text/csv",
+            key="strategy_audit_download",
+            use_container_width=True,
+        )
+
+        if any(
+            rec.get("status") == "Source rows missing"
+            for rec in results
+        ):
+            st.warning(
+                "At least one report has Strategy dates that could not be matched "
+                "to a historical source row. Those reports are intentionally not "
+                "auto-repaired; the audit leaves them for review instead of guessing."
+            )
+
+        if repairable:
+            st.divider()
+            st.markdown("#### Repair flagged historical LY cells")
+            st.caption(
+                "The repair step downloads each flagged workbook again, re-runs "
+                "the audit against the historical source, changes only LY cells "
+                "that still fail validation, uploads the workbook, then validates "
+                "the repaired copy again before moving on."
+            )
+
+            approve_repair = st.checkbox(
+                "I reviewed the diagnostic and want to repair all reports marked Needs repair",
+                key="strategy_audit_repair_confirm",
+            )
+
+            if st.button(
+                "Repair All Flagged Strategy Reports",
+                key="strategy_audit_repair_all",
+                type="primary",
+                use_container_width=True,
+                disabled=not approve_repair,
+            ):
+                svc = get_drive_service()
+                repair_progress = st.progress(0.0)
+                repair_status = st.empty()
+                repaired = []
+                errors = []
+
+                for idx, rec in enumerate(repairable, start=1):
+                    repair_status.caption(
+                        f"Repairing {rec['hotel']} — {rec['report_month']:%B %Y}"
+                    )
+                    try:
+                        result = _strategy_repair_drive_month(
+                            svc,
+                            rec,
+                        )
+                        repaired.append(result)
+                        rec["status"] = "OK"
+                        rec["mismatch_count"] = 0
+                        rec["issues"] = []
+                    except Exception as exc:
+                        errors.append(
+                            f"{rec['hotel']} {rec['report_month']:%b %Y}: {exc}"
+                        )
+                    repair_progress.progress(idx / len(repairable))
+
+                repair_status.empty()
+                repair_progress.empty()
+
+                if repaired:
+                    total_fixed = sum(
+                        item.get("cells_fixed", 0)
+                        for item in repaired
+                    )
+                    st.success(
+                        f"Repaired {len(repaired)} Strategy report(s) and "
+                        f"corrected {total_fixed:,} LY cells."
+                    )
+                    st.session_state[
+                        "strategy_hist_audit_results_v1"
+                    ] = results
+
+                for err in errors:
+                    st.error(err)
+
+
 if _section == SECTION_REVENUE:
     tab_weekly, tab_ancillary, tab_ooo = st.tabs(
         ["Weekly Workbook Update", "Ancillary Revenue", "Monthly OOO Report"])
@@ -21522,6 +22229,11 @@ with tab_weekly:
         st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
     all_discovered = get_hotels_from_drive()
+
+    # Portfolio-wide Strategy historical validation/repair. This is deliberately
+    # separate from the normal weekly update so an audit can be run read-only
+    # before any workbook is touched.
+    render_strategy_historical_audit(all_discovered)
 
     # Each portfolio's data arrives in a different export, so they get their own
     # tab rather than sharing one hotel list.
