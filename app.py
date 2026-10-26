@@ -2675,8 +2675,7 @@ def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
 
     out = {}  # {this_year_date: {field: value}}
     for ly_date, r in ly_date_row.items():
-        # Keep this legacy helper on the same portfolio-wide DOW rule.
-        this_year_date = _strategy_ty_date_from_stly(ly_date)
+        this_year_date = ly_date.replace(year=ly_date.year + 1)
         row_data = {}
 
         # Pull each TY source field from last year
@@ -2833,35 +2832,12 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
     return out
 
 
-def _strategy_stly_comparable_date(ty_date):
-    """Return the 52-week STLY comparison date for a Strategy TY date.
-
-    Strategy comparisons are aligned by day of week, not by calendar date.
-    Using exactly 364 days (52 weeks) guarantees the same weekday across
-    normal years, leap years, and month/year boundaries.
-
-    Examples:
-      2026-10-01 (Thu) -> 2025-10-02 (Thu)
-      2025-03-01 (Sat) -> 2024-03-02 (Sat)
-    """
-    if isinstance(ty_date, datetime.datetime):
-        ty_date = ty_date.date()
-    return ty_date - datetime.timedelta(days=364)
-
-
-def _strategy_ty_date_from_stly(stly_date):
-    """Inverse of _strategy_stly_comparable_date for defensive fallbacks."""
-    if isinstance(stly_date, datetime.datetime):
-        stly_date = stly_date.date()
-    return stly_date + datetime.timedelta(days=364)
-
-
 def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
-    """Read STLY Strategy values using the shared 52-week weekday mapping.
+    """Read prior-year Strategy values and align them to TY by weekday.
 
-    Portfolio-wide rule: STLY = TY date minus exactly 364 days (52 weeks).
-    This preserves day of week across normal years, leap years, and
-    month/year boundaries. Example: Thu 10/01/2026 <- Thu 10/02/2025.
+    Portfolio-wide STLY rule: a TY date receives the value from the nearest
+    date in the prior calendar year that falls on the SAME weekday.
+    Example: Tue 09/01/2026 <- Tue 09/02/2025.
     """
     if sheet_name not in ly_wb.sheetnames:
         return {}
@@ -2882,35 +2858,48 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
 
     if not ty_date_map:
         # Defensive fallback for callers without TY workbook context.
-        # The inverse 52-week mapping preserves weekday exactly.
         for src_date in ly_date_map:
-            ty_date_map[_strategy_ty_date_from_stly(src_date)] = None
+            try:
+                nominal = datetime.date(src_date.year + 1, src_date.month, src_date.day)
+            except ValueError:
+                nominal = datetime.date(src_date.year + 1, 2, 28)
+            for offset in range(-3, 4):
+                candidate = nominal + datetime.timedelta(days=offset)
+                if candidate.weekday() == src_date.weekday():
+                    ty_date_map[candidate] = None
+                    break
 
     comp_ty_col, _ = detect_comp_set_columns(ly_ws, ly_col_map)
     source_dates = sorted(ly_date_map.keys())
     out = {}
 
     for ty_date in sorted(ty_date_map.keys()):
-        comparable = _strategy_stly_comparable_date(ty_date)
+        prior_year = ty_date.year - 1
+        try:
+            nominal = datetime.date(prior_year, ty_date.month, ty_date.day)
+        except ValueError:
+            nominal = datetime.date(prior_year, 2, 28)
 
-        # Exact 52-week date is authoritative. Because Strategy workbooks
-        # carry a rolling daily calendar, this also correctly handles cases
-        # where the comparable date crosses a month or year boundary.
-        if comparable in ly_date_map:
-            src_date = comparable
+        candidates = [
+            d for d in source_dates
+            if d.year == prior_year
+            and d.weekday() == ty_date.weekday()
+            and abs((d - nominal).days) <= 7
+        ]
+        if candidates:
+            src_date = min(candidates, key=lambda d: (abs((d - nominal).days), d))
         else:
-            # Defensive fallback for legacy sheets with stale/misprinted years:
-            # never abandon the weekday rule. Pick the closest available row
-            # on the same weekday to the exact 52-week comparable date.
-            candidates = [
-                d for d in source_dates
-                if d.weekday() == ty_date.weekday()
-            ]
+            # If the source workbook has a bad printed year, preserve weekday
+            # alignment and choose the nearest month/day as a fallback.
+            candidates = [d for d in source_dates if d.weekday() == ty_date.weekday()]
             if not candidates:
                 continue
             src_date = min(
                 candidates,
-                key=lambda d: abs((d - comparable).days),
+                key=lambda d: (
+                    abs(d.month - nominal.month) * 31 + abs(d.day - nominal.day),
+                    abs(d.year - prior_year),
+                ),
             )
 
         src_row = ly_date_map[src_date]
@@ -12424,20 +12413,16 @@ def _count_sheet_data_rows(ws):
 
 
 def restructure_sr_dates(wb, target_month):
-    """Restructure Strategy date columns using one portfolio-wide STLY rule.
-
-    Row 4 (header): col 1 = year of the first STLY comparable date;
-                    col 3 = TY year.
-    Col 1 (STLY):   each TY date minus exactly 364 days (52 weeks), so DOW
-                    always matches — including leap years and boundaries.
-    Col 2 (DOW):    abbreviation matching the TY/STLY weekday.
-    Col 3 (TY):     starts at day 1 of target_month.
-
-    Example: 10/01/2026 Thu -> 10/02/2025 Thu.
+    """Restructure the three date columns in every strategy sheet for a new month.
+    Row 4 (header):    col 1 = LY year, col 3 = TY year — else stale years carry
+                        over from whatever the master template last had.
+    Col 1 (LY date):   starts at day 2 of target_month, last year
+    Col 2 (day of wk): abbreviation matching the TY date in col 3
+    Col 3 (TY date):   starts at day 1 of target_month, this year
     Row count matches the master — hotels open only part of the year have fewer rows.
     """
     ty_start = target_month
-    ly_start = _strategy_stly_comparable_date(ty_start)
+    ly_start = datetime.date(ty_start.year - 1, ty_start.month, 2)
 
     for sheet_name in STRATEGY_SHEETS:
         if sheet_name not in wb.sheetnames:
@@ -12458,7 +12443,7 @@ def restructure_sr_dates(wb, target_month):
         for i in range(num_rows):
             row     = 5 + i
             ty_date = ty_start + datetime.timedelta(days=i)
-            ly_date = _strategy_stly_comparable_date(ty_date)
+            ly_date = ly_start + datetime.timedelta(days=i)
             dow     = DOW_ABBREVS[ty_date.weekday()]
             try:
                 ws.cell(row, 1).value = datetime.datetime(ly_date.year, ly_date.month, ly_date.day)
