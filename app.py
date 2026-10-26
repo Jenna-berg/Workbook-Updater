@@ -2832,21 +2832,73 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
     return out
 
 
-def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
-    """Read prior-year Strategy values and align them to TY by weekday.
+def _build_strategy_historical_date_row_map(wb, sheet_name):
+    """Return the Strategy sheet's REAL printed TY dates without year repair.
 
-    Portfolio-wide STLY rule: a TY date receives the value from the nearest
-    date in the prior calendar year that falls on the SAME weekday.
-    Example: Tue 09/01/2026 <- Tue 09/02/2025.
+    This helper is intentionally Strategy/STLY-only.  The general
+    build_date_row_map() function may shift a stale workbook's dates into the
+    current year, which is useful for live/current-cycle updates but is wrong
+    when reading a historical Strategy workbook.  Historical Strategy dates
+    must remain in their original year so the LY bulk-copy can align by DOW.
+
+    Example (Tybee NOV2026): the source row for Sun 11/01/2026 is Sun
+    11/02/2025, not Sat 11/01/2025.  Preserving the source workbook's real
+    2025 dates is what makes that comparison possible.
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+
+    ws = wb[sheet_name]
+    date_col = detect_date_column(ws, wb=wb)
+    mapping = {}
+    anchor_date = None
+    anchor_row = None
+    scan_end = max(ws.max_row, 400)
+
+    for row_num in range(5, scan_end + 1):
+        val = ws.cell(row_num, date_col).value
+        if isinstance(val, datetime.datetime):
+            d = val.date()
+        elif isinstance(val, datetime.date):
+            d = val
+        elif isinstance(val, str) and val.startswith("="):
+            d = _resolve_formula_date(wb, sheet_name, val)
+            if d is None and anchor_row is not None:
+                d = anchor_date + datetime.timedelta(days=row_num - anchor_row)
+            elif d is None:
+                continue
+        elif anchor_row is not None:
+            d = anchor_date + datetime.timedelta(days=row_num - anchor_row)
+        else:
+            continue
+
+        if anchor_date is None:
+            anchor_date = d
+            anchor_row = row_num
+        mapping[d] = row_num
+
+    # IMPORTANT: no current-year normalization here.  This map is used only
+    # as the historical source for Strategy Last Year columns.
+    return mapping
+
+
+def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
+    """Read prior-year Strategy TY values into current Strategy LY columns.
+
+    Strategy-only STLY rule: for each current TY date, use the 52-week
+    comparable source date (TY date - 364 days), which has the SAME weekday.  The source is
+    always the prior Strategy report's TY columns (LY_FROM_TY), never its LY
+    columns.  Week/tab selection is handled elsewhere and is not changed here.
+
+    Example: Sun 11/01/2026 <- Sun 11/02/2025.
+    Leap-year shifts naturally become +/-2 days when required to preserve DOW.
     """
     if sheet_name not in ly_wb.sheetnames:
         return {}
 
     ly_ws = ly_wb[sheet_name]
     ly_col_map = detect_strategy_columns(ly_ws)
-    ly_date_map = build_date_row_map(
-        ly_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
-    )
+    ly_date_map = _build_strategy_historical_date_row_map(ly_wb, sheet_name)
     if not ly_date_map:
         return {}
 
@@ -2874,33 +2926,28 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
     out = {}
 
     for ty_date in sorted(ty_date_map.keys()):
-        prior_year = ty_date.year - 1
-        try:
-            nominal = datetime.date(prior_year, ty_date.month, ty_date.day)
-        except ValueError:
-            nominal = datetime.date(prior_year, 2, 28)
+        # Strategy LY bulk-copy ONLY: align to the comparable weekday 52 weeks
+        # earlier.  Using 364 days keeps the DOW identical and naturally handles
+        # leap-year and month/year-boundary shifts (e.g. 03/01/2024 Fri ->
+        # 03/03/2023 Fri; 12/31/2024 Tue -> 01/02/2024 Tue).  Do not constrain
+        # the source to ``ty_date.year - 1`` because a correct 52-week match can
+        # cross a calendar-year boundary.
+        comparable = ty_date - datetime.timedelta(days=364)
 
-        candidates = [
-            d for d in source_dates
-            if d.year == prior_year
-            and d.weekday() == ty_date.weekday()
-            and abs((d - nominal).days) <= 7
-        ]
-        if candidates:
-            src_date = min(candidates, key=lambda d: (abs((d - nominal).days), d))
+        if comparable in ly_date_map:
+            src_date = comparable
         else:
-            # If the source workbook has a bad printed year, preserve weekday
-            # alignment and choose the nearest month/day as a fallback.
-            candidates = [d for d in source_dates if d.weekday() == ty_date.weekday()]
+            # Defensive fallback for unusual/missing printed dates: keep the
+            # weekday exact and choose the closest available source row to the
+            # 52-week comparable date.  This remains Strategy-only.
+            candidates = [
+                d for d in source_dates
+                if d.weekday() == ty_date.weekday()
+                and abs((d - comparable).days) <= 7
+            ]
             if not candidates:
                 continue
-            src_date = min(
-                candidates,
-                key=lambda d: (
-                    abs(d.month - nominal.month) * 31 + abs(d.day - nominal.day),
-                    abs(d.year - prior_year),
-                ),
-            )
+            src_date = min(candidates, key=lambda d: (abs((d - comparable).days), d))
 
         src_row = ly_date_map[src_date]
         row_data = {}
