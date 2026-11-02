@@ -7133,11 +7133,28 @@ def _rob_valid_date(value):
 def _rob_last_completed_week(prev_wb, target_month):
     """Return the previous ROB's last actually-used week sheet.
 
-    Completion is based on the previous month block's current-year Revenue /
-    Rooms Sold cells, matching the existing Week 1 Previous logic.
+    Primary rule: choose the tab with the latest real weekly as-of date in E4.
+    This is safer than inferring usage from OTB cells because unused template
+    tabs can still contain linked/stale Revenue values.
+
+    Fallback rule: if no valid E4 dates exist, use the prior behavior based on
+    the previous month's current-year Revenue / Rooms Sold cells.
     """
     if prev_wb is None:
         return None
+
+    dated_candidates = []
+    for candidate in ROB_SHEETS:
+        if candidate not in prev_wb.sheetnames:
+            continue
+        as_of = _rob_valid_date(prev_wb[candidate].cell(4, 5).value)
+        if as_of is not None:
+            dated_candidates.append(
+                (as_of, ROB_SHEETS.index(candidate), candidate)
+            )
+
+    if dated_candidates:
+        return max(dated_candidates)[2]
 
     prev_month = (
         target_month - datetime.timedelta(days=1)
@@ -8823,7 +8840,14 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
     if prev_wb and wk_one_name in new_wb.sheetnames:
-        err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month, tracked_year=target_month.year)
+        err = _fill_rob_prev_table(
+            new_wb[wk_one_name],
+            prev_wb,
+            prev_wb_formulas,
+            target_month,
+            tracked_year=target_month.year,
+            prefer_asof_marker=True,
+        )
         if err:
             warnings.append(f"Prev table: {err}")
 
