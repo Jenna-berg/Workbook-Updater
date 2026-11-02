@@ -2832,18 +2832,19 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
     return out
 
 
-def _build_strategy_historical_date_row_map(wb, sheet_name):
-    """Return the Strategy sheet's REAL printed TY dates without year repair.
+def _build_strategy_real_date_row_map(wb, sheet_name, expected_year=None):
+    """Return the Strategy sheet's real TY calendar for this exact week tab.
 
-    This helper is intentionally Strategy/STLY-only.  The general
-    build_date_row_map() function may shift a stale workbook's dates into the
-    current year, which is useful for live/current-cycle updates but is wrong
-    when reading a historical Strategy workbook.  Historical Strategy dates
-    must remain in their original year so the LY bulk-copy can align by DOW.
+    Strategy TY->LY copying must not use the generic build_date_row_map()
+    year-repair behavior.  Best Western Springfield exposed why: a WKTWO tab
+    can otherwise resolve through a different/stale calendar path even when
+    WKONE is correct.  This helper reads only the requested Strategy tab,
+    follows its date formulas, and preserves the actual day/month sequence.
 
-    Example (Tybee NOV2026): the source row for Sun 11/01/2026 is Sun
-    11/02/2025, not Sat 11/01/2025.  Preserving the source workbook's real
-    2025 dates is what makes that comparison possible.
+    ``expected_year`` is allowed only for the CURRENT Strategy workbook.  If a
+    whole current tab is one year stale, the year is shifted while preserving
+    month/day and row alignment.  Historical source workbooks pass no expected
+    year so their original dates remain untouched.
     """
     if sheet_name not in wb.sheetnames:
         return {}
@@ -2877,12 +2878,35 @@ def _build_strategy_historical_date_row_map(wb, sheet_name):
             anchor_row = row_num
         mapping[d] = row_num
 
-    # IMPORTANT: no current-year normalization here.  This map is used only
-    # as the historical source for Strategy Last Year columns.
+    if mapping and expected_year is not None and anchor_date is not None:
+        year_shift = int(expected_year) - anchor_date.year
+        if year_shift:
+            shifted = {}
+            for d, r in mapping.items():
+                try:
+                    nd = d.replace(year=d.year + year_shift)
+                except ValueError:
+                    nd = d.replace(year=d.year + year_shift, month=2, day=28)
+                shifted[nd] = r
+            mapping = shifted
+
     return mapping
 
 
-def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
+def strategy_comparable_dow_date(ty_date):
+    """Strategy Comparable DOW Date rule.
+
+    The Strategy report's Last Year columns compare against the same weekday
+    exactly 52 weeks earlier.  Example: Sun 11/01/2026 -> Sun 11/02/2025.
+    Keeping this rule in one named helper makes future calendar-policy changes
+    isolated from ROB/Forecast/week-selection logic.
+    """
+    if not isinstance(ty_date, datetime.date):
+        return None
+    return ty_date - datetime.timedelta(days=364)
+
+
+def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None, target_year=None):
     """Read prior-year Strategy TY values into current Strategy LY columns.
 
     Strategy-only STLY rule: for each current TY date, use the 52-week
@@ -2898,14 +2922,14 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
 
     ly_ws = ly_wb[sheet_name]
     ly_col_map = detect_strategy_columns(ly_ws)
-    ly_date_map = _build_strategy_historical_date_row_map(ly_wb, sheet_name)
+    ly_date_map = _build_strategy_real_date_row_map(ly_wb, sheet_name)
     if not ly_date_map:
         return {}
 
     ty_date_map = {}
     if ty_wb and sheet_name in ty_wb.sheetnames:
-        ty_date_map = build_date_row_map(
-            ty_wb, prefer_sheet=sheet_name, fallback_to_wkone=False
+        ty_date_map = _build_strategy_real_date_row_map(
+            ty_wb, sheet_name, expected_year=target_year
         )
 
     if not ty_date_map:
@@ -2932,7 +2956,7 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=None):
         # 03/03/2023 Fri; 12/31/2024 Tue -> 01/02/2024 Tue).  Do not constrain
         # the source to ``ty_date.year - 1`` because a correct 52-week match can
         # cross a calendar-year boundary.
-        comparable = ty_date - datetime.timedelta(days=364)
+        comparable = strategy_comparable_dow_date(ty_date)
 
         if comparable in ly_date_map:
             src_date = comparable
@@ -3042,11 +3066,11 @@ def _strategy_sheet_has_real_ty_data(wb, sheet_name):
 
 def _strategy_audit_source_date(ly_wb, sheet_name, ty_date):
     """Return the historical source date used for one Strategy TY date."""
-    ly_map = _build_strategy_historical_date_row_map(ly_wb, sheet_name)
+    ly_map = _build_strategy_real_date_row_map(ly_wb, sheet_name)
     if not ly_map:
         return None
 
-    comparable = ty_date - datetime.timedelta(days=364)
+    comparable = strategy_comparable_dow_date(ty_date)
     if comparable in ly_map:
         return comparable
 
@@ -3098,10 +3122,10 @@ def strategy_audit_workbook(
         col_map = detect_strategy_columns(ws)
         _, comp_ly_col = detect_comp_set_columns(ws, col_map)
 
-        current_date_map = build_date_row_map(
+        current_date_map = _build_strategy_real_date_row_map(
             current_wb,
-            prefer_sheet=sheet_name,
-            fallback_to_wkone=False,
+            sheet_name,
+            expected_year=report_month.year,
         )
         current_date_map = {
             d: r for d, r in current_date_map.items()
@@ -3114,6 +3138,7 @@ def strategy_audit_workbook(
             historical_wb,
             sheet_name,
             ty_wb=current_wb,
+            target_year=report_month.year,
         )
         weeks_checked += 1
 
@@ -3433,7 +3458,9 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     # LY data — every week, aligned by weekday rather than calendar date.
     ly_data = {}
     if ly_wb:
-        ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name, ty_wb=wb)
+        ly_data = _extract_ly_data_from_wb(
+            ly_wb, sheet_name, ty_wb=wb, target_year=scope_start.year
+        )
 
     # Ashworth Casino Ballroom TY/current events carry forward week-over-week.
     # Prior-year Casino events are sourced separately from ly_wb above.
@@ -21889,6 +21916,91 @@ BEST_WESTERN_MONTHLY_HOTELS = {
 }
 
 
+def render_best_western_next_year_rob_setup(hotel_name, hotel_id):
+    """Set up Best Western's dedicated next-year ROB in the prior month folder.
+
+    BW follows the same ROB workbook format as the generic portfolio engine, but
+    its annual next-year workbook is expected in the previous month's Revenue
+    Reports folder (e.g. in NOV2026, prepare the 2027 ROB in OCT2026).
+    """
+    if not next_year_rob_enabled():
+        return
+
+    today = datetime.date.today()
+    current_month = today.replace(day=1)
+    report_month = (current_month - datetime.timedelta(days=1)).replace(day=1)
+    tracked_year = report_month.year + 1
+
+    with st.container(border=True):
+        st.markdown(f"**{tracked_year} ROB — dedicated next-year workbook**")
+        st.caption(
+            f"Best Western uses the shared ROB format. This prepares the "
+            f"{tracked_year} ROB in the **{report_month:%B %Y} Revenue Reports** "
+            f"folder and uses the prior dedicated next-year ROB for cadence."
+        )
+
+        if st.button(
+            f"Set Up {tracked_year} ROB",
+            key=f"bw_next_year_rob_setup_{hotel_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            svc = get_drive_service()
+            progress = st.progress(0, text=f"{hotel_name}: starting {tracked_year} ROB setup...")
+
+            def _progress_cb(value, message):
+                progress.progress(
+                    int(round(value * 100)),
+                    text=f"{hotel_name}: {message}",
+                )
+
+            try:
+                name, err, fid, original = setup_next_year_rob_month(
+                    svc,
+                    hotel_id,
+                    hotel_name,
+                    report_month,
+                    tracked_year=tracked_year,
+                    progress_callback=_progress_cb,
+                )
+                progress.progress(100, text=f"{hotel_name}: complete")
+                if err and not name:
+                    st.error(f"{hotel_name}: {err}")
+                    return
+                if err:
+                    st.warning(f"{hotel_name}: {err}")
+                if fid and original is not None:
+                    st.session_state["bw_next_year_rob_undo"] = [{
+                        "file_id": fid,
+                        "file_name": name,
+                        "bytes": original,
+                    }]
+                st.success(f"{hotel_name}: **{name}** ready.")
+            except Exception as e:
+                st.error(f"{hotel_name}: next-year ROB setup error — {e}")
+
+        undo_key = "bw_next_year_rob_undo"
+        if undo_key in st.session_state:
+            if st.button(
+                "↩ Reset Best Western Next-Year ROB setup",
+                key=f"bw_next_year_rob_reset_{hotel_id}",
+                use_container_width=True,
+            ):
+                svc = get_drive_service()
+                errors = []
+                for item in st.session_state[undo_key]:
+                    try:
+                        drive_upload(svc, item["file_id"], item["bytes"], item["file_name"])
+                    except Exception as e:
+                        errors.append(f"{item['file_name']}: {e}")
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                else:
+                    st.session_state.pop(undo_key, None)
+                    st.success("Best Western next-year ROB setup restored.")
+
+
 def render_best_western_monthly_setup():
     st.subheader("Best Western Monthly Setup")
     st.caption(
@@ -21903,6 +22015,7 @@ def render_best_western_monthly_setup():
     hotel_id = BEST_WESTERN_MONTHLY_HOTELS[hotel_name]
     st.markdown("### ROB")
     render_portfolio_rob_month_setup([(hotel_name, hotel_id)], "bw")
+    render_best_western_next_year_rob_setup(hotel_name, hotel_id)
     st.divider()
     st.markdown("### Strategy Report")
     render_ihg_strategy_month_setup(hotel_name, hotel_id)
