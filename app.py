@@ -6902,7 +6902,14 @@ def _rob_set_value(ws, row, col, value, number_format=None):
 
 
 
-def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracked_year=None):
+def _fill_rob_prev_table(
+    wk1_ws,
+    prev_wb,
+    prev_wb_formulas,
+    target_month,
+    tracked_year=None,
+    prefer_asof_marker=False,
+):
     """Fill Week 1 Previous Sheet from one prior-month completed week.
 
     Source rule:
@@ -7027,32 +7034,51 @@ def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month, tracke
 
     source_sheet = None
 
-    for candidate in reversed(ROB_SHEETS):
-        if candidate not in prev_wb.sheetnames:
-            continue
+    # For a dedicated next-year ROB, the prior month's last *used* tab is
+    # defined by its weekly as-of marker in E4. Template tabs can contain
+    # stale/default OTB values even when they were never actually used, so
+    # the previous-month pickup baseline must not infer usage from OTB alone.
+    # Example: OCT2026's 2027 ROB has real dates through wk four; wk five/six
+    # are unused. NOV2026 Week 1 must therefore baseline against wk four.
+    if prefer_asof_marker:
+        dated_candidates = []
+        for candidate in ROB_SHEETS:
+            if candidate not in prev_wb.sheetnames:
+                continue
+            as_of = _rob_valid_date(prev_wb[candidate].cell(4, 5).value)
+            if as_of is not None:
+                dated_candidates.append((as_of, ROB_SHEETS.index(candidate), candidate))
+        if dated_candidates:
+            source_sheet = max(dated_candidates)[2]
 
-        src_ws = prev_wb[candidate]  # data_only=True workbook
-        labels = rob_month_blocks(src_ws).get(prev_month_idx, {})
-        rev_row = labels.get("revenue")
-        rms_row = (
-            labels.get("room nights")
-            or labels.get("rms sold")
-            or labels.get("rooms sold")
-        )
+    # Normal/current-year ROBs retain the established completion fallback.
+    if source_sheet is None:
+        for candidate in reversed(ROB_SHEETS):
+            if candidate not in prev_wb.sheetnames:
+                continue
 
-        if not rev_row:
-            continue
+            src_ws = prev_wb[candidate]  # data_only=True workbook
+            labels = rob_month_blocks(src_ws).get(prev_month_idx, {})
+            rev_row = labels.get("revenue")
+            rms_row = (
+                labels.get("room nights")
+                or labels.get("rms sold")
+                or labels.get("rooms sold")
+            )
 
-        # Current-year is column E in the ROB structure.
-        rev_val = src_ws.cell(rev_row, 5).value
-        rms_val = src_ws.cell(rms_row, 5).value if rms_row else None
+            if not rev_row:
+                continue
 
-        # "Completed/used" means the cells are populated, even if the real
-        # numeric value happens to be zero. Blank cells indicate that week
-        # was not used for that month.
-        if rev_val is not None or rms_val is not None:
-            source_sheet = candidate
-            break
+            # Current-year is column E in the ROB structure.
+            rev_val = src_ws.cell(rev_row, 5).value
+            rms_val = src_ws.cell(rms_row, 5).value if rms_row else None
+
+            # "Completed/used" means the cells are populated, even if the real
+            # numeric value happens to be zero. Blank cells indicate that week
+            # was not used for that month.
+            if rev_val is not None or rms_val is not None:
+                source_sheet = candidate
+                break
 
     if source_sheet is None:
         return (
@@ -7508,6 +7534,28 @@ def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
 
     return copied
 
+
+
+def _rob_reinforce_next_year_stly_group_npu(new_wb, historical_week_map):
+    """Explicitly carry prior-year Group on Hold into next-year ROB column H.
+
+    The mapped historical ROB's column G is that historical snapshot's live
+    Group NPU / Group on Hold value. In the newly-created next-year ROB, column
+    H is the STLY comparison. This post-pass deliberately runs after the main
+    sheet fill so a template/link cannot leave H blank or stale. Blank source
+    values are ignored rather than manufactured as zero.
+    """
+    if new_wb is None or not historical_week_map:
+        return 0
+
+    copied = 0
+    for sheet_name, src_ws in historical_week_map.items():
+        if sheet_name not in new_wb.sheetnames or src_ws is None:
+            continue
+        dst_ws = new_wb[sheet_name]
+        for month_idx in range(12):
+            copied += _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx)
+    return copied
 
 
 def _rob_build_next_year_historical_map(
@@ -9675,6 +9723,15 @@ def setup_next_year_rob_month(
             carry_forward_ws=None,
         )
 
+    stly_npu_copied = _rob_reinforce_next_year_stly_group_npu(
+        new_wb, historical_week_map
+    )
+    if stly_npu_copied:
+        warnings.append(
+            f"STLY Group on Hold: populated {stly_npu_copied} historical "
+            f"Group NPU room/revenue cells from the mapped prior-year ROB."
+        )
+
     _emit_rob_setup_progress(progress_callback, 0.82, "Rebuilding year columns and formulas...")
 
     # No rolling one-year cutoff. Farther-out months keep whatever the
@@ -9700,6 +9757,7 @@ def setup_next_year_rob_month(
             prev_wb_formulas,
             report_month,
             tracked_year=tracked_year,
+            prefer_asof_marker=True,
         )
         if err:
             warnings.append(f"Prev table: {err}")
