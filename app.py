@@ -3419,7 +3419,14 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     if scope_end is None:
         scope_end = datetime.date(today.year + 1, 12, 31)
 
-    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
+    # Strategy-only current TY calendar.  Do not use the generic workbook
+    # date mapper here: Best Western templates can carry both LY and TY date
+    # columns on the left side, and the generic mapper can select the wrong
+    # calendar on WKONE/WKTWO.  The live Strategy write path must use the same
+    # real TY calendar as the historical LY extractor/audit.
+    date_row_map = _build_strategy_real_date_row_map(
+        wb, sheet_name, expected_year=scope_start.year
+    )
     ws = wb[sheet_name]
 
     # Detect actual column positions from headers — no guessing
@@ -3475,8 +3482,8 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 prev_cols = detect_strategy_columns(prev_ws_same_month)
                 prev_casino_col = prev_cols.get("casino_ballroom")
                 if prev_casino_col:
-                    prev_date_rows = build_date_row_map(
-                        wb, prefer_sheet=prev_sheet_name, fallback_to_wkone=False
+                    prev_date_rows = _build_strategy_real_date_row_map(
+                        wb, prev_sheet_name, expected_year=scope_start.year
                     )
                     for prev_date, prev_row in prev_date_rows.items():
                         val = prev_ws_same_month.cell(prev_row, prev_casino_col).value
@@ -3540,7 +3547,9 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     # Uses ONLY this sheet's own date column (no WKONE fallback) — this is
     # current-cycle data being written, and it must always be placed
     # against the calendar actually printed on the sheet being edited.
-    own_date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name, fallback_to_wkone=False)
+    own_date_row_map = _build_strategy_real_date_row_map(
+        wb, sheet_name, expected_year=scope_start.year
+    )
     for _, row in (df.iterrows() if df is not None else []):
         date_str = str(row[0]).strip() if row[0] else ""
         kind, info = classify_row(date_str)
