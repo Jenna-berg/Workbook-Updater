@@ -6913,6 +6913,7 @@ def _fill_rob_prev_table(
     target_month,
     tracked_year=None,
     prefer_asof_marker=False,
+    source_week_override=None,
 ):
     """Fill Week 1 Previous Sheet from one prior-month completed week.
 
@@ -7045,6 +7046,15 @@ def _fill_rob_prev_table(
     prev_month_idx = prev_month.month - 1
 
     source_sheet = None
+    if source_week_override is not None:
+        # SNT uses the SAME period-validated previous-month week for both
+        # closed-month OTB and the hidden Week 1 pickup baseline. Without
+        # this override, the hidden table used the newest E4 from *any*
+        # year (even an uncompleted future template week), while closed-month
+        # carry-forward used _snt_previous_month_completed_week().
+        if source_week_override not in ROB_SHEETS or source_week_override not in prev_wb.sheetnames:
+            return f"Invalid selected previous-month week: {source_week_override!r}"
+        source_sheet = source_week_override
 
     # For a dedicated next-year ROB, the prior month's last *used* tab is
     # defined by its weekly as-of marker in E4. Template tabs can contain
@@ -7052,7 +7062,7 @@ def _fill_rob_prev_table(
     # the previous-month pickup baseline must not infer usage from OTB alone.
     # Example: OCT2026's 2027 ROB has real dates through wk four; wk five/six
     # are unused. NOV2026 Week 1 must therefore baseline against wk four.
-    if prefer_asof_marker:
+    if prefer_asof_marker and source_sheet is None:
         dated_candidates = []
         for candidate in ROB_SHEETS:
             if candidate not in prev_wb.sheetnames:
@@ -7111,6 +7121,11 @@ def _fill_rob_prev_table(
         tracked_year: 5,
     }
 
+    # Validate the one revenue cell that makes the SNT rollover meaningful:
+    # the prior month's TY Revenue must reach the same month/year in the
+    # Week 1 Previous table. A successful header/table lookup alone is not
+    # proof that the hidden pickup baseline was populated.
+    copied_closed_month_revenue = False
     for month_idx, dest_row in dest_month_row.items():
         rev_row = source_blocks.get(month_idx, {}).get("revenue")
         if not rev_row:
@@ -7128,6 +7143,18 @@ def _fill_rob_prev_table(
 
             if value is not None:
                 _rob_set_value(wk1_ws, dest_row, dest_col, value)
+                if month_idx == prev_month_idx and year == tracked_year:
+                    copied_closed_month_revenue = (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and wk1_ws.cell(dest_row, dest_col).value == value
+                    )
+
+    if source_week_override is not None and not copied_closed_month_revenue:
+        return (
+            'SNT hidden pickup baseline incomplete: the selected prior-month '
+            'week has no numeric current-year Revenue for the closing month.'
+        )
 
     return None
 
@@ -7194,6 +7221,51 @@ def _rob_last_completed_week(prev_wb, target_month):
 
     return None
 
+
+
+def _snt_previous_month_completed_week(prev_wb, target_month):
+    """Select the last *dated* preceding-month weekly snapshot for SNT.
+
+    A copied template may have populated week tabs dated in a different month
+    or year. Those must not silently become the current-year carry-forward
+    source. A week that runs into the first seven days of the target month is
+    permitted for the usual final reporting-week overlap.
+
+    An undated source, or a dated template with no numeric OTB for the closing
+    month, is intentionally rejected. Neither is a completed reporting week.
+    """
+    if prev_wb is None:
+        return None
+    period_start = (target_month - datetime.timedelta(days=1)).replace(day=1)
+    period_end = target_month + datetime.timedelta(days=7)
+    candidates = []
+    previous_month_idx = period_start.month - 1
+    for index, name in enumerate(ROB_SHEETS):
+        if name not in prev_wb.sheetnames:
+            continue
+        ws = prev_wb[name]
+        asof = _rob_valid_date(ws['E4'].value)
+        if asof is None or not (period_start <= asof < period_end):
+            continue
+        # E4 alone is not proof of a completed reporting week: copied masters
+        # can retain an old weekly date while the corresponding OTB cells are
+        # blank. This data-only source must have actual numeric Revenue or
+        # Room Nights for the month being closed before it can be selected.
+        closed_month = rob_month_blocks(ws).get(previous_month_idx, {})
+        revenue_row = closed_month.get('revenue')
+        rooms_row = closed_month.get('room nights') or closed_month.get('rms sold')
+        # The hidden Week 1 pickup baseline copies Revenue, not Room Nights.
+        # A source with only Rooms populated cannot provide a valid pickup
+        # baseline even though earlier logic accepted it as a completed week.
+        # Numeric zero is legitimate; blank and uncached formulas are not.
+        revenue_value = ws.cell(revenue_row, 5).value if revenue_row else None
+        if not (
+            isinstance(revenue_value, (int, float))
+            and not isinstance(revenue_value, bool)
+        ):
+            continue
+        candidates.append((asof, index, name))
+    return max(candidates)[2] if candidates else None
 
 def _rob_previous_stly_anchor_date(prev_wb, target_month):
     """Historical as-of date already consumed by the prior month's last week.
@@ -7262,6 +7334,7 @@ def _rob_build_date_first_stly_map(
     prev_wb,
     target_month,
     source_workbooks,
+    snt_mode=False,
 ):
     """Map ROB weeks by reporting dates with a portfolio minimum of 4 weeks.
 
@@ -7276,12 +7349,22 @@ def _rob_build_date_first_stly_map(
     if not snapshots:
         return {}, ["No dated STLY ROB week snapshots were found."]
 
-    consumed_hist_date, consumed_hist_sheet = _rob_previous_stly_anchor_date(
-        prev_wb,
-        target_month,
-    )
-
-    prev_completed_sheet = _rob_last_completed_week(prev_wb, target_month)
+    # SNT needs the same period-validated week for the historical STLY
+    # anchor, reporting cadence, visible carry-forward, and hidden pickup.
+    # A template tab dated in a different year must not shift the whole map.
+    if snt_mode:
+        prev_completed_sheet = _snt_previous_month_completed_week(prev_wb, target_month)
+        consumed_hist_date = (
+            _rob_valid_date(prev_wb[prev_completed_sheet].cell(4, 4).value)
+            if prev_wb is not None and prev_completed_sheet else None
+        )
+        consumed_hist_sheet = prev_completed_sheet
+    else:
+        consumed_hist_date, consumed_hist_sheet = _rob_previous_stly_anchor_date(
+            prev_wb,
+            target_month,
+        )
+        prev_completed_sheet = _rob_last_completed_week(prev_wb, target_month)
     prev_ty_date = None
     if (
         prev_wb is not None
@@ -8740,7 +8823,115 @@ def _hilton_current_year_month_rollover_repair(
     ]
 
 
-def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False):
+def _snt_current_year_wk1_rollover_repair(
+    new_wb,
+    historical_same_month_wb,
+    prior_month_last_week,
+    target_month,
+):
+    """Reconcile SNT current-year WK1 against the comparable prior-year ROB.
+
+    Source of truth for the completed previous month and future-month history:
+    same-calendar-month prior-year ROB, WK1, columns C:D:E -> B:C:D.
+    This pass runs *after* the date-first STLY weekly fill, which can select an
+    earlier-month snapshot and overwrite the correct long-range historical
+    forecast, or clear the just-finalized prior-month current-year OTB.
+
+    Example NOV2026 Long Beach: Oct-Dec historical values come from NOV2025
+    WK1. October 2026 OTB is taken from the last actually used OCT2026 week.
+    November/December historical Group NPU come from NOV2025 G -> NOV2026 H.
+    Other week tabs, live current/future E, and all pickup formulas are kept.
+    """
+    notes = []
+    if 'wk one' not in new_wb.sheetnames:
+        return ['SNT reconciliation skipped: destination WK1 absent.']
+    dest = new_wb['wk one']
+    if historical_same_month_wb is None or 'wk one' not in historical_same_month_wb.sheetnames:
+        notes.append('SNT historical WK1 reconciliation unavailable: same-month prior-year ROB not found.')
+        history = None
+    else:
+        history = historical_same_month_wb['wk one']
+
+    previous_index = target_month.month - 2
+    historical_cells = 0
+    stly_cells = 0
+    cleared_stly = 0
+    if history is not None:
+        hist_blocks = rob_month_blocks(history)
+        dest_blocks = rob_month_blocks(dest)
+        # The newly closed month and the remaining months must retain the
+        # historical forecast in this calendar month's prior-year snapshot.
+        # Preserve the actual source ADR value/formula (including manually
+        # entered numeric ADRs) rather than imposing a generic formula.
+        for mi in range(max(0, previous_index), 12):
+            src_labels = hist_blocks.get(mi, {})
+            dst_labels = dest_blocks.get(mi, {})
+            for metric in ('revenue', 'room nights', 'adr',
+                           'group rms sold', 'group rm rev', 'group rm adr'):
+                sr, dr = src_labels.get(metric), dst_labels.get(metric)
+                if not sr or not dr:
+                    continue
+                for sc, dc in ((3, 2), (4, 3), (5, 4)):
+                    original = history.cell(sr, sc).value
+                    if original is None or is_datelike(original):
+                        continue
+                    translated = _rob_formula_for_destination(
+                        original, history, sr, sc, dest, dr, dc
+                    )
+                    if _rob_set_value(dest, dr, dc, translated):
+                        historical_cells += 1
+
+            # Historical GNPU belongs in H for the months being forecast.
+            # The *just-closed* prior month has no open GNPU (its historical
+            # H should be empty, not a value from an old snapshot).
+            if mi == previous_index:
+                for metric in _ROB_SECONDARY_METRIC_LABELS:
+                    dr = dst_labels.get(metric)
+                    if dr and _rob_set_value(dest, dr, 8, None):
+                        cleared_stly += 1
+            elif mi >= target_month.month - 1:
+                for metric in _ROB_SECONDARY_METRIC_LABELS:
+                    sr, dr = src_labels.get(metric), dst_labels.get(metric)
+                    if not sr or not dr:
+                        continue
+                    value = history.cell(sr, 7).value
+                    if value is None or is_datelike(value):
+                        continue
+                    translated = _rob_formula_for_destination(
+                        value, history, sr, 7, dest, dr, 8
+                    )
+                    if _rob_set_value(dest, dr, 8, translated):
+                        stly_cells += 1
+    if previous_index >= 0:
+        # Restore the closed-month snapshot from the last completed *previous*
+        # ROB tab. Do not copy that tab's formula text into WK1: it may refer
+        # to the prior workbook or to its own WK1 and become circular.
+        if prior_month_last_week is None:
+            notes.append('SNT previous-month current-year OTB could not be restored: prior ROB missing.')
+        else:
+            src_block = rob_month_blocks(prior_month_last_week).get(previous_index, {})
+            dst_block = rob_month_blocks(dest).get(previous_index, {})
+            carry_count = 0
+            for metric in ('revenue', 'room nights', 'group rms sold', 'group rm rev'):
+                sr, dr = src_block.get(metric), dst_block.get(metric)
+                if not sr or not dr:
+                    continue
+                val = prior_month_last_week.cell(sr, 5).value
+                if val is None or is_datelike(val) or is_formula(val):
+                    # Never overwrite a valid destination with an absent
+                    # cached value or a potentially circular source formula.
+                    continue
+                if _rob_set_value(dest, dr, 5, val):
+                    carry_count += 1
+            notes.append(f'SNT closed-month E carry-forward: {carry_count} cells from previous completed week.')
+    notes.append(
+        f'SNT WK1 same-month historical reconciliation: {historical_cells} B:D cells; '
+        f'{stly_cells} future STLY GNPU cells; {cleared_stly} closed-month STLY GNPU cells cleared.'
+    )
+    return notes
+
+
+def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
     `original_bytes` is the file's content exactly as it was before this
@@ -8793,6 +8984,74 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ):
             existing_id = None
             existing_name = None
+    # For a new SNT month, validate required upstream ROBs BEFORE copying a
+    # master into Drive. The post-load validation below remains in place for
+    # existing files and for any source changed between preflight and upload.
+    # Without this early check, failure leaves an incomplete new monthly file
+    # in Drive despite returning a failed setup status.
+    if snt_mode and not hilton_mode and not (existing_id and "master" not in existing_name.lower()):
+        _prev_month = (target_month - datetime.timedelta(days=1)).replace(day=1)
+        _ly_month = target_month.replace(year=target_month.year - 1)
+        _required = (("previous-month", _prev_month), ("historical", _ly_month))
+        _preflight_problems = []
+        for _role, _month in _required:
+            _resolved, _problem = _resolve_drive_workbook_session_cached(
+                service, hotel_id, hotel_name, "ROB", _month
+            )
+            if not _resolved:
+                _preflight_problems.append(
+                    f"{_role} {_month:%b %Y} ROB not found: {_problem}"
+                )
+                continue
+            try:
+                _source_wb = _get_openpyxl_workbook_cached(
+                    service, _resolved[0], data_only=(_role == "previous-month")
+                )
+                if _role == "previous-month":
+                    if _snt_previous_month_completed_week(_source_wb, target_month) is None:
+                        _preflight_problems.append(
+                            f"previous-month {_month:%b %Y} ROB has no completed week"
+                        )
+                elif ROB_SHEETS[0] not in _source_wb.sheetnames:
+                    _preflight_problems.append(
+                        f"historical {_month:%b %Y} ROB has no WK1 tab"
+                    )
+                else:
+                    _hist_ws = _source_wb[ROB_SHEETS[0]]
+                    _source_year = _hist_ws['E3'].value
+                    try:
+                        _source_year = int(float(_source_year))
+                    except (TypeError, ValueError):
+                        _source_year = None
+                    if _source_year is not None and _source_year != _month.year:
+                        _preflight_problems.append(
+                            f"historical {_month:%b %Y} ROB has unexpected "
+                            f"year heading E3={_source_year}, expected {_month.year}"
+                        )
+                    _source_blocks = rob_month_blocks(_hist_ws)
+                    if not any(
+                        _hist_ws.cell(_labels['revenue'], 5).value is not None
+                        for _labels in _source_blocks.values()
+                        if 'revenue' in _labels
+                    ):
+                        _preflight_problems.append(
+                            f"historical {_month:%b %Y} WK1 has no column E "
+                            "Revenue data to seed the new year"
+                        )
+            except Exception as _exc:
+                _preflight_problems.append(
+                    f"{_role} {_month:%b %Y} ROB could not be opened: {_exc}"
+                )
+        if _preflight_problems:
+            return (
+                None,
+                "SNT monthly rollover was NOT started; no new master was "
+                "created because the required sources failed preflight: "
+                + "; ".join(_preflight_problems),
+                None,
+                None,
+            )
+
     is_fresh_copy = False
     if existing_id and "master" not in existing_name.lower():
         new_file_id, new_file_name = existing_id, existing_name
@@ -8833,6 +9092,41 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
+        # A master is not evidence of a completed weekly upload. Template
+        # E4 markers can be stale (including prior-month dates) and may cause
+        # later weekly updates to skip Week 1. Clear these only on fresh SNT
+        # copies; never erase dates in an existing/live monthly workbook.
+        if snt_mode and not hilton_mode:
+            for _week_name in ROB_SHEETS:
+                if _week_name in new_wb.sheetnames:
+                    new_wb[_week_name]['E4'] = None
+
+    # SNT: When the target ROB already contains a weekly upload, rerunning
+    # monthly setup must NOT erase current-year OTB/GNPU already loaded for
+    # this reporting month. A copied master is not an uploaded live report,
+    # so only protect existing workbooks with an as-of date in this month.
+    _snt_live_wk1 = {}
+    if snt_mode and not hilton_mode and not is_fresh_copy and 'wk one' in new_wb.sheetnames:
+        _live_ws = new_wb['wk one']
+        _live_asof = _rob_valid_date(_live_ws['E4'].value)
+        if (_live_asof is not None and
+                (_live_asof.year, _live_asof.month) == (target_month.year, target_month.month)):
+            _snt_live_wk1['E4'] = _live_ws['E4'].value
+            for _mi, _labels in rob_month_blocks(_live_ws).items():
+                if _mi < target_month.month - 1:
+                    continue
+                for _metric in _ROB_BASE_METRIC_LABELS:
+                    _r = _labels.get(_metric)
+                    if _r:
+                        _value = _live_ws.cell(_r, 5).value
+                        if _value is not None:
+                            _snt_live_wk1[f'E{_r}'] = _value
+                for _metric in _ROB_SECONDARY_METRIC_LABELS:
+                    _r = _labels.get(_metric)
+                    if _r:
+                        _value = _live_ws.cell(_r, 7).value
+                        if _value is not None:
+                            _snt_live_wk1[f'G{_r}'] = _value
 
     _set_rob_year_headers(
         new_wb,
@@ -9045,6 +9339,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     _history_seed_wb = ly_wb_formulas if ly_wb_formulas is not None else ly_wb
     if _history_seed_wb is not None:
         for _sheet_name in ROB_SHEETS:
+            # The corrected SNT new-month example initializes WK1 only;
+            # later week tabs are filled by their own weekly update. Do not
+            # pre-seed or rewrite future SNT weeks during monthly setup.
+            if snt_mode and not hilton_mode and _sheet_name != ROB_SHEETS[0]:
+                continue
             if (
                 _sheet_name in new_wb.sheetnames
                 and _sheet_name in _history_seed_wb.sheetnames
@@ -9071,6 +9370,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             (next_ly_month_dt.strftime("%b%Y").upper(), next_ly_wb),
             (next2_ly_month_dt.strftime("%b%Y").upper(), next2_ly_wb),
         ],
+        snt_mode=(snt_mode and not hilton_mode),
     )
     if stly_map_diag:
         warnings.append(
@@ -9079,9 +9379,10 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
     # Latest completed week in the previous ROB is the current-year OTB
     # carry-forward baseline for the newly-created month.
-    latest_prev_sheet_name = _rob_last_completed_week(
-        prev_wb,
-        target_month,
+    latest_prev_sheet_name = (
+        _snt_previous_month_completed_week(prev_wb, target_month)
+        if snt_mode and not hilton_mode
+        else _rob_last_completed_week(prev_wb, target_month)
     )
     carry_forward_ws = (
         prev_wb[latest_prev_sheet_name]
@@ -9095,11 +9396,60 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             f"Current-year carry-forward source: {latest_prev_sheet_name}"
         )
 
+    # An SNT rollover is a source-dependent operation: do not upload an
+    # apparently successful, partially populated workbook if the prior
+    # October ROB or comparable November STLY ROB is missing. The comparison
+    # is intentionally performed before saving, so the original workbook
+    # on Drive is not overwritten. Check both the source workbook and the
+    # specific weekly tabs used for the SNT WK1 reconciliation.
+    if snt_mode and not hilton_mode:
+        missing_required = []
+        if carry_forward_ws is None:
+            missing_required.append(
+                f"last completed week of {prev_month_dt.strftime('%b %Y')} ROB"
+            )
+        if _history_seed_wb is None or ROB_SHEETS[0] not in _history_seed_wb.sheetnames:
+            missing_required.append(
+                f"WK1 from {ly_month_dt.strftime('%b %Y')} historical ROB"
+            )
+        else:
+            _history_wk1 = _history_seed_wb[ROB_SHEETS[0]]
+            _hist_year = _history_wk1['E3'].value
+            try:
+                _hist_year = int(float(_hist_year))
+            except (TypeError, ValueError):
+                _hist_year = None
+            if _hist_year is not None and _hist_year != ly_month_dt.year:
+                missing_required.append(
+                    f"historical ROB contains year {_hist_year} in E3 "
+                    f"instead of {ly_month_dt.year}"
+                )
+            _blocks = rob_month_blocks(_history_wk1)
+            if not any(
+                _history_wk1.cell(_rows['revenue'], 5).value is not None
+                for _rows in _blocks.values() if 'revenue' in _rows
+            ):
+                missing_required.append("historical WK1 has no year-E Revenue rows")
+        if missing_required:
+            return (
+                None,
+                "SNT monthly rollover was NOT applied: required sources could "
+                "not be loaded (" + "; ".join(missing_required) + "). "
+                "Verify the prior-month and comparable prior-year ROB files "
+                "in Drive. Details: " + "; ".join(warnings),
+                None,
+                None,
+            )
+
     wk_one_name = ROB_SHEETS[0]
     filled_stly_sheets = set()
 
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
+            continue
+        if snt_mode and not hilton_mode and sheet_name != ROB_SHEETS[0]:
+            # SNT future weeks are not yet used; leave them unchanged.
+            # Date-first STLY mapping remains available to weekly updates.
             continue
 
         new_ws = new_wb[sheet_name]
@@ -9224,8 +9574,19 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             target_month,
             tracked_year=target_month.year,
             prefer_asof_marker=True,
+            source_week_override=(latest_prev_sheet_name if snt_mode and not hilton_mode else None),
         )
         if err:
+            if snt_mode and not hilton_mode:
+                return (
+                    None,
+                    "SNT monthly rollover was NOT saved: the hidden Week 1 "
+                    f"Previous pickup table could not be populated ({err}). "
+                    "No updated workbook was uploaded. "
+                    "Details: " + "; ".join(warnings),
+                    None,
+                    None,
+                )
             warnings.append(f"Prev table: {err}")
 
     warnings.extend(
@@ -9260,6 +9621,32 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             new_wb, _hist_wk1, _prior_wk, target_month,
             prior_month_last_week_formulas=_prior_wk_formulas,
         ))
+
+    # SNT/independent hotel's historical forecast in the newly closed month
+    # and all future months comes from the comparable prior-year ROB's WK1,
+    # not from a date-first snapshot in the *earlier* STLY month. This also
+    # restores the closed month's actual OTB after _fill_rob_sheet clears E.
+    if snt_mode and not hilton_mode:
+        _same_month_hist = (
+            ly_wb_formulas if ly_wb_formulas is not None else ly_wb
+        )
+        warnings.extend(_snt_current_year_wk1_rollover_repair(
+            new_wb, _same_month_hist, carry_forward_ws, target_month
+        ))
+        if _snt_live_wk1:
+            _live_dest = new_wb['wk one']
+            for _coord, _value in _snt_live_wk1.items():
+                _live_dest[_coord] = _value
+            warnings.append(
+                f'SNT existing WK1 live reporting data preserved: '
+                f'{len(_snt_live_wk1)} cells including E4.'
+            )
+
+    # _fill_rob_sheet can restore a previous-month date into the WK1 E4
+    # header while populating historical comparisons. For a fresh SNT ROB,
+    # that header must stay blank until the *new month's* weekly upload.
+    if snt_mode and not hilton_mode and is_fresh_copy and 'wk one' in new_wb.sheetnames:
+        new_wb['wk one']['E4'] = None
 
     _emit_rob_setup_progress(progress_callback, 0.93, "Saving and uploading workbook...")
     strip_tables(new_wb)
@@ -23185,14 +23572,16 @@ with tab_weekly:
                             hotel_sel,
                             setup_month_dt,
                             progress_callback=_snt_progress_cb,
+                            snt_mode=True,
                         )
-                        progress.progress(
-                            100,
-                            text=f"{hotel_sel}: complete",
-                        )
+                        if rob_name:
+                            progress.progress(
+                                100,
+                                text=f"{hotel_sel}: complete",
+                            )
                         if rob_err and not rob_name:
                             if "storageQuotaExceeded" in str(rob_err):
-                                _, master_name = find_rob_master(svc, hotel_id_nm, target_month.year)
+                                _, master_name = find_rob_master(svc, hotel_id_nm, setup_month_dt.year)
                                 rob_suffix = hotel_sel.upper()
                                 if master_name and "ROB" in master_name.upper():
                                     after = master_name[master_name.upper().find("ROB") + 3:].strip()
