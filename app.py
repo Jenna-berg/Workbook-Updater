@@ -5940,14 +5940,12 @@ def drive_download(service, file_id) -> bytes:
     return buf.getvalue()
 
 
-def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
+def drive_upload(service, file_id, file_bytes: bytes, file_name: str, media_mimetype=None):
     """Overwrite an existing Drive file with new bytes."""
     buf   = io.BytesIO(file_bytes)
-    media = MediaIoBaseUpload(
-        buf,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        resumable=True,
-    )
+    if media_mimetype is None:
+        media_mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    media = MediaIoBaseUpload(buf, mimetype=media_mimetype, resumable=True)
     # supportsAllDrives is required here even though drive_download's
     # get_media() works without it — confirmed real case: writing back to a
     # Shared Drive file (Hyannis Anchor In) 404'd on update() alone, for
@@ -7614,6 +7612,74 @@ def _rob_reinforce_next_year_stly_group_npu(new_wb, historical_week_map):
     return copied
 
 
+def _rob_historical_snapshot_date_with_recovery(historical_wb, sheet_name):
+    """Read a historical ROB week date without dropping a populated damaged week.
+
+    A few legitimate historical workbooks have a broken E4 cached formula or
+    Excel #VALUE! in a week tab even though the historical revenue/rooms are
+    populated. For historical mapping ONLY, infer that week's ordering date
+    from the nearest genuinely dated neighboring tab (seven days per week).
+    Do not write the inferred date into the workbook; normal weekly usage
+    detection and destination E4 must still require real dates.
+    """
+    if sheet_name not in historical_wb.sheetnames:
+        return None, False
+    ws = historical_wb[sheet_name]
+    raw_date = ws.cell(4, 5).value
+    direct = _rob_valid_date(raw_date)
+    if direct is not None:
+        return direct, False
+    # A plain empty/zero date is an unused tab, not a damaged historical
+    # snapshot. Recover only a conspicuously broken date/error cell.
+    if raw_date is None or raw_date == 0 or isinstance(raw_date, datetime.time):
+        return None, False
+
+    # Never resurrect an unused master tab purely from its formatted dates.
+    # Require actual historical source-year Revenue or Room Nights numbers.
+    blocks = rob_month_blocks(ws)
+    has_data = False
+    for labels in blocks.values():
+        for label in ("revenue", "room nights"):
+            row = labels.get(label)
+            if row is None:
+                continue
+            value = ws.cell(row, 5).value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                has_data = True
+                break
+        if has_data:
+            break
+    if not has_data:
+        return None, False
+
+    candidates = []
+    idx = ROB_SHEETS.index(sheet_name)
+    for j, neighbor_name in enumerate(ROB_SHEETS):
+        if j == idx or neighbor_name not in historical_wb.sheetnames:
+            continue
+        neighbor_date = _rob_valid_date(
+            historical_wb[neighbor_name].cell(4, 5).value
+        )
+        if neighbor_date is None:
+            continue
+        # Historical ROB tabs are weekly snapshots, not monthly row dates.
+        offset = idx - j
+        if abs(offset) > 2:
+            continue
+        inferred = neighbor_date + datetime.timedelta(days=7 * offset)
+        candidates.append((abs(offset), inferred, neighbor_name))
+
+    if not candidates:
+        return None, False
+    candidates.sort(key=lambda item: item[0])
+    inferred = candidates[0][1]
+    # Require neighboring observations to agree within a few days if both
+    # sides exist, protecting against stray old template E4 dates.
+    if any(abs((other[1] - inferred).days) > 4 for other in candidates):
+        return None, False
+    return inferred, True
+
+
 def _rob_build_next_year_historical_map(
     new_wb,
     cadence_prev_wb,
@@ -7646,13 +7712,21 @@ def _rob_build_next_year_historical_map(
 
         ws = historical_wb[sheet_name]
 
-        # In the dedicated future-year historical ROB, column E contains that
-        # workbook's reporting snapshot date.
-        source_date = _rob_valid_date(
-            ws.cell(4, 5).value
+        # Keep real historical weeks even when their E4 formula/cache is
+        # damaged; otherwise WK2 can incorrectly slide into destination WK1.
+        source_date, date_recovered = (
+            _rob_historical_snapshot_date_with_recovery(
+                historical_wb, sheet_name
+            )
         )
         if source_date is None:
             continue
+        if date_recovered:
+            diagnostics.append(
+                f"Recovered {sheet_name} historical week ordering date "
+                f"as {source_date:%m/%d/%Y} from neighboring used tabs "
+                "(source E4 was invalid)."
+            )
 
         snapshots.append(
             {
@@ -9899,6 +9973,28 @@ def setup_next_year_rob_month(
             tracked_year=tracked_year,
             carry_forward_ws=None,
         )
+
+        # If this historical week was rescued from a broken E4 date, also
+        # repair the comparable 2026 date header (D4) in the new workbook.
+        # It is not sufficient to map the correct revenue/rooms: leaving the
+        # destination header blank or stale would break the reporting dates.
+        recovered_date, was_recovered = (
+            _rob_historical_snapshot_date_with_recovery(
+                hist_wb, hist_ws.title
+            )
+        ) if hist_wb is not None else (None, False)
+        if was_recovered and recovered_date is not None:
+            for header_row in _rob_month_header_rows(new_ws).values():
+                if header_row == 4:
+                    _rob_set_value(
+                        new_ws, 4, 4, recovered_date,
+                        number_format="mm/dd/yyyy",
+                    )
+                    warnings.append(
+                        f"{sheet_name}: repaired STLY comparison as-of "
+                        f"date in D4 to {recovered_date:%m/%d/%Y}."
+                    )
+                    break
 
     stly_npu_copied = _rob_reinforce_next_year_stly_group_npu(
         new_wb, historical_week_map
@@ -19074,29 +19170,85 @@ OOO_TAB_RGB = "FF00FF00"  # bright green, per explicit request — distinct from
 OOO_REPORT_FILE_KEYWORD = "SELL-OUT EFFICIENCY REPORT"
 
 
+def _ooo_drive_report_candidates(service):
+    """Search every visible Drive page, including shared drives and shortcuts.
+
+    Filename matching is deliberately less brittle than the old exact substring:
+    Sell-Out / Sell Out / Sellout Efficiency Report are all supported. Drive
+    `name contains` is used first so reports aren't lost beyond page one.
+    """
+    queries = [
+        "trashed = false and (name contains 'Sell' or name contains 'sell' "
+        "or name contains 'Efficiency' or name contains 'efficiency')",
+        # A fallback for accounts where Drive's name search is inconsistent.
+        "trashed = false and (mimeType='application/vnd.ms-excel.sheet.macroEnabled.12' "
+        "or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+        "or mimeType='application/vnd.google-apps.shortcut' "
+        "or mimeType='application/vnd.google-apps.spreadsheet')",
+    ]
+    seen = {}
+    errors = []
+    for q in queries:
+        token = None
+        while True:
+            try:
+                result = service.files().list(
+                    q=q,
+                    fields='nextPageToken,files(id,name,mimeType,modifiedTime,shortcutDetails(targetId,targetMimeType))',
+                    pageSize=1000, pageToken=token,
+                    supportsAllDrives=True, includeItemsFromAllDrives=True,
+                ).execute()
+            except Exception as exc:
+                errors.append(str(exc))
+                break
+            for f in result.get('files', []):
+                name = str(f.get('name') or '')
+                norm = re.sub(r'[^A-Z0-9]', '', name.upper())
+                if 'SELLOUT' not in norm or 'EFFICIENCY' not in norm:
+                    continue
+                mimetype = f.get('mimeType')
+                if mimetype == 'application/vnd.google-apps.shortcut':
+                    details = f.get('shortcutDetails') or {}
+                    fid = details.get('targetId')
+                    mimetype = details.get('targetMimeType')
+                else:
+                    fid = f.get('id')
+                if not fid or mimetype not in {
+                    'application/vnd.ms-excel.sheet.macroEnabled.12',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                }:
+                    continue
+                candidate = dict(f, id=fid, mimeType=mimetype)
+                seen[fid] = candidate
+            token = result.get('nextPageToken')
+            if not token:
+                break
+        if seen:
+            break
+    return list(seen.values()), errors
+
+
 def find_ooo_report_file(service):
-    """Locate the company-wide Sell-Out Efficiency Report workbook (currently
-    shared as 'COPY Sell-Out Efficiency Report.xlsm - TEST'). Searched by
-    filename across all of Drive rather than a fixed folder, since there's
-    exactly one of these (unlike the per-hotel workbooks). Returns
-    (file_id, file_name) or (None, error_str) — errors out on zero or
-    multiple matches rather than guessing which one is right."""
-    q = ("trashed = false and "
-         "(mimeType='application/vnd.ms-excel.sheet.macroenabled.12' "
-         "or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')")
-    result = service.files().list(
-        q=q, fields="files(id, name)", pageSize=1000, corpora="allDrives",
-        supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute()
-    candidates = [f for f in result.get("files", [])
-                  if OOO_REPORT_FILE_KEYWORD in f["name"].strip().upper()]
+    """Return the accessible Sell-Out Efficiency workbook or a precise error.
+
+    Multiple matches are reported, not silently substituted. A -TEST copy is
+    ranked behind the actual report, so the normal production report wins.
+    """
+    candidates, errors = _ooo_drive_report_candidates(service)
     if not candidates:
-        return None, (f"No workbook matching '{OOO_REPORT_FILE_KEYWORD.title()}' found anywhere "
-                       f"in Drive — make sure it's been shared with the service account.")
-    if len(candidates) > 1:
-        names = ", ".join(f["name"] for f in candidates)
-        return None, f"Found {len(candidates)} matching workbooks, expected exactly 1: {names}"
-    return candidates[0]["id"], candidates[0]["name"]
+        detail = f" Drive query error: {errors[0]}" if errors else ''
+        return None, (
+            "No Sell-Out Efficiency Report workbook is visible to this app's Drive "
+            "account. Check that the actual .xlsm/.xlsx file (not just a shortcut "
+            "inside a private folder) is shared with its service account, and "
+            "that the file name includes 'Sell-Out' and 'Efficiency'." + detail
+        )
+    production = [f for f in candidates if not re.search(r'(?i)(?:^|[\s_-])(?:TEST|COPY)(?:$|[\s_-])', f['name'])]
+    preferred = production if production else candidates
+    if len(preferred) != 1:
+        names = ', '.join(f['name'] for f in preferred[:12])
+        return None, f"Multiple Sell-Out Efficiency workbooks visible ({len(preferred)}): {names}. Rename/archive duplicates so the production file is unambiguous."
+    return preferred[0]['id'], preferred[0]['name']
 
 
 def _parse_ooo_sheet_date(name):
@@ -19169,56 +19321,91 @@ def build_ooo_monthly_totals(wb, year, month, sheet_names):
 
 
 # ── OOO Report: per-property ADR pulled from each hotel's own ROB ────────────
-# Each hotel's ROB is a full-year "trailing" sheet: every WK tab (wk one..wk
-# six) contains one 8-row block per calendar month (Jan..Dec), laid out as
-# Month-header / Revenue / Room Nights / ADR / Group Rms sold / Group Rm Rev
-# / Group Rm ADR / PICKUP WoW, starting at row 4 and repeating every 8 rows —
-# confirmed against a real file: block_start = 4 + 8*(month-1), Revenue =
-# block_start+1, Room Nights = block_start+2, ADR = block_start+3 (verified
-# July 2026 block landing at rows 52-59, ADR at row 55, matching a real
-# screenshot of Hotel 1620's ROB with July 2026 ADR highlighted at that exact
-# position). Year columns (2023/2024/2025/2026...) are consistent across
-# every month block in a sheet, but how many trailing years — and therefore
-# which column is "this year" — varies per hotel, so it's detected from the
-# one header row that reliably holds literal (non-formula) dates: Jan's.
+# Hotel ROBs use varying monthly row layouts: Northbrook has 11 rows per
+# month; other hotel templates may differ. The ADR reader therefore locates
+# the selected month and its labeled Revenue / Room Nights lines rather than
+# using a fixed offset. Actual year labels live in row 3; row 4 contains
+# as-of dates and must not be mistaken for year headers.
 _OOO_HOTEL_MATCH_EXCLUDE = ("TEST",)
 
 
 def _find_rob_year_column(ws, target_year):
-    """Jan's header row (row 4) holds literal dates; every other month's
-    header is a formula chain off the previous month and its cached value is
-    often stale/blank on files this app has re-saved with openpyxl (which
-    never recalculates formulas) — so only Jan's row is trusted here."""
+    """Find the ROB year from its visible year headings (row 3).
+
+    Row 4 contains reporting/as-of dates, not reliable year headings. A
+    previous implementation read row 4 and guessed column E, which can
+    silently select the wrong year for historical ADR requests.
+    """
     for c in range(2, 12):
-        v = ws.cell(4, c).value
-        if isinstance(v, (datetime.datetime, datetime.date)) and v.year == target_year:
-            return c
-        if isinstance(v, (int, float)) and int(v) == target_year:
-            return c
+        v = ws.cell(3, c).value
+        try:
+            if not isinstance(v, (datetime.date, datetime.datetime)) and int(v) == target_year:
+                return c
+        except (ValueError, TypeError):
+            continue
     return None
 
 
+def _ooo_rob_month_metric_rows(ws, target_month):
+    """Locate this month's Revenue and Room Nights rows by their labels.
+
+    Hilton, SNT and IHG ROB layouts can have different numbers of group and
+    permanent-room lines. Never assume each month is exactly eight rows tall;
+    verified Northbrook 2026 has month starts 4, 15, 26, ... (11 rows).
+    """
+    month_abbr = datetime.date(2000, target_month, 1).strftime('%b').upper()
+    month_full = datetime.date(2000, target_month, 1).strftime('%B').upper()
+    # Some read-only Excel exports omit the worksheet dimension, making
+    # ws.max_row=None. Iterating a bounded first-column range works for both.
+    for r, (raw_label,) in enumerate(
+        ws.iter_rows(min_row=1, max_row=300, min_col=1, max_col=1, values_only=True), 1
+    ):
+        label = str(raw_label or '').strip().upper()
+        if label not in (month_abbr, month_full):
+            continue
+        # Only accept a month header when its nearby labelled rows agree.
+        revenue_row = nights_row = None
+        for rr, (raw_metric,) in enumerate(
+            ws.iter_rows(min_row=r + 1, max_row=r + 6, min_col=1, max_col=1, values_only=True),
+            r + 1,
+        ):
+            metric = re.sub(r'\s+', ' ', str(raw_metric or '').strip().upper())
+            if metric == 'REVENUE':
+                revenue_row = rr
+            elif metric in ('ROOM NIGHTS', 'ROOM NIGHTS SOLD', 'ROOMNIGHTS'):
+                nights_row = rr
+        if revenue_row is not None and nights_row is not None:
+            return revenue_row, nights_row
+    return None, None
+
+
 def read_rob_adr(wb_bytes, sheet_name, target_year, target_month):
-    """ADR is computed here as Revenue / Room Nights rather than read from
-    the sheet's own ADR formula cell — Revenue and Room Nights are written
-    as literal values by this app (always reliable), while the ADR formula
-    cell's cached result is frequently blank on files this app has re-saved,
-    since openpyxl never recalculates formulas on save. Returns (adr_or_None,
-    error_str_or_None)."""
-    wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=True)
-    if sheet_name not in wb.sheetnames:
-        return None, f"Sheet '{sheet_name}' not found."
-    ws = wb[sheet_name]
-    year_col = _find_rob_year_column(ws, target_year)
-    if year_col is None:
-        year_col = 5  # fall back to column E, the typical "current year" column
-    block_start = 4 + 8 * (target_month - 1)
-    rev = safe_float(ws.cell(block_start + 1, year_col).value)
-    rms = safe_float(ws.cell(block_start + 2, year_col).value)
-    if rev is None or rms is None or rms == 0:
-        month_label = datetime.date(target_year, target_month, 1).strftime("%b %Y")
-        return None, f"No {month_label} Revenue/Room Nights on '{sheet_name}' (col {get_column_letter(year_col)})."
-    return rev / rms, None
+    """Calculate selected-month ADR = ROB Revenue / ROB Room Nights.
+
+    Resolve both the year and metric rows from the workbook's own labels.
+    Never guess a year column or a month-row offset, because a plausible
+    but incorrect ADR is worse than reporting an unavailable source.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=True, read_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return None, f"Sheet '{sheet_name}' not found."
+        ws = wb[sheet_name]
+        year_col = _find_rob_year_column(ws, target_year)
+        if year_col is None:
+            return None, f"{target_year} year heading not found on '{sheet_name}'."
+        rev_row, rms_row = _ooo_rob_month_metric_rows(ws, target_month)
+        if rev_row is None:
+            return None, f"{datetime.date(target_year,target_month,1):%b %Y} revenue/room-night rows not found on '{sheet_name}'."
+        rev = safe_float(ws.cell(rev_row, year_col).value)
+        rms = safe_float(ws.cell(rms_row, year_col).value)
+        if rev is None or rms is None or rms <= 0:
+            return None, (f"No valid {datetime.date(target_year,target_month,1):%b %Y} "
+                          f"Revenue/Room Nights on '{sheet_name}' "
+                          f"(col {get_column_letter(year_col)}).")
+        return rev / rms, None
+    finally:
+        wb.close()
 
 
 def match_ooo_property_to_hotel(prop_name, hotels):
@@ -19263,56 +19450,65 @@ def match_ooo_property_to_hotel(prop_name, hotels):
     return candidates[0][0], candidates[0][1], None
 
 
-def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name):
-    """Finds the most recent week with data in the hotel's ROB file.
-    Scans current month first (WK6 -> WK1), then previous month if current is empty.
-    Returns (wb_bytes, sheet_name, file_name, error_str)."""
-    today = datetime.date.today()
-    cur_month_dt  = today.replace(day=1)
-    prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name, target_year, target_month):
+    """Find the best finalized ROB week for the selected OOO reporting month.
+
+    Unlike the old implementation this does not anchor to today's month, so
+    last-month reports still work when a new calendar month begins. Prefer
+    the following month's ROB for finalized previous-month data, then the
+    selected month's ROB, then the previous month's as a last resort.
+    A candidate must contain a valid ADR to be accepted.
+    """
+    target = datetime.date(target_year, target_month, 1)
+    previous = (target - datetime.timedelta(days=1)).replace(day=1)
+    following = (target + datetime.timedelta(days=32)).replace(day=1)
     tried = []
-    for month_dt in (cur_month_dt, prev_month_dt):
-        result, err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB", month_dt)
+    for month_dt in (following, target, previous):
+        result, err = resolve_drive_workbook(service, hotel_id, hotel_name, 'ROB', month_dt)
         if not result:
             tried.append(f"{month_dt.strftime('%b %Y')} ROB: {err}")
             continue
         fid, fname = result
         wb_bytes = drive_download(service, fid)
-        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-        # First pass: look for tab with any color (marked/highlighted)
-        for sheet_name in reversed(ROB_SHEETS):
+        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False, read_only=False)
+        dated = []
+        for i, sheet_name in enumerate(ROB_SHEETS):
             if sheet_name not in wb.sheetnames:
                 continue
             ws = wb[sheet_name]
-            tc = ws.sheet_properties.tabColor
-            # Any color means it's been marked/highlighted
-            if tc is not None and getattr(tc, "rgb", None):
+            asof = ws['E4'].value
+            if isinstance(asof, datetime.datetime):
+                asof = asof.date()
+            if isinstance(asof, datetime.date):
+                dated.append((asof, i, sheet_name))
+        # Prefer latest real dated tab; do not rely on arbitrary colored tabs
+        # or stale values in unused master weeks.
+        candidates = [x[2] for x in sorted(dated, reverse=True)]
+        if not candidates:
+            # Legacy ROBs without dated E4 markers.
+            candidates = [name for name in reversed(ROB_SHEETS)
+                          if name in wb.sheetnames and
+                          any(wb[name].cell(r, 2).value not in (None, '') for r in range(5, 15))]
+        wb.close()
+        for sheet_name in candidates:
+            adr, adr_err = read_rob_adr(wb_bytes, sheet_name, target_year, target_month)
+            if adr is not None:
                 return wb_bytes, sheet_name, fname, None
-        # Second pass: if no tab marked done, use the first week with any data
-        for sheet_name in reversed(ROB_SHEETS):
-            if sheet_name not in wb.sheetnames:
-                continue
-            ws = wb[sheet_name]
-            # Check if sheet has any OTB data (column B, rows 5-14)
-            if any(ws.cell(r, 2).value for r in range(5, 15)):
-                return wb_bytes, sheet_name, fname, None
-        tried.append(f"{fname}: no week with data found")
-    return None, None, None, "; ".join(tried) or "No ROB file found for the current or previous month."
+        tried.append(f'{fname}: no completed week with valid ADR for {target:%b %Y}')
+    return None, None, None, '; '.join(tried)
 
 
 def build_ooo_adr_lookup(service, order, hotels, year, month):
-    """For each property in `order`, resolves it to a Drive hotel and reads
-    its most-recently-available ADR for (year, month) off that hotel's ROB.
-    Returns {property: (adr_or_None, note_or_None)} — note explains why a
-    property has no ADR (unmatched hotel, ambiguous match, no filled ROB
-    week found, etc.) so gaps are visible rather than silently blank."""
+    """Resolve each property's ADR for the selected report month."""
     out = {}
     for prop in order:
         hotel_name, hotel_id, match_note = match_ooo_property_to_hotel(prop, hotels)
         if not hotel_name:
             out[prop] = (None, match_note)
             continue
-        wb_bytes, sheet_name, file_name, src_err = _find_ooo_adr_source_workbook(service, hotel_id, hotel_name)
+        wb_bytes, sheet_name, file_name, src_err = _find_ooo_adr_source_workbook(
+            service, hotel_id, hotel_name, year, month
+        )
         if not wb_bytes:
             out[prop] = (None, src_err)
             continue
@@ -19391,7 +19587,7 @@ def _ooo_build_new_sheet_xml(month_label, order, totals, days_included,
                     + cell_str(f"A{r}", "Property", "header_left")
                     + cell_str(f"B{r}", "Total End. OOO Rooms", "header")
                     + cell_str(f"C{r}", "ADR", "header")
-                    + cell_str(f"D{r}", "Revenue", "header") + '</row>')
+                    + cell_str(f"D{r}", "Est. Revenue Impact", "header") + '</row>')
     r += 1
     grand_total = 0.0
     grand_revenue = 0.0
@@ -24828,125 +25024,139 @@ with tab_ancillary:
     with arev_margaritaville_tab:
         _render_arev_status_brand_tab("Margaritaville", ["Margaritaville Resort Cape Cod"], use_oaky=True)
 
-        with tab_ooo:
-            st.caption(
-                "Pulls the Sell-Out Efficiency Report straight from Drive, adds a bright-green "
-                "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
-                "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
-                "the selected month, with an ADR column pulled from that property's own ROB "
-                "(most recently-finalized week, current month falling back to previous month), "
-                "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
-                "macro buttons on every existing tab are left completely untouched."
-            )
+with tab_ooo:
+    st.caption(
+        "Pulls the Sell-Out Efficiency Report straight from Drive, adds a bright-green "
+        "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
+        "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
+        "the selected month, with an ADR column pulled from that property's own ROB "
+        "(latest dated week for the selected month, with adjacent-month fallback), "
+        "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
+        "macro buttons on every existing tab are left completely untouched."
+    )
 
-            today = datetime.date.today()
-            ooo_cur_month_dt  = today.replace(day=1)
-            ooo_prev_month_dt = (ooo_cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
-            ooo_next_month_dt = (ooo_cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
-            ooo_month_options = {
-                ooo_prev_month_dt.strftime("%B %Y"): ooo_prev_month_dt,
-                ooo_cur_month_dt.strftime("%B %Y"):  ooo_cur_month_dt,
-                ooo_next_month_dt.strftime("%B %Y"): ooo_next_month_dt,
-            }
-            ooo_month_labels = list(ooo_month_options.keys())
-            # Default to the previous (just-completed) month — e.g. on Aug 1st this
-            # defaults to July — since current/next are only there for override.
-            ooo_sel_label = st.selectbox(
-                "Month to summarize", ooo_month_labels,
-                index=ooo_month_labels.index(ooo_prev_month_dt.strftime("%B %Y")),
-                key="ooo_month_sel",
-            )
-            ooo_target_dt = ooo_month_options[ooo_sel_label]
+    today = datetime.date.today()
+    ooo_cur_month_dt  = today.replace(day=1)
+    ooo_prev_month_dt = (ooo_cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+    ooo_next_month_dt = (ooo_cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
+    ooo_month_options = {
+        ooo_prev_month_dt.strftime("%B %Y"): ooo_prev_month_dt,
+        ooo_cur_month_dt.strftime("%B %Y"):  ooo_cur_month_dt,
+        ooo_next_month_dt.strftime("%B %Y"): ooo_next_month_dt,
+    }
+    ooo_month_labels = list(ooo_month_options.keys())
+    # Default to the previous (just-completed) month — e.g. on Aug 1st this
+    # defaults to July — since current/next are only there for override.
+    ooo_sel_label = st.selectbox(
+        "Month to summarize", ooo_month_labels,
+        index=ooo_month_labels.index(ooo_prev_month_dt.strftime("%B %Y")),
+        key="ooo_month_sel",
+    )
+    ooo_target_dt = ooo_month_options[ooo_sel_label]
 
-            if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
-                try:
-                    svc = get_drive_service()
-                    ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
-                    if not ooo_file_id:
-                        st.error(ooo_file_name)
+    if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
+        try:
+            svc = get_drive_service()
+            ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
+            if not ooo_file_id:
+                st.error(ooo_file_name)
+            else:
+                ooo_bytes = drive_download(svc, ooo_file_id)
+                ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
+                ooo_months = list_ooo_available_months(ooo_wb)
+                match = next((m for m in ooo_months
+                              if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
+                if not match:
+                    st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
+                else:
+                    ooo_year, ooo_month, ooo_sheet_names = match
+                    order, totals, days_included, skipped = build_ooo_monthly_totals(
+                        ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
+                    if not order:
+                        st.error(
+                            "None of that month's tabs matched the expected layout "
+                            "('Property' header in row 7 col C, 'End...OOO' in row 7 col J) — "
+                            "nothing was totaled, so no report was built."
+                        )
                     else:
-                        ooo_bytes = drive_download(svc, ooo_file_id)
-                        ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
-                        ooo_months = list_ooo_available_months(ooo_wb)
-                        match = next((m for m in ooo_months
-                                      if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
-                        if not match:
-                            st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
-                        else:
-                            ooo_year, ooo_month, ooo_sheet_names = match
-                            order, totals, days_included, skipped = build_ooo_monthly_totals(
-                                ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
-                            if not order:
-                                st.error(
-                                    "None of that month's tabs matched the expected layout "
-                                    "('Property' header in row 7 col C, 'End...OOO' in row 7 col J) — "
-                                    "nothing was totaled, so no report was built."
-                                )
-                            else:
-                                with st.spinner("Looking up ADR for each property from its ROB..."):
-                                    hotels_for_adr = get_hotels_from_drive()
-                                    if not hotels_for_adr:
-                                        # A silent [] can also be a cached transient Drive
-                                        # failure (5-min TTL) — clear and retry once before
-                                        # concluding nothing is shared.
-                                        get_hotels_from_drive.clear()
-                                        hotels_for_adr = get_hotels_from_drive()
-                                    adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
-                                st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
-                                st.session_state["ooo_file_id"]       = ooo_file_id
-                                st.session_state["ooo_file_name"]     = ooo_file_name
-                                st.session_state["ooo_bytes"]         = ooo_bytes
-                                st.session_state["ooo_year"]          = ooo_year
-                                st.session_state["ooo_month"]         = ooo_month
-                                st.session_state["ooo_order"]         = order
-                                st.session_state["ooo_totals"]        = totals
-                                st.session_state["ooo_days_included"] = days_included
-                                st.session_state["ooo_skipped"]       = skipped
-                                st.session_state["ooo_adr_lookup"]    = adr_lookup
-                                matched = sum(1 for adr, _ in adr_lookup.values() if adr is not None)
-                                st.success(f"Ready to summarize **{ooo_target_dt.strftime('%B %Y')}** "
-                                           f"from **{ooo_file_name}** ({days_included} daily reports found, "
-                                           f"ADR matched for {matched}/{len(order)} properties).")
-                except Exception as e:
-                    st.error(f"Preview error: {e}")
+                        with st.spinner("Looking up ADR for each property from its ROB..."):
+                            hotels_for_adr = get_hotels_from_drive()
+                            if not hotels_for_adr:
+                                # A silent [] can also be a cached transient Drive
+                                # failure (5-min TTL) — clear and retry once before
+                                # concluding nothing is shared.
+                                get_hotels_from_drive.clear()
+                                hotels_for_adr = get_hotels_from_drive()
+                            adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
+                        st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
+                        st.session_state["ooo_file_id"]       = ooo_file_id
+                        st.session_state["ooo_file_name"]     = ooo_file_name
+                        st.session_state["ooo_bytes"]         = ooo_bytes
+                        st.session_state["ooo_year"]          = ooo_year
+                        st.session_state["ooo_month"]         = ooo_month
+                        st.session_state["ooo_order"]         = order
+                        st.session_state["ooo_totals"]        = totals
+                        st.session_state["ooo_days_included"] = days_included
+                        st.session_state["ooo_skipped"]       = skipped
+                        st.session_state["ooo_adr_lookup"]    = adr_lookup
+                        matched = sum(1 for adr, _ in adr_lookup.values() if adr is not None)
+                        st.success(f"Ready to summarize **{ooo_target_dt.strftime('%B %Y')}** "
+                                   f"from **{ooo_file_name}** ({days_included} daily reports found, "
+                                   f"ADR matched for {matched}/{len(order)} properties).")
+        except Exception as e:
+            st.error(f"Preview error: {e}")
 
-            if "ooo_order" in st.session_state:
-                order      = st.session_state["ooo_order"]
-                totals     = st.session_state["ooo_totals"]
-                adr_lookup = st.session_state["ooo_adr_lookup"]
-                hotels_seen = st.session_state.get("ooo_hotels_seen", [])
-                with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
-                    st.write(", ".join(hotels_seen) if hotels_seen else
-                             "None — no hotel folders are shared with this environment's service account.")
-                if st.session_state.get("ooo_skipped"):
-                    st.caption(f"Skipped tabs that didn't match the expected layout: "
-                               f"{', '.join(st.session_state['ooo_skipped'])}")
-                st.dataframe(
-                    [{"Property": p, "Total End. OOO Rooms": totals[p],
-                      "ADR": adr_lookup[p][0],
-                      "Revenue": round(adr_lookup[p][0] * totals[p], 2) if adr_lookup[p][0] is not None else None,
-                      "ADR note": adr_lookup[p][1] or ""} for p in order],
-                    use_container_width=True,
-                )
-                if st.button("Apply to Google Drive", key="ooo_apply", type="primary"):
-                    try:
-                        svc = get_drive_service()
-                        new_bytes, tab_name, err = inject_ooo_monthly_sheet(
-                            st.session_state["ooo_bytes"], st.session_state["ooo_year"],
-                            st.session_state["ooo_month"], order, totals,
-                            st.session_state["ooo_days_included"], adr_lookup)
-                        if err:
-                            st.error(err)
-                        else:
-                            drive_upload(svc, st.session_state["ooo_file_id"], new_bytes,
-                                         st.session_state["ooo_file_name"])
-                            st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
-                            for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
-                                        "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
-                                        "ooo_adr_lookup", "ooo_hotels_seen"]:
-                                st.session_state.pop(key, None)
-                    except Exception as e:
-                        st.error(f"Apply error: {e}")
+    if ("ooo_order" in st.session_state and
+            (st.session_state.get("ooo_year"), st.session_state.get("ooo_month")) !=
+            (ooo_target_dt.year, ooo_target_dt.month)):
+        for _key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
+                     "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
+                     "ooo_adr_lookup", "ooo_hotels_seen"]:
+            st.session_state.pop(_key, None)
+        st.info("Month changed; preview the selected month before applying.")
+
+    if "ooo_order" in st.session_state:
+        order      = st.session_state["ooo_order"]
+        totals     = st.session_state["ooo_totals"]
+        adr_lookup = st.session_state["ooo_adr_lookup"]
+        hotels_seen = st.session_state.get("ooo_hotels_seen", [])
+        with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
+            st.write(", ".join(hotels_seen) if hotels_seen else
+                     "None — no hotel folders are shared with this environment's service account.")
+        if st.session_state.get("ooo_skipped"):
+            st.caption(f"Skipped tabs that didn't match the expected layout: "
+                       f"{', '.join(st.session_state['ooo_skipped'])}")
+        st.dataframe(
+            [{"Property": p, "Total End. OOO Rooms": totals[p],
+              "ADR": adr_lookup[p][0],
+              "Estimated Revenue Impact": round(adr_lookup[p][0] * totals[p], 2) if adr_lookup[p][0] is not None else None,
+              "ADR note": adr_lookup[p][1] or ""} for p in order],
+            use_container_width=True,
+        )
+        if st.button("Apply to Google Drive", key="ooo_apply", type="primary"):
+            try:
+                svc = get_drive_service()
+                new_bytes, tab_name, err = inject_ooo_monthly_sheet(
+                    st.session_state["ooo_bytes"], st.session_state["ooo_year"],
+                    st.session_state["ooo_month"], order, totals,
+                    st.session_state["ooo_days_included"], adr_lookup)
+                if err:
+                    st.error(err)
+                else:
+                    ooo_name = st.session_state["ooo_file_name"].lower()
+                    ooo_mime = ("application/vnd.ms-excel.sheet.macroEnabled.12"
+                                if ".xlsm" in ooo_name else
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    drive_upload(svc, st.session_state["ooo_file_id"], new_bytes,
+                                 st.session_state["ooo_file_name"],
+                                 media_mimetype=ooo_mime)
+                    st.success(f"Added **{tab_name}** to **{st.session_state['ooo_file_name']}**.")
+                    for key in ["ooo_file_id", "ooo_file_name", "ooo_bytes", "ooo_year", "ooo_month",
+                                "ooo_order", "ooo_totals", "ooo_days_included", "ooo_skipped",
+                                "ooo_adr_lookup", "ooo_hotels_seen"]:
+                        st.session_state.pop(key, None)
+            except Exception as e:
+                st.error(f"Apply error: {e}")
 
 
     # ══════════════════════════════════════════════════════════════════════════════
