@@ -7025,12 +7025,20 @@ def _fill_rob_prev_table(
     )
 
     for year, col in dest_year_col.items():
-        _rob_set_value(
-            wk1_ws,
-            year_header_row,
-            col,
-            year,
-        )
+        current_header = wk1_ws.cell(year_header_row, col).value
+        # Preserve workbook-owned header formulas such as =B3/=C3/=D3/=E3.
+        # Replace only blank/stale literal headers so formula structure is not
+        # unnecessarily changed during month setup.
+        if is_formula(current_header):
+            continue
+        current_year = _as_year(current_header)
+        if current_year != year:
+            _rob_set_value(
+                wk1_ws,
+                year_header_row,
+                col,
+                year,
+            )
 
     # ----- Select ONE last completed week from previous month's ROB -----
     prev_month = (
@@ -7421,6 +7429,25 @@ def _rob_month_header_rows(ws):
     return out
 
 
+def _rob_formula_for_destination(value, src_ws, src_row, src_col, dst_ws, dst_row, dst_col):
+    """Translate an Excel formula when copying it to a different ROB cell.
+
+    Copying formula text verbatim is only safe when source and destination are
+    the same coordinate. Historical ROB setup routinely shifts C:D:E -> B:C:D
+    and G -> H, so relative references must move with the formula.
+    """
+    if not is_formula(value):
+        return value
+    try:
+        origin = f"{get_column_letter(src_col)}{src_row}"
+        destination = f"{get_column_letter(dst_col)}{dst_row}"
+        return Translator(str(value), origin=origin).translate_formula(destination)
+    except Exception:
+        # Preserve the original formula rather than dropping it if a workbook
+        # contains a construct Translator cannot parse.
+        return value
+
+
 def _rob_copy_month_metrics_by_label(
     src_ws,
     dst_ws,
@@ -7451,6 +7478,9 @@ def _rob_copy_month_metrics_by_label(
                 continue
             if is_formula(str(value)) and not allow_formulas:
                 continue
+            value = _rob_formula_for_destination(
+                value, src_ws, sr, src_col, dst_ws, dr, dst_col
+            )
             if _rob_set_value(dst_ws, dr, dst_col, value):
                 copied += 1
 
@@ -7551,6 +7581,9 @@ def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
         value = src_ws.cell(sr, 7).value  # G = source-year Group NPU
         if value is None or is_datelike(value):
             continue
+        value = _rob_formula_for_destination(
+            value, src_ws, sr, 7, dst_ws, dr, 8
+        )
 
         if _rob_set_value(dst_ws, dr, 8, value):  # H = STLY Group NPU
             copied += 1
@@ -7747,6 +7780,9 @@ def _rob_seed_historical_columns(
                 value = source_ws.cell(sr, src_col).value
                 if value is None or is_datelike(value):
                     continue
+                value = _rob_formula_for_destination(
+                    value, source_ws, sr, src_col, dest_ws, dr, dst_col
+                )
                 if _rob_set_value(
                     dest_ws,
                     dr,
@@ -7795,6 +7831,10 @@ def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
             for source_col, dest_col in col_map:
                 value = source_ws.cell(src_header, source_col).value
                 if value is not None:
+                    value = _rob_formula_for_destination(
+                        value, source_ws, src_header, source_col,
+                        dest_ws, dst_header, dest_col
+                    )
                     dest_ws.cell(dst_header, dest_col).value = value
                     copied += 1
 
@@ -7808,6 +7848,10 @@ def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
                 value = source_ws.cell(src_row, source_col).value
                 if value is None:
                     continue
+                value = _rob_formula_for_destination(
+                    value, source_ws, src_row, source_col,
+                    dest_ws, dst_row, dest_col
+                )
                 dest_ws.cell(dst_row, dest_col).value = value
                 copied += 1
 
@@ -8249,6 +8293,59 @@ def apply_rob_pickup_wow_formulas(wb, target_year, allowed_sheets=None):
     return [] if refs else ['Pickup WoW formulas: WK1 previous table could not be mapped; WK1 formulas left unchanged.']
 
 
+
+def _normalize_hilton_wk1_pickup_formulas(wb, target_year):
+    """Normalize only Hilton Week 1 Pickup WoW formulas.
+
+    Hilton masters can carry malformed/stale Week 1 pickup references. The
+    hidden Week 1 Previous table is the authoritative prior-month baseline.
+    Rebuild only WK1 pickup formulas from the visible year headers and the
+    month-matched hidden table; leave WK2+ formulas untouched.
+    """
+    if not ROB_SHEETS or ROB_SHEETS[0] not in wb.sheetnames:
+        return 'Hilton WK1 pickup formulas: wk one not found.'
+
+    ws = wb[ROB_SHEETS[0]]
+    refs = _wk1_previous_table_refs(ws, target_year)
+    if not refs:
+        return 'Hilton WK1 pickup formulas: previous table could not be mapped.'
+
+    year_by_col = {}
+    for c in range(2, 6):
+        v = ws.cell(3, c).value
+        y = None
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            y = v.year
+        elif isinstance(v, (int, float)) and 2000 <= int(v) <= 2100:
+            y = int(v)
+        elif isinstance(v, str):
+            m = re.search(r'\b(20\d{2})\b', v)
+            y = int(m.group(1)) if m else None
+        year_by_col[c] = y or (target_year - 5 + c)
+
+    changed = 0
+    for mi, labels in rob_month_blocks(ws).items():
+        revenue_row = labels.get('revenue')
+        pickup_row = next(
+            (r for lab, r in labels.items()
+             if 'pickup' in lab and 'wow' in lab.replace(' ', '')),
+            None,
+        )
+        if not revenue_row or not pickup_row:
+            continue
+
+        for c in range(2, 6):
+            ref = refs.get((mi, year_by_col[c]))
+            if not ref:
+                continue
+            L = get_column_letter(c)
+            formula = f'={L}{revenue_row}-{ref}'
+            if ws.cell(pickup_row, c).value != formula:
+                _rob_set_value(ws, pickup_row, c, formula)
+                changed += 1
+
+    return None if changed >= 0 else None
+
 def _emit_rob_setup_progress(progress_callback, value, message):
     """Best-effort progress reporting for ROB setup without changing logic."""
     if progress_callback is None:
@@ -8573,6 +8670,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         service, hotel_id, hotel_name, "ROB", ly_month_dt
     )
     ly_wb = None
+    ly_wb_formulas = None
     if ly_result:
         warnings.append(
             f"Last year NORMAL ROB ({ly_month_dt.strftime('%b %Y')}) "
@@ -8583,6 +8681,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 service,
                 ly_result[0],
                 data_only=True,
+            )
+            ly_wb_formulas = _get_openpyxl_workbook_cached(
+                service,
+                ly_result[0],
+                data_only=False,
             )
         except Exception as e:
             warnings.append(
@@ -8608,6 +8711,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         next_ly_month_dt,
     )
     next_ly_wb = None
+    next_ly_wb_formulas = None
     if next_ly_result:
         warnings.append(
             f"Following STLY month ({next_ly_month_dt.strftime('%b %Y')}) "
@@ -8618,6 +8722,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 service,
                 next_ly_result[0],
                 data_only=True,
+            )
+            next_ly_wb_formulas = _get_openpyxl_workbook_cached(
+                service,
+                next_ly_result[0],
+                data_only=False,
             )
         except Exception as e:
             warnings.append(
@@ -8643,6 +8752,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         next2_ly_month_dt,
     )
     next2_ly_wb = None
+    next2_ly_wb_formulas = None
     if next2_ly_result:
         warnings.append(
             f"Second following STLY month "
@@ -8654,6 +8764,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 service,
                 next2_ly_result[0],
                 data_only=True,
+            )
+            next2_ly_wb_formulas = _get_openpyxl_workbook_cached(
+                service,
+                next2_ly_result[0],
+                data_only=False,
             )
         except Exception as e:
             warnings.append(
@@ -8697,16 +8812,23 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # prior-year ROB. This guarantees future months (Oct-Dec, etc.) retain their
     # prior-year totals even if weekly date mapping later crosses into another
     # prior-year month file.
-    if ly_wb is not None:
+    _history_seed_wb = ly_wb_formulas if ly_wb_formulas is not None else ly_wb
+    if _history_seed_wb is not None:
         for _sheet_name in ROB_SHEETS:
             if (
                 _sheet_name in new_wb.sheetnames
-                and _sheet_name in ly_wb.sheetnames
+                and _sheet_name in _history_seed_wb.sheetnames
             ):
-                _rob_seed_historical_columns(
-                    ly_wb[_sheet_name],
-                    new_wb[_sheet_name],
-                )
+                if hilton_mode:
+                    _rob_seed_historical_columns_hilton(
+                        _history_seed_wb[_sheet_name],
+                        new_wb[_sheet_name],
+                    )
+                else:
+                    _rob_seed_historical_columns(
+                        _history_seed_wb[_sheet_name],
+                        new_wb[_sheet_name],
+                    )
 
     # STLY source weeks are selected by actual chronological snapshot dates,
     # not by matching destination/source tab names.
@@ -8759,6 +8881,23 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
         stly_snap = stly_week_map.get(sheet_name)
         ly_ws = stly_snap["worksheet"] if stly_snap else None
+
+        # Hilton historical ROBs are formula-heavy. The date-first map is built
+        # from data-only workbooks for reliable snapshot dates, but the actual
+        # historical B:D copy must use the formula-preserving counterpart so
+        # Oct-Dec formulas/values are not lost when cached results are absent.
+        if hilton_mode and stly_snap is not None:
+            _src_label = stly_snap.get("workbook_label")
+            _src_sheet = stly_snap.get("sheet_name")
+            _formula_wb = None
+            if _src_label == ly_month_dt.strftime("%b%Y").upper():
+                _formula_wb = ly_wb_formulas
+            elif _src_label == next_ly_month_dt.strftime("%b%Y").upper():
+                _formula_wb = next_ly_wb_formulas
+            elif _src_label == next2_ly_month_dt.strftime("%b%Y").upper():
+                _formula_wb = next2_ly_wb_formulas
+            if _formula_wb is not None and _src_sheet in _formula_wb.sheetnames:
+                ly_ws = _formula_wb[_src_sheet]
 
         # Current-year ROB setup still needs the historical B:D totals for the
         # target month and all remaining months even when an exact date-first
@@ -10591,9 +10730,12 @@ def setup_hilton_next_year_rob_month(
     hist_id, hist_name, hist_folder_name, hist_bytes = hist_result
 
     try:
+        # Preserve formulas in the historical Hilton ROB. Historical columns
+        # are shifted C:D:E -> B:C:D, so formulas must be translated rather
+        # than replaced by potentially missing cached values.
         hist_wb = openpyxl.load_workbook(
             io.BytesIO(hist_bytes),
-            data_only=True,
+            data_only=False,
         )
     except Exception as e:
         return None, (
@@ -10698,11 +10840,43 @@ def setup_hilton_next_year_rob_month(
             new_wb,
             ROB_SHEETS,
         )
+        # E4 is the authoritative usage marker for next-year ROB week tabs.
+        # A master can contain stale dates; a fresh monthly copy must start
+        # with WK1 available.
+        for _sheet_name in ROB_SHEETS:
+            if _sheet_name in new_wb.sheetnames:
+                new_wb[_sheet_name].cell(4, 5).value = None
 
     _set_rob_year_headers(
         new_wb,
         tracked_year,
     )
+
+    # Previous report month's next-year ROB is the Week 1 WoW baseline.
+    # Hilton has its own setup path, so this must be loaded here explicitly.
+    prev_report_month = (
+        report_month - datetime.timedelta(days=1)
+    ).replace(day=1)
+    prev_next_result, prev_next_err = _resolve_next_year_rob_workbook_session_cached(
+        service,
+        hotel_id,
+        hotel_name,
+        report_month=prev_report_month,
+        tracked_year=tracked_year,
+    )
+    prev_next_wb = None
+    prev_next_wb_formulas = None
+    if prev_next_result:
+        try:
+            prev_next_wb = _get_openpyxl_workbook_cached(
+                service, prev_next_result[0], data_only=True
+            )
+            prev_next_wb_formulas = _get_openpyxl_workbook_cached(
+                service, prev_next_result[0], data_only=False
+            )
+        except Exception:
+            prev_next_wb = None
+            prev_next_wb_formulas = None
 
     _emit_rob_setup_progress(
         progress_callback,
@@ -10914,11 +11088,34 @@ def setup_hilton_next_year_rob_month(
         "Preserving all available future-month data...",
     )
 
-    warnings = apply_rob_pickup_wow_formulas(
-        new_wb,
-        tracked_year,
-        allowed_sheets=None,
-    )
+    warnings = []
+
+    # Populate only the hidden Week 1 Previous table from the last genuinely
+    # used tab of the prior month's next-year ROB. Do NOT regenerate Hilton
+    # pickup formulas here: the Hilton master/corrected workbook already owns
+    # the correct formula pattern and rebuilding it has caused shifted refs.
+    if prev_next_wb is not None and ROB_SHEETS[0] in new_wb.sheetnames:
+        err = _fill_rob_prev_table(
+            new_wb[ROB_SHEETS[0]],
+            prev_next_wb,
+            prev_next_wb_formulas,
+            report_month,
+            tracked_year=tracked_year,
+            prefer_asof_marker=True,
+        )
+        if err:
+            warnings.append(f"Prev table: {err}")
+        else:
+            formula_err = _normalize_hilton_wk1_pickup_formulas(
+                new_wb, tracked_year
+            )
+            if formula_err:
+                warnings.append(formula_err)
+    elif report_month.month != 1:
+        warnings.append(
+            f"Previous {tracked_year} ROB was not available for Week 1 WoW baseline: "
+            f"{prev_next_err}"
+        )
 
     _emit_rob_setup_progress(
         progress_callback,
