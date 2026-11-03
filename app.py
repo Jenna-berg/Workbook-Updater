@@ -8584,6 +8584,162 @@ def _monthly_output_hotel_suffix(hotel_name, candidate_suffix=None):
 
 
 
+def _hilton_current_year_month_rollover_repair(
+    new_wb, historical_wk1, prior_month_last_week, target_month,
+    prior_month_last_week_formulas=None,
+):
+    """Hilton NORMAL ROB WK1 rollover, validated against Mesa NOV2026.
+
+    Historical Oct-Dec B:D should come from the comparable prior-year
+    WK1 C:E, not a master placeholder. The current-year E October onward
+    is real OTB already present in the last completed prior-month week.
+    The historical pink-box comparison H uses that same STLY week's live G.
+    Only WK1 is written; the other weekly tabs' existing links are retained.
+    """
+    if 'wk one' not in new_wb.sheetnames:
+        return ['Hilton rollover: no wk one tab; no corrections applied.']
+    # These two sources serve separate purposes: an unavailable prior-month
+    # workbook must not prevent filling verified historical/STLY values, and
+    # vice versa. Continue with the available source and report any gap.
+    source_warnings = []
+    if historical_wk1 is None:
+        source_warnings.append(
+            'Hilton rollover: historical WK1 unavailable; STLY values and '
+            'historical pickup formulas cannot be verified.'
+        )
+    if prior_month_last_week is None:
+        source_warnings.append(
+            'Hilton rollover: previous-month last completed week unavailable; '
+            'current-year OTB cannot be carried forward.'
+        )
+
+    ws = new_wb['wk one']
+    dst_blocks = rob_month_blocks(ws)
+    hist_blocks = rob_month_blocks(historical_wk1) if historical_wk1 is not None else {}
+    prior_blocks = rob_month_blocks(prior_month_last_week) if prior_month_last_week is not None else {}
+    previous_month_idx = (target_month - datetime.timedelta(days=1)).month - 1
+    hist_count = otb_count = npu_count = 0
+
+    for mi in range(previous_month_idx, 12):
+        dest = dst_blocks.get(mi, {})
+        hist = hist_blocks.get(mi, {})
+        prior = prior_blocks.get(mi, {})
+        for label in (*_ROB_BASE_METRIC_LABELS, 'adr', 'group rm adr'):
+            dr, sr = dest.get(label), hist.get(label)
+            if dr and sr:
+                for sc, dc in ((3, 2), (4, 3), (5, 4)):
+                    value = historical_wk1.cell(sr, sc).value
+                    if value is not None and not is_datelike(value):
+                        value = _rob_formula_for_destination(
+                            value, historical_wk1, sr, sc, ws, dr, dc
+                        )
+                        ws.cell(dr, dc).value = value
+                        hist_count += 1
+            pr = prior.get(label)
+            if dr and pr and ws.cell(dr, 5).value is None:
+                value = prior_month_last_week.cell(pr, 5).value
+                # Copy a valid formula when Excel has no cached result.
+                # Do not copy cross-sheet or self-referencing formulas.
+                if value is None and prior_month_last_week_formulas is not None:
+                    formula = prior_month_last_week_formulas.cell(pr, 5).value
+                    if is_formula(formula) and '!' not in formula and '[' not in formula:
+                        self_reference = re.search(
+                            rf'(?<![A-Za-z0-9_])\$?E\$?{dr}(?!\d)',
+                            formula, re.I,
+                        )
+                        if not self_reference:
+                            value = formula
+                if value is not None and not is_datelike(value):
+                    value = _rob_formula_for_destination(
+                        value, prior_month_last_week, pr, 5, ws, dr, 5
+                    )
+                    ws.cell(dr, 5).value = value
+                    otb_count += 1
+
+        for label in _ROB_SECONDARY_METRIC_LABELS:
+            dr, sr = dest.get(label), hist.get(label)
+            if dr and sr:
+                value = historical_wk1.cell(sr, 7).value
+                if value is not None and not is_datelike(value):
+                    ws.cell(dr, 8).value = _rob_formula_for_destination(
+                        value, historical_wk1, sr, 7, ws, dr, 8
+                    )
+                    npu_count += 1
+
+    # The hidden WK1 previous table is positional, regardless of whether its
+    # year headers are literal years or linked formulas (=B3, =C3...). The
+    # latter had caused a one-column shift (B-AA instead of B-Z) at Mesa.
+    # Rebuild only existing pickup formula cells in all four year columns.
+    refs = _wk1_previous_table_refs(ws, target_month.year)
+    months = rob_month_blocks(ws)
+    pickup_count = 0
+    for mi, labels in months.items():
+        rr = labels.get('revenue')
+        pr = labels.get('pickup wow')
+        if not rr or not pr:
+            continue
+        for dc, baseline_col in ((2, 'Z'), (3, 'AA'), (4, 'AB'), (5, 'AC')):
+            current = ws.cell(pr, dc).value
+            if not is_formula(current):
+                continue
+            # Derive the hidden monthly row from the actual previous-table
+            # month mapping, not from its potentially stale year labels.
+            possible = [coord for (month, year), coord in refs.items()
+                        if month == mi and coord.startswith(baseline_col)]
+            if possible:
+                baseline = possible[0]
+            else:
+                # Standard Hilton previous table: January starts at row 5.
+                baseline = f'{baseline_col}{mi + 5}'
+            expected = f'={get_column_letter(dc)}{rr}-{baseline}'
+            if current != expected:
+                ws.cell(pr, dc).value = expected
+                pickup_count += 1
+
+    # For November/December in Hilton current-year reports, the user's
+    # verified Mesa reference preserves the historical baseline year for
+    # B:D pickup formulas.  Example: historical 2025 C91=C85-AA15
+    # becomes 2026 B91=B85-AA15 (not B85-Z15).  Reuse the actual
+    # historical WK1 baseline references, but shift the OTB numerator to
+    # its new destination column.  This narrowly overrides the generic
+    # same-year pickup normalization for those historical future months.
+    # Column E retains its own current-year pickup formula.
+    historical_pickups_restored = 0
+    for mi in range(target_month.month - 1, 12):
+        if mi < 10:  # The Mesa reference preserves a separate Nov/Dec pattern.
+            continue
+        dest = dst_blocks.get(mi, {})
+        hist = hist_blocks.get(mi, {})
+        dr, sr = dest.get('pickup wow'), hist.get('pickup wow')
+        dest_rev = dest.get('revenue')
+        if not dr or not sr or not dest_rev:
+            continue
+        for source_col, dest_col in ((3, 2), (4, 3), (5, 4)):
+            source_formula = historical_wk1.cell(sr, source_col).value
+            if not is_formula(source_formula):
+                continue
+            # Preserve the historical baseline reference verbatim; only
+            # the leading Revenue OTB reference changes with the year column.
+            match = re.fullmatch(
+                r'\s*=\s*\$?[A-Z]{1,3}\$?\d+\s*-\s*(\$?[A-Z]{1,3}\$?\d+)\s*',
+                source_formula, flags=re.I,
+            )
+            if not match:
+                continue
+            destination_formula = (
+                f'={get_column_letter(dest_col)}{dest_rev}-{match.group(1)}'
+            )
+            ws.cell(dr, dest_col).value = destination_formula
+            historical_pickups_restored += 1
+
+    return source_warnings + [
+        f'Hilton WK1 source-verified rollover: {hist_count} STLY cells; '
+        f'{otb_count} prior-month OTB cells; {npu_count} STLY GNPU cells; '
+        f'{pickup_count} WK1 pickup formulas normalized; '
+        f'{historical_pickups_restored} future-month historical pickup formulas restored.'
+    ]
+
+
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
@@ -9079,6 +9235,31 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             allowed_sheets=filled_stly_sheets,
         )
     )
+
+    # Hilton current-year ROBs need one more source-verified pass. The generic
+    # month setup clears current-year E for October onward and its generic
+    # previous-table year parser can shift WK1 pickup references. Restore
+    # actual latest prior-month OTB and exact comparable historical values.
+    if hilton_mode and wk_one_name in new_wb.sheetnames:
+        _hist_wk1 = None
+        if ly_wb_formulas is not None and wk_one_name in ly_wb_formulas.sheetnames:
+            _hist_wk1 = ly_wb_formulas[wk_one_name]
+        elif ly_wb is not None and wk_one_name in ly_wb.sheetnames:
+            _hist_wk1 = ly_wb[wk_one_name]
+        # Use cached numerical OTB, not formulas from the old workbook.
+        # An old wk four formula pointing at its own wk one could become a
+        # circular self-reference if copied verbatim to the new wk one.
+        _prior_wk = carry_forward_ws
+        _prior_wk_formulas = (
+            prev_wb_formulas[latest_prev_sheet_name]
+            if prev_wb_formulas is not None
+            and latest_prev_sheet_name in prev_wb_formulas.sheetnames
+            else None
+        )
+        warnings.extend(_hilton_current_year_month_rollover_repair(
+            new_wb, _hist_wk1, _prior_wk, target_month,
+            prior_month_last_week_formulas=_prior_wk_formulas,
+        ))
 
     _emit_rob_setup_progress(progress_callback, 0.93, "Saving and uploading workbook...")
     strip_tables(new_wb)
