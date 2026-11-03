@@ -2065,13 +2065,9 @@ def rob_week_status(wb, sheet_names, next_year=False):
     """[(sheet_name, reason_or_None), ...] — why each week tab was passed over.
 
     Normal ROBs determine usage from the current month's Revenue / Room Nights
-    block. Next-year ROBs cannot use that test because the same calendar month
-    in the tracked year may intentionally sit outside the rolling 12-month
-    horizon (for example, an OCT2026 report tracks through SEP2027, so OCT2027
-    is intentionally blank).
-
-    For a next-year ROB, E4 is the weekly as-of marker. Setup leaves it blank;
-    the weekly update writes the report date there.
+    block. For next-year ROBs, E4 is authoritative: a real E4 as-of date means
+    the tab was used. A green done tab is also treated as used. Stale/template
+    month-block values must NOT cause a blank next-year tab to be skipped.
     """
     month = datetime.date.today().month
     out = []
@@ -2084,6 +2080,12 @@ def rob_week_status(wb, sheet_names, next_year=False):
             if as_of is not None:
                 out.append((name, f"already used for {as_of:%b %d, %Y}"))
                 continue
+            tc = ws.sheet_properties.tabColor
+            if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+                out.append((name, "tab marked done (green)"))
+                continue
+            out.append((name, None))
+            continue
 
         block_start = 4 + rob_block_step(ws) * (month - 1)
         out.append((name, _rob_week_taken_reason(ws, block_start)))
@@ -2095,18 +2097,22 @@ def first_uncolored_sheet(wb, sheet_names, next_year=False):
     """Return the first available ROB week tab.
 
     Normal ROBs use this month's Revenue / Room Nights block as the completion
-    test. Next-year ROBs use E4 as the primary completion marker because their
-    same-calendar-month tracked-year block may intentionally be outside the
-    rolling horizon and therefore blank.
+    test. Next-year ROBs use E4 + the app's done color only. This prevents an
+    untouched WK1 from being skipped because a master/template contains stale
+    linked values in the tracked-month block.
     """
     month = datetime.date.today().month
 
     for name in sheet_names:
         ws = wb[name]
 
-        # A completed next-year weekly update writes its as-of date to E4.
-        if next_year and _rob_valid_date(ws.cell(4, 5).value) is not None:
-            continue
+        if next_year:
+            if _rob_valid_date(ws.cell(4, 5).value) is not None:
+                continue
+            tc = ws.sheet_properties.tabColor
+            if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+                continue
+            return name
 
         block_start = 4 + rob_block_step(ws) * (month - 1)
         if _rob_week_taken_reason(ws, block_start) is None:
@@ -8206,7 +8212,9 @@ def apply_rob_pickup_wow_formulas(wb, target_year, allowed_sheets=None):
     wk1=wb[weeks[0]]; refs=_wk1_previous_table_refs(wk1,target_year)
     year_by_col={}
     for c in range(2,6):
-        v=wk1.cell(4,c).value; y=None
+        # ROB year labels live in row 3. Row 4 is the weekly as-of/date row
+        # on Hilton/IHG/SNT files and must never be used to map pickup years.
+        v=wk1.cell(3,c).value; y=None
         if isinstance(v,(datetime.datetime,datetime.date)): y=v.year
         elif isinstance(v,(int,float)) and 2000<=int(v)<=2100: y=int(v)
         elif isinstance(v,str):
@@ -9560,6 +9568,12 @@ def setup_next_year_rob_month(
     )
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
+        # E4 is the authoritative next-year weekly usage marker. A copied
+        # master can contain stale dates, so reset them only on a brand-new
+        # monthly copy. Existing live workbooks are never reset here.
+        for _sheet_name in ROB_SHEETS:
+            if _sheet_name in new_wb.sheetnames:
+                new_wb[_sheet_name].cell(4, 5).value = None
 
     _set_rob_year_headers(
         new_wb,
