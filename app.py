@@ -5662,6 +5662,194 @@ def _drive_excel_children_cached(_service, parent_id, include_google_sheets=Fals
     return rows
 
 
+# Confirmed reporting folder roots supplied for Hilton properties. Both the
+# monthly builder and weekly preview use these SAME roots, preventing mismatched
+# hotel-discovery and per-month resolver paths from creating duplicate files.
+# Never search across hotels: an inaccessible root falls back to legacy lookup.
+HILTON_CONFIRMED_REPORT_ROOTS = {
+    "KANSAS CITY": "146kICySGKhXzWukB8b3xdrfCDf8-ZC2i",
+    "LITTLETON": "1BGvHLpFpEHKuFcRONJ9c58AF4d-Mb-7P",
+    "NASHUA": "1-ACfv7xSfv_qVwIbVkaoZF4Z5-cz-8SG",
+    "MEMPHIS": "1K66lKzvqdtvdiH8h92h21T0A1L1XGAdP",
+}
+
+
+def _hilton_confirmed_root(hotel_name):
+    label = re.sub(r"[^A-Z0-9 ]+", " ", str(hotel_name or "").upper())
+    for hotel, folder_id in HILTON_CONFIRMED_REPORT_ROOTS.items():
+        if hotel in label:
+            return folder_id
+    return None
+
+
+def _hilton_target_file_match(filename, report_month, next_year=False):
+    """Require an exact reporting-month token and the correct ROB family."""
+    name = str(filename or "").upper()
+    if "ROB" not in name or "MASTER" in name:
+        return False
+    tracked = report_month.year + 1
+    lead = re.match(r"^\s*(20\d{2})\s+ROB\b", name)
+    if next_year:
+        if not lead or int(lead.group(1)) != tracked:
+            return False
+    elif lead:
+        return False
+    if not _monthly_destination_matches_target(name, "", report_month):
+        return False
+    return True
+
+
+def _hilton_root_walk(service, root_id, max_depth=8, report_month=None):
+    """Bounded, cycle-safe traversal of one explicitly provided Drive root."""
+    frontier = [(root_id, 0)]
+    seen = set()
+    while frontier:
+        folder_id, depth = frontier.pop(0)
+        if folder_id in seen:
+            continue
+        seen.add(folder_id)
+        try:
+            info = service.files().get(
+                fileId=folder_id, fields="id,name,parents",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            continue
+        yield folder_id, info.get("name", "")
+        if depth >= max_depth:
+            continue
+        for child in _drive_folder_children_cached(service, folder_id):
+            if not child.get("id") or child["id"] in seen:
+                continue
+            if report_month is not None:
+                cname = str(child.get("name") or "").upper()
+                # Recognizable year-only or dated month/year subfolders that
+                # are for another reporting period cannot hold this month.
+                yearonly = re.fullmatch(r"\s*(20\d{2})\s*", cname)
+                if yearonly and int(yearonly.group(1)) != report_month.year:
+                    continue
+                identified = re.findall(
+                    r"\b(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|"
+                    r"MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|"
+                    r"OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\s*[-_ ]?"
+                    r"(20\d{2})\b", cname,
+                )
+                if identified and not any(
+                    int(yr) == report_month.year
+                    and mon[:3] == report_month.strftime("%b").upper()
+                    for mon, yr in identified
+                ):
+                    continue
+            frontier.append((child["id"], depth + 1))
+
+
+def _hilton_find_confirmed_workbook(service, hotel_name, report_month,
+                                    next_year=False):
+    """(file, folder, duplicates) in a known Hilton root, or None.
+
+    Prefers the canonical unnumbered filename over Drive 'Copy of' and '(1)'
+    versions. Duplicates are never created as a consequence of this lookup.
+    """
+    root_id = _hilton_confirmed_root(hotel_name)
+    if not root_id:
+        return None
+    found = []
+    for folder_id, folder_name in _hilton_root_walk(
+        service, root_id, report_month=report_month
+    ):
+        for f in _drive_excel_children_cached(service, folder_id):
+            name = str(f.get("name", ""))
+            if _hilton_target_file_match(name, report_month, next_year):
+                found.append((f, folder_id, folder_name))
+    if not found:
+        return None
+    suffix = re.sub(r"[^A-Z0-9]", "", str(hotel_name or "").upper())
+    def score(item):
+        file, folder_id, folder_name = item
+        name = str(file.get('name', ''))
+        upper = name.upper()
+        token = report_month.strftime('%b%Y').upper()
+        canonical = bool(re.match(rf'^\s*{token}\s+ROB\b', upper)) if not next_year else bool(re.match(rf'^\s*{report_month.year+1}\s+ROB\s+{token}\b', upper))
+        # Prefer exact conventional filenames, not Drive-suffixed copies.
+        duplicate_copy = bool(re.search(r'\(\d+\)\s*\.XLS[X M]?$|^\s*COPY OF\b', upper))
+        return (int(canonical), int(not duplicate_copy),
+                int(suffix in re.sub(r'[^A-Z0-9]', '', upper)),
+                str(file.get('modifiedTime', '')))
+    found.sort(key=score, reverse=True)
+    f, folder_id, folder_name = found[0]
+    return (f['id'], f['name'], folder_id, folder_name,
+            [x[0]['name'] for x in found[1:]])
+
+
+def _hilton_find_confirmed_month_folder(service, hotel_name, report_month):
+    root_id = _hilton_confirmed_root(hotel_name)
+    if not root_id:
+        return None
+    candidates = []
+    token = report_month.strftime('%b%Y').upper()
+    for folder_id, name in _hilton_root_walk(
+        service, root_id, report_month=report_month
+    ):
+        compact = re.sub(r'[^A-Z0-9]', '', str(name).upper())
+        if token in compact:
+            # Prefer the explicit month folder, not an older 'revenue reports'
+            # ancestor; root may itself be the month folder.
+            candidates.append((int('REVENUE' in str(name).upper()), folder_id, name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _, fid, fname = candidates[0]
+    return fid, fname
+
+
+def _hilton_previous_completed_week(wb, target_month):
+    """Use an actual prior-month E4; exclude stale and future template weeks."""
+    if wb is None:
+        return None
+    prev = (target_month - datetime.timedelta(days=1)).replace(day=1)
+    candidates = []
+    for sheet in ROB_SHEETS:
+        if sheet not in wb.sheetnames:
+            continue
+        date = _rob_valid_date(wb[sheet]['E4'].value)
+        if date is None or (date.year, date.month) != (prev.year, prev.month):
+            continue
+        labels = rob_month_blocks(wb[sheet]).get(prev.month - 1, {})
+        rev = labels.get('revenue')
+        rms = labels.get('room nights')
+        if rev is None or rms is None:
+            continue
+        v1 = wb[sheet].cell(rev, 5).value
+        v2 = wb[sheet].cell(rms, 5).value
+        if not (isinstance(v1, (int, float)) and not isinstance(v1, bool)
+                and isinstance(v2, (int, float)) and not isinstance(v2, bool)):
+            continue
+        candidates.append((date, ROB_SHEETS.index(sheet), sheet))
+    return max(candidates)[2] if candidates else None
+
+
+def _hilton_initialize_new_month_dates(wb, target_month):
+    """Clear stale dates on a newly rolled/never-live Hilton month only.
+
+    A workbook with at least one real E4 from this reporting month is live:
+    preserve *all* of its E4 dates, even when setup is rerun.
+    """
+    dates = [(_rob_valid_date(wb[n]['E4'].value) if n in wb.sheetnames else None)
+             for n in ROB_SHEETS]
+    if any(d is not None and (d.year, d.month) ==
+           (target_month.year, target_month.month) for d in dates):
+        return 0
+    cleared = 0
+    for name in ROB_SHEETS:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        if ws['E4'].value is not None:
+            ws['E4'] = None
+            cleared += 1
+    return cleared
+
+
 def _find_rev_reports_folder_for_year(_service, hotel_id, year_kw, month_kw=None):
     """Find the REVENUE REPORTS folder to use for a given year (and,
     preferably, the specific target month — see _pick_rev_reports_candidate
@@ -6665,8 +6853,12 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
             "_drive_excel_children_cache_v1",
             {},
         )
-        excel_cache.pop((str(parent_id), False), None)
-        excel_cache.pop((str(parent_id), True), None)
+        excel_cache.pop((str(parent_folder_id), False), None)
+        excel_cache.pop((str(parent_folder_id), True), None)
+        # The decorator has its own TTL cache; clearing only session_state
+        # leaves a just-created workbook invisible until the TTL expires.
+        if hasattr(_drive_excel_children_cached, "clear"):
+            _drive_excel_children_cached.clear()
     except Exception:
         pass
 
@@ -6835,12 +7027,21 @@ def _rob_as_of_date(year, month):
     return d
 
 
-def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
+def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col, _seen=None):
     """Read a cell value, following simple cross-sheet formula references if needed.
     When data_only=True returns None (no cached value), reads the formula string
     from prev_wb_formulas and follows the reference (e.g. ='wk one'!B45)."""
     import re
     from openpyxl.utils import column_index_from_string
+
+    # Real Hilton workbooks may have mutually linked weekly formulas.
+    # Stop rather than recurse forever if cached results are unavailable.
+    if _seen is None:
+        _seen = set()
+    current = (sheet_name, row, col)
+    if current in _seen or len(_seen) >= 24:
+        return None
+    _seen.add(current)
 
     def _read_data(wb, sname, r, c):
         if wb and sname in wb.sheetnames:
@@ -6864,34 +7065,22 @@ def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
                 if v is not None:
                     return v
                 # Referenced sheet might itself have a formula — follow one more level
-                v2 = _resolve_cell(prev_wb_data, prev_wb_formulas, ref_sheet, ref_row, ref_col)
+                v2 = _resolve_cell(
+                    prev_wb_data, prev_wb_formulas,
+                    ref_sheet, ref_row, ref_col, _seen,
+                )
                 return v2
     return None
 
 
 def _rob_cell_is_writable(ws, row, col):
-    """True when a ROB setup cell can safely receive a value.
+    """A merged non-anchor is an openpyxl MergedCell, and is read-only.
 
-    Northbrook's ROB master contains vertically merged cells inside monthly
-    blocks (for example H5:H7). openpyxl represents every merged cell except
-    the top-left anchor as MergedCell, whose .value is read-only.
-
-    Setup should preserve those merged sections, so non-anchor merged cells are
-    skipped instead of being assigned.
+    Ordinary Cells (including the upper-left anchor of a merged range) are
+    writable. Checking ws.merged_cells.ranges for every ordinary Cell made
+    large Hilton workbooks extremely slow during a whole-month rollover.
     """
-    cell = ws.cell(row, col)
-    if cell.__class__.__name__ == "MergedCell":
-        return False
-
-    # Defensive check for regular Cell objects that belong to a merge range.
-    for rng in ws.merged_cells.ranges:
-        if (
-            rng.min_row <= row <= rng.max_row
-            and rng.min_col <= col <= rng.max_col
-        ):
-            return row == rng.min_row and col == rng.min_col
-
-    return True
+    return ws.cell(row, col).__class__.__name__ != "MergedCell"
 
 
 def _rob_set_value(ws, row, col, value, number_format=None):
@@ -7121,11 +7310,6 @@ def _fill_rob_prev_table(
         tracked_year: 5,
     }
 
-    # Validate the one revenue cell that makes the SNT rollover meaningful:
-    # the prior month's TY Revenue must reach the same month/year in the
-    # Week 1 Previous table. A successful header/table lookup alone is not
-    # proof that the hidden pickup baseline was populated.
-    copied_closed_month_revenue = False
     for month_idx, dest_row in dest_month_row.items():
         rev_row = source_blocks.get(month_idx, {}).get("revenue")
         if not rev_row:
@@ -7143,18 +7327,6 @@ def _fill_rob_prev_table(
 
             if value is not None:
                 _rob_set_value(wk1_ws, dest_row, dest_col, value)
-                if month_idx == prev_month_idx and year == tracked_year:
-                    copied_closed_month_revenue = (
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and wk1_ws.cell(dest_row, dest_col).value == value
-                    )
-
-    if source_week_override is not None and not copied_closed_month_revenue:
-        return (
-            'SNT hidden pickup baseline incomplete: the selected prior-month '
-            'week has no numeric current-year Revenue for the closing month.'
-        )
 
     return None
 
@@ -7254,14 +7426,12 @@ def _snt_previous_month_completed_week(prev_wb, target_month):
         closed_month = rob_month_blocks(ws).get(previous_month_idx, {})
         revenue_row = closed_month.get('revenue')
         rooms_row = closed_month.get('room nights') or closed_month.get('rms sold')
-        # The hidden Week 1 pickup baseline copies Revenue, not Room Nights.
-        # A source with only Rooms populated cannot provide a valid pickup
-        # baseline even though earlier logic accepted it as a completed week.
-        # Numeric zero is legitimate; blank and uncached formulas are not.
-        revenue_value = ws.cell(revenue_row, 5).value if revenue_row else None
-        if not (
-            isinstance(revenue_value, (int, float))
-            and not isinstance(revenue_value, bool)
+        values = [
+            ws.cell(row, 5).value for row in (revenue_row, rooms_row) if row
+        ]
+        if not any(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
         ):
             continue
         candidates.append((asof, index, name))
@@ -8943,11 +9113,44 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
+    # Confirmed Hilton roots: find the existing target workbook FIRST, before
+    # any copying, using the exact same discovery rule as weekly preview.
+    # This is vital for files already duplicated by older Preview workflows.
+    _confirmed = _hilton_confirmed_root(hotel_name) if hilton_mode else None
+    if _confirmed:
+        try:
+            service.files().get(
+                fileId=_confirmed, fields="id,name",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as _root_error:
+            return (
+                None,
+                f"Confirmed Hilton Drive folder {_confirmed} cannot be opened "
+                f"by the app service account: {_root_error}. "
+                "No alternative-folder copy was attempted.",
+                None, None,
+            )
+    _hilton_existing = (
+        _hilton_find_confirmed_workbook(service, hotel_name, target_month)
+        if hilton_mode else None
+    )
+    _hilton_dest_folder = (
+        _hilton_find_confirmed_month_folder(service, hotel_name, target_month)
+        if hilton_mode and not _hilton_existing else None
+    )
     # ── Locate month folder (never created — must already exist) ────────────
     rev_id, rev_name = _find_rev_reports_folder_for_year(service, hotel_id, year_kw, month_kw)
-    if not rev_id:
+    if not rev_id and not (_hilton_existing or _hilton_dest_folder):
         return None, "No REVENUE REPORTS folder.", None, None
-    month_id, month_name = _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+    month_id, month_name = (
+        _find_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
+        if rev_id else (None, None)
+    )
+    if _hilton_existing:
+        month_id, month_name = _hilton_existing[2], _hilton_existing[3]
+    elif _hilton_dest_folder:
+        month_id, month_name = _hilton_dest_folder
     if not month_id:
         return None, f"Could not find the {month_kw} folder for {hotel_name} — it should already exist.", None, None
 
@@ -8959,12 +9162,19 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # ── Find or copy the file ─────────────────────────────────────────────────
     # Fast path: skip extra duplicate-file diagnostic Drive query.
     dup_check_warnings = []
+    if _hilton_existing and _hilton_existing[4]:
+        dup_check_warnings.append(
+            "Duplicate ROBs exist in the confirmed reporting folder: "
+            + ", ".join(_hilton_existing[4])
+            + ". Existing canonical file reused; duplicates were not modified or deleted."
+        )
 
-    existing_id, existing_name = _find_exact_monthly_workbook_in_folder(
-        service,
-        month_id,
-        "ROB",
-        target_month,
+    existing_id, existing_name = (
+        (_hilton_existing[0], _hilton_existing[1])
+        if _hilton_existing else
+        _find_exact_monthly_workbook_in_folder(
+            service, month_id, "ROB", target_month,
+        )
     )
 
     if not existing_id:
@@ -8984,6 +9194,53 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ):
             existing_id = None
             existing_name = None
+    # Hilton also must validate source files BEFORE any master is copied. This
+    # prevents leaving an unfinished November file behind when a previous-year
+    # ROB is missing or an October weekly snapshot is unusable.
+    if hilton_mode and not (existing_id and "master" not in existing_name.lower()):
+        _prev = (target_month - datetime.timedelta(days=1)).replace(day=1)
+        _historical = target_month.replace(year=target_month.year - 1)
+        _source_errors = []
+        for _role, _month in (("previous month", _prev), ("historical", _historical)):
+            _result, _error = _resolve_drive_workbook_session_cached(
+                service, hotel_id, hotel_name, "ROB", _month, force_refresh=True,
+            )
+            if not _result:
+                _source_errors.append(f"{_role} {_month:%b %Y} ROB missing: {_error}")
+                continue
+            try:
+                _wb = _get_openpyxl_workbook_cached(
+                    service, _result[0], data_only=(_role == "previous month"),
+                )
+                if _role == "previous month":
+                    if _hilton_previous_completed_week(_wb, target_month) is None:
+                        _source_errors.append(
+                            f"{_role} {_month:%b %Y} has no correctly dated "
+                            "week with numeric Revenue and Room Nights"
+                        )
+                elif "wk one" not in _wb.sheetnames:
+                    _source_errors.append(f"{_role} {_month:%b %Y} is missing wk one")
+                else:
+                    _year = _wb["wk one"]["E3"].value
+                    try:
+                        _year = int(float(_year))
+                    except (TypeError, ValueError):
+                        _year = None
+                    if _year != _month.year:
+                        _source_errors.append(
+                            f"{_role} {_month:%b %Y} has E3={_year!r}; "
+                            f"expected {_month.year}"
+                        )
+            except Exception as _exc:
+                _source_errors.append(f"{_role} {_month:%b %Y} failed to open: {_exc}")
+        if _source_errors:
+            return (
+                None,
+                "Hilton monthly setup did not create a file because sources "
+                "failed validation: " + "; ".join(_source_errors),
+                None, None,
+            )
+
     # For a new SNT month, validate required upstream ROBs BEFORE copying a
     # master into Drive. The post-load validation below remains in place for
     # existing files and for any source changed between preflight and upload.
@@ -9008,10 +9265,20 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                     service, _resolved[0], data_only=(_role == "previous-month")
                 )
                 if _role == "previous-month":
-                    if _snt_previous_month_completed_week(_source_wb, target_month) is None:
+                    _completed = _snt_previous_month_completed_week(_source_wb, target_month)
+                    if _completed is None:
                         _preflight_problems.append(
                             f"previous-month {_month:%b %Y} ROB has no completed week"
                         )
+                    else:
+                        _labels = rob_month_blocks(_source_wb[_completed]).get(_month.month - 1, {})
+                        _rev = _labels.get("revenue")
+                        _value = (_source_wb[_completed].cell(_rev, 5).value if _rev else None)
+                        if not isinstance(_value, (int, float)) or isinstance(_value, bool):
+                            _preflight_problems.append(
+                                f"previous-month {_month:%b %Y} closing week has no "
+                                "cached numeric Revenue for the Week 1 pickup baseline"
+                            )
                 elif ROB_SHEETS[0] not in _source_wb.sheetnames:
                     _preflight_problems.append(
                         f"historical {_month:%b %Y} ROB has no WK1 tab"
@@ -9090,6 +9357,21 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
+    if hilton_mode and not is_fresh_copy:
+        _live_dates = [
+            _rob_valid_date(new_wb[s]['E4'].value)
+            for s in ROB_SHEETS if s in new_wb.sheetnames
+        ]
+        if any(d is not None and (d.year, d.month) ==
+               (target_month.year, target_month.month) for d in _live_dates):
+            return (
+                new_file_name,
+                "Existing Hilton ROB already has live weekly data for "
+                f"{target_month:%B %Y}. No cells were changed or uploaded. "
+                "Use the weekly update tool rather than running monthly setup again.",
+                new_file_id,
+                new_wb_bytes,
+            )
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
         # A master is not evidence of a completed weekly upload. Template
@@ -9382,7 +9664,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     latest_prev_sheet_name = (
         _snt_previous_month_completed_week(prev_wb, target_month)
         if snt_mode and not hilton_mode
-        else _rob_last_completed_week(prev_wb, target_month)
+        else (_hilton_previous_completed_week(prev_wb, target_month)
+              if hilton_mode else _rob_last_completed_week(prev_wb, target_month))
     )
     carry_forward_ws = (
         prev_wb[latest_prev_sheet_name]
@@ -9408,6 +9691,15 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             missing_required.append(
                 f"last completed week of {prev_month_dt.strftime('%b %Y')} ROB"
             )
+        else:
+            _close = rob_month_blocks(carry_forward_ws).get(prev_month_dt.month - 1, {})
+            _revrow = _close.get("revenue")
+            _revvalue = carry_forward_ws.cell(_revrow, 5).value if _revrow else None
+            if not isinstance(_revvalue, (int, float)) or isinstance(_revvalue, bool):
+                missing_required.append(
+                    f"last completed week of {prev_month_dt.strftime('%b %Y')} "
+                    "ROB has no numeric Revenue pickup baseline"
+                )
         if _history_seed_wb is None or ROB_SHEETS[0] not in _history_seed_wb.sheetnames:
             missing_required.append(
                 f"WK1 from {ly_month_dt.strftime('%b %Y')} historical ROB"
@@ -9440,6 +9732,19 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 None,
                 None,
             )
+
+    if hilton_mode:
+        _missing_hilton = []
+        if carry_forward_ws is None:
+            _missing_hilton.append(
+                f"{prev_month_dt:%b %Y} prior-month ROB with a dated and populated closing week"
+            )
+        if _history_seed_wb is None or 'wk one' not in _history_seed_wb.sheetnames:
+            _missing_hilton.append(f"{ly_month_dt:%b %Y} historical WK1 ROB")
+        if _missing_hilton:
+            return (None, "Hilton monthly setup stopped without uploading: missing "
+                    + ", ".join(_missing_hilton) + ". "
+                    + "; ".join(warnings), None, None)
 
     wk_one_name = ROB_SHEETS[0]
     filled_stly_sheets = set()
@@ -9574,7 +9879,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             target_month,
             tracked_year=target_month.year,
             prefer_asof_marker=True,
-            source_week_override=(latest_prev_sheet_name if snt_mode and not hilton_mode else None),
+            source_week_override=(latest_prev_sheet_name if (snt_mode or hilton_mode) else None),
         )
         if err:
             if snt_mode and not hilton_mode:
@@ -9642,6 +9947,18 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 f'{len(_snt_live_wk1)} cells including E4.'
             )
 
+    if hilton_mode:
+        # The historical seeding stage writes source C:D:E year headings
+        # back into B:C:D. Reassert the correct report-year window LAST.
+        _set_rob_year_headers(new_wb, target_month.year)
+        # An October master with old E4 dates is not a November live report.
+        # A genuine updated November report is protected by this guard.
+        _dates_cleared = _hilton_initialize_new_month_dates(new_wb, target_month)
+        if _dates_cleared:
+            warnings.append(
+                f"Hilton monthly setup cleared {_dates_cleared} stale week E4 dates."
+            )
+
     # _fill_rob_sheet can restore a previous-month date into the WK1 E4
     # header while populating historical comparisons. For a fresh SNT ROB,
     # that header must stay blank until the *new month's* weekly upload.
@@ -9675,6 +9992,13 @@ def resolve_next_year_rob_workbook(
     """
     report_month = report_month or datetime.date.today().replace(day=1)
     tracked_year = tracked_year or (report_month.year + 1)
+
+    if _hilton_confirmed_root(hotel_name):
+        _known = _hilton_find_confirmed_workbook(
+            service, hotel_name, report_month, next_year=True,
+        )
+        if _known:
+            return (_known[0], _known[1]), None
 
     year_kw = str(report_month.year)
     month_kw = report_month.strftime("%b%Y").upper()
@@ -13388,6 +13712,13 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
     if month_date is None:
         month_date = datetime.date.today()
 
+    if workbook_type == "ROB" and _hilton_confirmed_root(hotel_name):
+        _known = _hilton_find_confirmed_workbook(
+            service, hotel_name, month_date, next_year=False,
+        )
+        if _known:
+            return (_known[0], _known[1]), None
+
     month_kw = month_date.strftime("%b%Y").upper()
     month_kw_2digit = month_date.strftime("%b%y").upper()
     year_kw = str(month_date.year)
@@ -13923,7 +14254,10 @@ def _resolve_drive_workbook_session_cached(
         if not force_refresh and cache_key in cache:
             item = cache[cache_key]
             result = tuple(item["result"]) if item.get("result") else None
-            return result, item.get("error")
+            if result:
+                return result, item.get("error")
+            # Never cache "not found" throughout the session: a monthly
+            # builder may have created that file since the failed preview.
     except Exception:
         pass
 
@@ -21104,36 +21438,14 @@ def render_hilton_update(hotels):
                         month_date=report_month,
                     )
 
-                    # A missing current-month Hilton ROB should be created via
-                    # the same monthly setup path rather than stopping at an
-                    # old/legacy Revenue Reports root.
-                    if (
-                        wb_type == "ROB"
-                        and (err or not result)
-                    ):
-                        (
-                            created_name,
-                            create_err,
-                            _created_id,
-                            _original_bytes,
-                        ) = setup_new_rob_month(
-                            svc,
-                            fid,
-                            name,
-                            report_month,
-                            hilton_mode=True,
+                    # Preview must be read-only. Never create a second ROB
+                    # because a lookup failed: use Set Up New ROB explicitly.
+                    if wb_type == "ROB" and (err or not result):
+                        err = (
+                            f"{err or 'ROB not found'}. Preview did not create "
+                            "any Drive files. Verify the existing workbook or "
+                            "use Set Up New ROB after checking its folder."
                         )
-
-                        if created_name:
-                            result, err = resolve_drive_workbook(
-                                svc,
-                                fid,
-                                name,
-                                "ROB",
-                                month_date=report_month,
-                            )
-                        else:
-                            err = create_err or err
 
                 if err or not result:
                     problems.append(
@@ -21272,6 +21584,23 @@ def render_hilton_update(hotels):
     for msg in st.session_state.get("hil_problems") or []:
         st.warning(msg)
 
+    _hilton_missing_rob = bool(
+        "ROB" in wb_sels and any(
+            "— ROB:" in str(msg) and (
+                "not found" in str(msg).lower()
+                or "could not find" in str(msg).lower()
+                or "cannot be opened" in str(msg).lower()
+            )
+            for msg in (st.session_state.get("hil_problems") or [])
+        )
+    )
+    if _hilton_missing_rob:
+        st.error(
+            "Hilton preview is incomplete: at least one selected ROB was "
+            "not located. Do not apply a Forecast-only partial batch. "
+            "Correct the Drive lookup or run Set Up New ROB, then preview again."
+        )
+
     _render_undo_bar("hil_undo")
 
     if not jobs:
@@ -21287,7 +21616,10 @@ def render_hilton_update(hotels):
     total = sum(len([c for c in j["changes"] if not c["skip_reason"]]) for j in jobs)
     st.write(f"**{total} cells across {len(jobs)} workbook(s).** "
              f"Applying writes to Drive and marks each tab done (green).")
-    if st.button("Confirm and apply to Drive", key="hil_apply", type="primary"):
+    if st.button(
+        "Confirm and apply to Drive", key="hil_apply", type="primary",
+        disabled=_hilton_missing_rob,
+    ):
         saved, errors = apply_portfolio_plans(get_drive_service(), jobs, "hil_undo")
         for s in saved:
             st.success(f"Saved {s}")
