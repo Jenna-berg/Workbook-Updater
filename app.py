@@ -9342,16 +9342,44 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 elif "wk one" not in _wb.sheetnames:
                     _source_errors.append(f"{_role} {_month:%b %Y} is missing wk one")
                 else:
-                    _year = _wb["wk one"]["E3"].value
-                    try:
-                        _year = int(float(_year))
-                    except (TypeError, ValueError):
-                        _year = None
-                    if _year != _month.year:
-                        _source_errors.append(
-                            f"{_role} {_month:%b %Y} has E3={_year!r}; "
-                            f"expected {_month.year}"
+                    # Historical Hilton workbooks may legitimately have an E3
+                    # tracked-year header one year *after* the weekly snapshot.
+                    # E3=2026 in a NOV2025 source is not a 2027 ROB leak.
+                    # Validate actual dated week snapshots, not the year header.
+                    _cached_hist = _get_openpyxl_workbook_cached(
+                        service, _result[0], data_only=True,
+                    )
+                    _matching_hist_weeks = [
+                        _sheet for _sheet in ROB_SHEETS
+                        if _sheet in _cached_hist.sheetnames
+                        and (
+                            (lambda d: d is not None and
+                             (d.year, d.month) == (_month.year, _month.month))(
+                                _rob_valid_date(_cached_hist[_sheet]["E4"].value)
+                            )
                         )
+                    ]
+                    if not _matching_hist_weeks:
+                        _source_errors.append(
+                            f"{_role} {_month:%b %Y} has no weekly E4 snapshot "
+                            f"dated {_month:%b %Y}; cannot validate its source "
+                            "from the tracked-year header alone"
+                        )
+                    else:
+                        _source_ws = _cached_hist[_matching_hist_weeks[0]]
+                        _metrics = rob_month_blocks(_source_ws)
+                        if not any(
+                            isinstance(_source_ws.cell(labels['revenue'], 5).value,
+                                       (int, float))
+                            and not isinstance(_source_ws.cell(labels['revenue'], 5).value,
+                                               bool)
+                            for labels in _metrics.values()
+                            if 'revenue' in labels
+                        ):
+                            _source_errors.append(
+                                f"{_role} {_month:%b %Y} contains dated weeks "
+                                "but lacks numeric historical revenue"
+                            )
             except Exception as _exc:
                 _source_errors.append(f"{_role} {_month:%b %Y} failed to open: {_exc}")
         if _source_errors:
