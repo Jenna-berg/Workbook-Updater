@@ -8867,6 +8867,19 @@ def _hilton_current_year_month_rollover_repair(
         )
 
     ws = new_wb['wk one']
+    _expected_year = target_month.year
+    _actual_year = None
+    if prior_month_last_week is not None:
+        try:
+            _actual_year = int(float(prior_month_last_week['E3'].value))
+        except (ValueError, TypeError):
+            pass
+    if _actual_year != _expected_year:
+        raise ValueError(
+            f"Hilton {target_month:%b %Y} normal ROB refused prior-month "
+            f"source with E3={_actual_year!r}, expected {_expected_year}. "
+            "Check for accidental 2027 ROB selection."
+        )
     dst_blocks = rob_month_blocks(ws)
     hist_blocks = rob_month_blocks(historical_wk1) if historical_wk1 is not None else {}
     prior_blocks = rob_month_blocks(prior_month_last_week) if prior_month_last_week is not None else {}
@@ -8889,7 +8902,11 @@ def _hilton_current_year_month_rollover_repair(
                         ws.cell(dr, dc).value = value
                         hist_count += 1
             pr = prior.get(label)
-            if dr and pr and ws.cell(dr, 5).value is None:
+            # Hilton normal ROB: prior-month closing-week E is authoritative
+            # for the completed month and the opening OTB of future months.
+            # Replace stale values inherited from a master, including values
+            # that came from the next-year ROB. Never import 2027 E into 2026.
+            if dr and pr:
                 value = prior_month_last_week.cell(pr, 5).value
                 # Copy a valid formula when Excel has no cached result.
                 # Do not copy cross-sheet or self-referencing formulas.
@@ -8908,6 +8925,10 @@ def _hilton_current_year_month_rollover_repair(
                     )
                     ws.cell(dr, 5).value = value
                     otb_count += 1
+                elif label in _ROB_BASE_METRIC_LABELS:
+                    # Do not leave a prefilled 2027 master cell in the live
+                    # 2026 E column when the proper 2026 source is blank.
+                    ws.cell(dr, 5).value = None
 
         for label in _ROB_SECONDARY_METRIC_LABELS:
             dr, sr = dest.get(label), hist.get(label)
@@ -9099,6 +9120,106 @@ def _snt_current_year_wk1_rollover_repair(
         f'{stly_cells} future STLY GNPU cells; {cleared_stly} closed-month STLY GNPU cells cleared.'
     )
     return notes
+
+
+def _hilton_reconcile_q4_history(dest_wb, target_month, prev_close_ws,
+                                 date_week_map, historical_workbook_pairs):
+    """Reconcile Q4 B:D from correct-year ROB sources, never guessed values.
+
+    For the just-closed month the previous current-year report is authoritative.
+    For current/future months the date-matched STLY snapshot is authoritative
+    when populated. Empty source cells fall back to the previous-month report
+    (already in the destination's B:D year convention) and then later STLY
+    sources (whose C:D:E represents those same three historical years).
+
+    Only input metrics are moved; ADR and pickup formulas remain calculated.
+    If a required historical Revenue or Room Nights cell cannot be populated,
+    return an error instead of uploading a deceptively completed ROB.
+    """
+    notes, missing = [], []
+    prior_blocks = rob_month_blocks(prev_close_ws) if prev_close_ws else {}
+    matched_pairs = []
+    for data_wb, formula_wb in historical_workbook_pairs:
+        if data_wb is None:
+            continue
+        for week_name in reversed(ROB_SHEETS):
+            if week_name in data_wb.sheetnames:
+                matched_pairs.append((data_wb[week_name],
+                    formula_wb[week_name] if formula_wb is not None
+                    and week_name in formula_wb.sheetnames else None))
+    # Priority within fallback: a later historical ROB has a more complete
+    # snapshot of November and December; avoid using an early empty week.
+    matched_pairs.reverse()
+    for dest_name in ROB_SHEETS:
+        if dest_name not in dest_wb.sheetnames:
+            continue
+        dest_ws = dest_wb[dest_name]
+        dst_blocks = rob_month_blocks(dest_ws)
+        selected = date_week_map.get(dest_name)
+        matched = selected.get('worksheet') if selected else None
+        matched_blocks = rob_month_blocks(matched) if matched else {}
+        changes = 0
+        for month_idx in (9, 10, 11):
+            # October is closed for a November build; generalize to other
+            # months by only forcing the previous month's completed history.
+            use_prior_close = month_idx < target_month.month - 1
+            rows = dst_blocks.get(month_idx, {})
+            for label in ('revenue', 'room nights', 'group rms sold', 'group rm rev',
+                          'perm rms sold', 'perm rm rev'):
+                dest_row = rows.get(label)
+                if dest_row is None:
+                    continue
+                for dest_col in (2, 3, 4):
+                    candidates = []
+                    # Existing B:D in the completed current-year report has
+                    # exactly the destination's historical-year headings.
+                    prior_row = prior_blocks.get(month_idx, {}).get(label)
+                    if prior_row is not None and str(prev_close_ws.cell(3, dest_col).value).strip() == str(dest_ws.cell(3, dest_col).value).strip():
+                        candidates.append((prev_close_ws, prior_row, dest_col,
+                                           'previous-month closing week'))
+                    selected_row = matched_blocks.get(month_idx, {}).get(label)
+                    if selected_row is not None:
+                        for source_col in (2, 3, 4, 5):
+                            if str(matched.cell(3, source_col).value).strip() == str(dest_ws.cell(3, dest_col).value).strip():
+                                candidates.append((matched, selected_row, source_col,
+                                                   'date-matched STLY snapshot'))
+                    for data_ws, _formula_ws in matched_pairs:
+                        rr = rob_month_blocks(data_ws).get(month_idx, {}).get(label)
+                        if rr is not None:
+                            for source_col in (2, 3, 4, 5):
+                                # Historical sources may roll from a 2025 ROB
+                                # into a 2026 ROB: match the YEAR, not column
+                                # position, or Jan 2026 shifts history wrongly.
+                                if str(data_ws.cell(3, source_col).value).strip() == str(dest_ws.cell(3, dest_col).value).strip():
+                                    candidates.append((data_ws, rr, source_col,
+                                                       'later historical snapshot'))
+                    # For future months prefer date-matched historical actuals;
+                    # for completed months prefer already-finalized prior ROB.
+                    if not use_prior_close:
+                        candidates.sort(key=lambda x: 0 if x[3] ==
+                            'date-matched STLY snapshot' else
+                            1 if x[3] == 'later historical snapshot' else 2)
+                    chosen = None
+                    for ws, rr, cc, origin in candidates:
+                        if ws is None:
+                            continue
+                        v = ws.cell(rr, cc).value
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            chosen = (v, origin)
+                            break
+                    existing = dest_ws.cell(dest_row, dest_col).value
+                    if chosen is not None:
+                        value, origin = chosen
+                        if existing != value:
+                            dest_ws.cell(dest_row, dest_col).value = value
+                            changes += 1
+                    elif label in ('revenue', 'room nights'):
+                        # A prior destination value or template formula is not
+                        # independent evidence that history was imported.
+                        missing.append(f'{dest_name} {month_idx + 1:02d} '
+                                       f'{label} {get_column_letter(dest_col)}')
+        notes.append(f'{dest_name}: Q4 historical base metrics reconciled ({changes} cells).')
+    return notes, missing
 
 
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False):
@@ -9451,6 +9572,23 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     else:
         warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
 
+    # Normal reporting-year isolation. The previous-month current-year file
+    # must have the same tracked year as the destination. Never import live
+    # E-column totals from a 2027 ROB into a 2026 ROB, even if the name/folder
+    # matches the reporting month.
+    if hilton_mode:
+        if prev_wb is None or 'wk one' not in prev_wb.sheetnames:
+            return None, f"Hilton {target_month.year} ROB requires the previous-month normal ROB.", None, None
+        try:
+            _prev_year = int(float(prev_wb['wk one']['E3'].value))
+        except (ValueError, TypeError):
+            _prev_year = None
+        if _prev_year != target_month.year:
+            return (None, f"Hilton year isolation stopped the update: previous-month "
+                    f"source {prev_result[1] if prev_result else '(unresolved)'} has "
+                    f"E3={_prev_year!r}; normal {target_month.year} ROB must use "
+                    f"E3={target_month.year}. No upload performed.", None, None)
+
     # Preserve the established current-year budget/reference block from the
     # previous live ROB. This intentionally overrides blank I/J cells inherited
     # from a generic/future-year master.
@@ -9678,6 +9816,18 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         warnings.append(
             f"Current-year carry-forward source: {latest_prev_sheet_name}"
         )
+    if hilton_mode:
+        if carry_forward_ws is None:
+            return None, "Hilton rollover stopped: no completed previous-month current-year ROB was found.", None, None
+        _close_row = rob_month_blocks(carry_forward_ws).get(prev_month_dt.month - 1, {}).get('revenue')
+        _close_value = carry_forward_ws.cell(_close_row, 5).value if _close_row else None
+        if not isinstance(_close_value, (int, float)) or isinstance(_close_value, bool):
+            return None, "Hilton rollover stopped: finalized previous-month revenue is not a cached number in column E.", None, None
+        warnings.append(
+            f"Verified {prev_month_dt:%b %Y} month-end Revenue from "
+            f"{latest_prev_sheet_name} E{_close_row}: {_close_value:,.2f}; "
+            f"tracked year {target_month.year} (NOT {target_month.year+1})."
+        )
 
     # An SNT rollover is a source-dependent operation: do not upload an
     # apparently successful, partially populated workbook if the prior
@@ -9827,6 +9977,35 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 )
 
         filled_stly_sheets.add(sheet_name)
+
+    # v54: Historical October/November/December repair.  The date-first
+    # mapping picks the right STLY WEEK, but some historical workbook snapshots
+    # contain missing future-month values (and the prior-month October close
+    # must not be replaced by a partial, earlier October snapshot).  Prefer
+    # the closed previous current-year ROB for October and fall back through
+    # other validated historical sources for missing November/December metrics.
+    # Never modify E/G current-year metrics or the date-first STLY week map.
+    if hilton_mode:
+        _v54_notes, _v54_missing = _hilton_reconcile_q4_history(
+            new_wb, target_month, carry_forward_ws,
+            stly_week_map,
+            (
+                (ly_wb, ly_wb_formulas),
+                (next_ly_wb, next_ly_wb_formulas),
+                (next2_ly_wb, next2_ly_wb_formulas),
+            ),
+        )
+        warnings.extend(_v54_notes)
+        if _v54_missing:
+            return (
+                None,
+                "Hilton monthly setup NOT uploaded: October-December historical "
+                "Revenue/Room Nights are missing or not verifiable: "
+                + "; ".join(_v54_missing)
+                + ". Review the Oct 2026 and prior-year ROB source workbooks. "
+                + "; ".join(warnings),
+                None, None,
+            )
 
     # Normalize all ROB date headers to MM/DD/YYYY display.
     for _s in ROB_SHEETS:
@@ -13814,6 +13993,17 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
 
         if "master" in str(fname).lower():
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
+        # Hilton NORMAL 2026 ROB resolution must never use a 2027 ROB.
+        # Future-year ROBs carry a *different* tracked-year column and are
+        # resolved only by the separate next-year workflow.
+        if workbook_type == "ROB" and _hilton_confirmed_root(hotel_name):
+            _leading_year = re.match(r"^\s*(20\d{2})\s+ROB\b", str(fname).upper())
+            if _leading_year:
+                return None, (
+                    f"Found '{fname}' but it belongs to the "
+                    f"{_leading_year.group(1)} future-year ROB family, not "
+                    f"the {month_date.year} normal ROB."
+                )
 
         if workbook_type in ("ROB", "Strategy Report", "Forecast"):
             folder_context = _drive_folder_context_name(
