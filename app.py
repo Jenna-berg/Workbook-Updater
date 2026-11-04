@@ -9370,6 +9370,104 @@ def _hilton_normal_year_month_setup_from_close(
         f'Week 1 pickup formula: {_pickup_formula}.',
     ]
 
+def _hilton_normal_revenue_room_nights_from_prior_year(
+    destination, historical, target_month,
+):
+    """Match a normal 2026 ROB's Revenue/Room Nights to the normal 2025 ROB.
+
+    Only the two requested metrics are affected.  In the normal 2025 source,
+    C/D/E represent 2023/2024/2025; in the normal 2026 destination they
+    belong in B/C/D.  Match by year header, month label, and week snapshot,
+    never by a 2026-prefixed NOV2025 file that tracks 2026 or by a 2027 ROB.
+    October/November/December 2026 E values are left empty during initial
+    November setup, as verified against the corrected Littleton wk one.
+    """
+    expected_source_year = target_month.year - 1
+    if historical is None or 'wk one' not in historical.sheetnames:
+        raise ValueError('normal prior-year ROB wk one missing')
+    try:
+        tracked = int(float(historical['wk one']['E3'].value))
+    except (TypeError, ValueError):
+        tracked = None
+    if tracked != expected_source_year:
+        raise ValueError(
+            f'wrong historical ROB family: E3={tracked}, expected '
+            f'{expected_source_year} (e.g. NOV2025 ROB, NOT 2026 NOV2025 ROB)'
+        )
+    reportable_weeks = 0
+    written = 0
+    for week_name in ROB_SHEETS:
+        if week_name not in destination.sheetnames or week_name not in historical.sheetnames:
+            continue
+        dst, src = destination[week_name], historical[week_name]
+        if week_name != 'wk one':
+            # Weeks 5/6 can belong to December rather than November. Do not
+            # populate their November comparisons using a mismatched date.
+            asof = _rob_valid_date(src['E4'].value)
+            if asof is None or (asof.year, asof.month) != (
+                expected_source_year, target_month.month
+            ):
+                continue
+        reportable_weeks += 1
+        dst_blocks = rob_month_blocks(dst)
+        src_blocks = rob_month_blocks(src)
+        for month_index in range(9, 12):
+            # January-September are already correct in the completed
+            # October 2026 ROB; preserve the exact values/cents.
+            for label in ('revenue', 'room nights'):
+                sr = src_blocks.get(month_index, {}).get(label)
+                dr = dst_blocks.get(month_index, {}).get(label)
+                if sr is None or dr is None:
+                    if week_name == 'wk one':
+                        raise ValueError(f'row missing: {week_name} month {month_index+1} {label}')
+                    continue
+                for src_col, dst_col in ((3,2),(4,3),(5,4)):
+                    src_year = historical['wk one'].cell(3,src_col).value
+                    dst_year = destination['wk one'].cell(3,dst_col).value
+                    try:
+                        correct_year = int(float(src_year)) == int(float(dst_year))
+                    except (TypeError,ValueError):
+                        correct_year = False
+                    if not correct_year:
+                        raise ValueError(
+                            f'{week_name} wrong Revenue/Room Nights year '
+                            f'{src_year!r} -> {dst_year!r}'
+                        )
+                    value = src.cell(sr,src_col).value
+                    if value is None:
+                        if week_name == 'wk one':
+                            raise ValueError(
+                                f'prior-year normal ROB missing {label} '
+                                f'{month_index+1:02d} {get_column_letter(src_col)}{sr}'
+                            )
+                        continue
+                    # Arithmetic source formulas (such as a group-adjusted
+                    # November 2025 OTB total) are intentionally preserved.
+                    # Revenue/Room Nights cells use no relative coordinates
+                    # in the corrected historical source example.
+                    if is_formula(value):
+                        value = _rob_formula_for_destination(
+                            value, src, sr, src_col, dst, dr, dst_col
+                        )
+                    dst.cell(dr,dst_col).value = value
+                    written += 1
+                if month_index >= target_month.month-2:
+                    # Keep October onward E blank in new November report.
+                    # The previous October closing figures are still used
+                    # in the separate hidden pickup baseline table.
+                    dst.cell(dr,5).value = None
+    # Keep active WK1 intentionally blank until its November weekly export.
+    if reportable_weeks < 1:
+        raise ValueError('no prior-year comparable weeks were available')
+    wk1 = destination['wk one']
+    for month_index in (target_month.month-2, target_month.month-1):
+        for metric in ('revenue','room nights'):
+            row = rob_month_blocks(wk1).get(month_index,{}).get(metric)
+            if row is None or wk1.cell(row,5).value is not None:
+                raise ValueError(f'new-month E clearing failed for {metric} {month_index+1}')
+    return f'Hilton normal ROB Revenue/Room Nights corrected: {written} historical B:D cells from normal {expected_source_year} ROB in {reportable_weeks} comparable weeks; October onward current-year E cleared.'
+
+
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
@@ -9768,20 +9866,38 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         except (ValueError, KeyError) as _exc:
             return (None, f"Hilton monthly setup not uploaded: {_exc}", None, None)
         warnings.extend(_summary)
+        # The user's corrected November 2026 ROB is authoritative for
+        # historical Revenue/Room Nights. Do not use the October 2026 ROB's
+        # stale B:D snapshots, and never use 2026 NOV2025 (a 2027 seed).
+        _normal_ly_month = target_month.replace(year=target_month.year - 1)
+        _normal_ly_result = _hilton_find_confirmed_workbook(
+            service, hotel_name, _normal_ly_month, next_year=False,
+        )
+        if not _normal_ly_result:
+            return (None, 'Hilton Revenue/Room Nights not uploaded: '
+                    f'normal {_normal_ly_month:%b%Y} ROB missing from the '
+                    'hotel reporting folders. Need NOV2025 ROB, not '
+                    '2026 NOV2025 ROB. No upload performed.', None, None)
+        try:
+            _normal_ly_wb = _get_openpyxl_workbook_cached(
+                service, _normal_ly_result[0], data_only=False,
+            )
+            _normal_notes = _hilton_normal_revenue_room_nights_from_prior_year(
+                new_wb, _normal_ly_wb, target_month,
+            )
+        except (ValueError, KeyError, TypeError, Exception) as _err:
+            return (None, f'Hilton Revenue/Room Nights not uploaded: '
+                    f'{_err}. No upload performed.', None, None)
+        warnings.append(f'Normal prior-year source: {_normal_ly_result[1]}')
+        warnings.append(_normal_notes)
         warnings.append(
             f"Verified {_src.title} October-month-end source: "
             f"Revenue {_close_revenue:,.2f}, Room Nights {_close_rooms:,.0f}; "
             f"year {target_month.year}. No following-year ROB was read."
         )
-        # Validate in-memory workbook *before* any Drive upload.
+        # The verified October final is a source check and may feed the
+        # previous-week baseline; it is NOT an October E input in the new ROB.
         _wk1 = new_wb['wk one']
-        _oct_block = rob_month_blocks(_wk1).get(prev_month_dt.month - 1, {})
-        for _label, _expected in (('revenue', _close_revenue),
-                                  ('room nights', _close_rooms)):
-            _row = _oct_block.get(_label)
-            if _row is None or _wk1.cell(_row, 5).value != _expected:
-                return (None, f"Hilton {target_month:%b %Y} did not upload: "
-                        f"{prev_month_dt:%b %Y} {_label} failed readback.", None, None)
         if _rob_valid_date(_wk1['E4'].value) is not None:
             return (None, "Hilton monthly setup refused to upload a workbook "
                     "with an already-populated Week 1 reporting date.", None, None)
@@ -9791,9 +9907,30 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         new_wb.save(_out)
         # Re-open the actual bytes to catch serialization/structural errors.
         _verify = openpyxl.load_workbook(io.BytesIO(_out.getvalue()), data_only=False)
-        _revenue_row = rob_month_blocks(_verify['wk one'])[prev_month_dt.month - 1]['revenue']
-        if _verify['wk one'].cell(_revenue_row, 5).value != _close_revenue:
-            return (None, "Hilton ROB serialization check failed. No upload.", None, None)
+        # Read back all Week 1 Revenue/Room Nights historical rows and the
+        # intentional current-year October-November-December blanks.
+        _reference_wk1 = _normal_ly_wb['wk one']
+        for _month_index in range(9, 12):
+            _ref_blocks = rob_month_blocks(_reference_wk1).get(_month_index, {})
+            _written_blocks = rob_month_blocks(_verify['wk one']).get(_month_index, {})
+            for _label in ('revenue','room nights'):
+                _sr = _ref_blocks.get(_label)
+                _dr = _written_blocks.get(_label)
+                if _sr is None or _dr is None:
+                    return (None, 'Hilton ROB serialization missing metric rows. No upload.', None, None)
+                for _sc, _dc in ((3,2),(4,3),(5,4)):
+                    _src_value = _reference_wk1.cell(_sr,_sc).value
+                    _dest_value = _verify['wk one'].cell(_dr,_dc).value
+                    if _src_value != _dest_value:
+                        # Formula translation can legitimately change syntax
+                        # while keeping meaning, so compare exact literals
+                        # only when the source is not a formula.
+                        if not is_formula(_src_value):
+                            return (None, f'Hilton Revenue/Room Nights readback mismatch '
+                                    f'{_label} {_month_index+1} col {_dc}. No upload.', None, None)
+                if _month_index >= target_month.month-2 and _verify['wk one'].cell(_dr,5).value is not None:
+                    return (None, f'Hilton future-month E readback not blank: '
+                            f'{_label} {_month_index+1}. No upload.', None, None)
         drive_upload(service, new_file_id, _out.getvalue(), new_file_name)
         _emit_rob_setup_progress(progress_callback, 1.0, "Hilton ROB setup complete.")
         return new_file_name, "; ".join(warnings), new_file_id, new_wb_bytes
