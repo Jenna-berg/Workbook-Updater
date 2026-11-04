@@ -7896,6 +7896,42 @@ def _rob_copy_secondary_by_label(src_ws, dst_ws, month_idx):
 
 
 
+def _rob_copy_matched_week_stly_gnpu(src_ws, dst_ws, start_month_idx=0):
+    """Transfer Group NPU rooms/revenue from a matched historical ROB week.
+
+    The historical week's live GNPU is in G; the current/next-year ROB's
+    historical comparison is H. Match month and metric labels, not row
+    offsets (permanent-room layouts have additional rows). Treat an empty
+    historical G as empty H, but preserve actual zero values. Do not touch
+    current-year GNPU in G or any revenue/pickup cells.
+    """
+    if src_ws is None or dst_ws is None:
+        return 0
+    src_blocks = rob_month_blocks(src_ws)
+    dst_blocks = rob_month_blocks(dst_ws)
+    count = 0
+    for month_idx in range(start_month_idx, 12):
+        src_rows = src_blocks.get(month_idx, {})
+        dst_rows = dst_blocks.get(month_idx, {})
+        for label in _ROB_SECONDARY_METRIC_LABELS:
+            sr, dr = src_rows.get(label), dst_rows.get(label)
+            if not dr:
+                continue
+            value = src_ws.cell(sr, 7).value if sr else None
+            if value is None or value == '' or is_datelike(value):
+                value = None
+            else:
+                value = _rob_formula_for_destination(
+                    value, src_ws, sr, 7, dst_ws, dr, 8
+                )
+            if _rob_cell_is_writable(dst_ws, dr, 8):
+                if dst_ws.cell(dr, 8).value != value:
+                    dst_ws.cell(dr, 8).value = value
+                if value is not None:
+                    count += 1
+    return count
+
+
 def _rob_reinforce_next_year_stly_group_npu(new_wb, historical_week_map):
     """Explicitly carry prior-year Group on Hold into next-year ROB column H.
 
@@ -10029,6 +10065,24 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         except Exception as _err:
             return (None, f'Hilton Revenue/Room Nights not uploaded: '
                     f'{_err}. No upload performed.', None, None)
+        # The Revenue/Room Nights setup above does not own GNPU. Carry the
+        # matched normal prior-year week's G into this year's STLY H.
+        # Only dated, comparable November weeks are populated; December tabs
+        # stay unreported. Earlier finalized months are not altered.
+        _gnpu_count = 0
+        for _sheet in ROB_SHEETS:
+            if _sheet not in new_wb.sheetnames or _sheet not in _normal_ly_wb.sheetnames:
+                continue
+            _historical_ws = _normal_ly_wb[_sheet]
+            _date = _rob_valid_date(_historical_ws['E4'].value)
+            if (_date is None or (_date.year, _date.month) !=
+                    (target_month.year - 1, target_month.month)):
+                continue
+            _gnpu_count += _rob_copy_matched_week_stly_gnpu(
+                _historical_ws, new_wb[_sheet],
+                start_month_idx=target_month.month - 1,
+            )
+        warnings.append(f'Hilton normal-year STLY GNPU G to H: {_gnpu_count} populated cells.')
         warnings.append(f'Normal prior-year source: {_normal_source_label}')
         warnings.append(_normal_notes)
         warnings.append(
@@ -12542,28 +12596,17 @@ def setup_hilton_next_year_rob_month(
     #
     # WK1 from the historical source (10/01/2025) is skipped because that
     # snapshot was already consumed by the prior reporting cadence.
-    if str(hotel_name or "").strip().lower() == "memphis":
-        historical_week_map, historical_map_diag = (
-            _rob_build_memphis_next_year_benchmark_map(
-                hist_wb,
-                hist_name,
-                new_wb,
-            )
+    # Every Hilton property, including Memphis, uses the standard date-first
+    # cadence. The former Memphis-only "skip historical week one" override
+    # shifted valid source weeks and is deliberately not called.
+    historical_week_map, historical_map_diag = (
+        _rob_build_date_first_stly_map(
+            new_wb,
+            cadence_prev_wb,
+            report_month,
+            [(hist_name, hist_wb)],
         )
-    else:
-        historical_week_map, historical_map_diag = (
-            _rob_build_date_first_stly_map(
-                new_wb,
-                cadence_prev_wb,
-                report_month,
-                [
-                    (
-                        hist_name,
-                        hist_wb,
-                    )
-                ],
-            )
-        )
+    )
 
     copied = 0
 
@@ -12587,6 +12630,9 @@ def setup_hilton_next_year_rob_month(
                 src_ws,
                 dst_ws,
             )
+            # STLY GNPU is NOT included in the B:D historical copy.
+            # Independently copy source live G to destination comparison H.
+            copied += _rob_copy_matched_week_stly_gnpu(src_ws, dst_ws)
 
         dst_blocks = rob_month_blocks(dst_ws)
 
