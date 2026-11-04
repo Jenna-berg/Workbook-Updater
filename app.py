@@ -5696,6 +5696,10 @@ def _hilton_target_file_match(filename, report_month, next_year=False):
             return False
     elif lead:
         return False
+    if not next_year and re.match(r"^\s*20\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s*20\d{2}\s+ROB\b", name):
+        # A year-prefixed historical ROB (e.g. '2026 NOV2025 ROB') is
+        # prepared for the FOLLOWING reporting year, not the normal 2025 ROB.
+        return False
     if not _monthly_destination_matches_target(name, "", report_month):
         return False
     return True
@@ -5781,6 +5785,53 @@ def _hilton_find_confirmed_workbook(service, hotel_name, report_month,
     f, folder_id, folder_name = found[0]
     return (f['id'], f['name'], folder_id, folder_name,
             [x[0]['name'] for x in found[1:]])
+
+
+def _hilton_find_normal_historical_anywhere(service, hotel_name, report_month):
+    """Find a normal-year Hilton ROB outside the configured reporting root.
+
+    This is a fallback only. Search files visible to the SAME Drive service
+    account; never confuse a prefixed future-year seed with a normal ROB.
+    Do not select a matching hotel solely by month token.
+    """
+    month_token = report_month.strftime('%b%Y').upper()
+    hotel_token = re.sub(r'[^A-Z0-9]', '', str(hotel_name or '').upper())
+    try:
+        q = ("trashed = false and "
+             "(mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+             "or mimeType = 'application/vnd.ms-excel.sheet.macroEnabled.12') "
+             f"and name contains '{month_token}'")
+        rows = []
+        token = None
+        for _ in range(10):
+            kwargs = dict(q=q, fields='nextPageToken, files(id,name,modifiedTime)',
+                          pageSize=1000, supportsAllDrives=True,
+                          includeItemsFromAllDrives=True)
+            if token:
+                kwargs['pageToken'] = token
+            result = service.files().list(**kwargs).execute()
+            rows.extend(result.get('files', []))
+            token = result.get('nextPageToken')
+            if not token:
+                break
+    except Exception:
+        return None
+    candidates = []
+    for row in rows:
+        name = str(row.get('name') or '')
+        compact = re.sub(r'[^A-Z0-9]', '', name.upper())
+        if (not _hilton_target_file_match(name, report_month, False)
+                or hotel_token not in compact):
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (int(bool(re.match(
+        rf'^\s*{month_token}\s+ROB\b', x['name'].upper()))),
+        str(x.get('modifiedTime') or '')), reverse=True)
+    result = candidates[0]
+    return (result['id'], result['name'], None, 'Drive search',
+            [c['name'] for c in candidates[1:]])
 
 
 def _hilton_find_confirmed_month_folder(service, hotel_name, report_month):
@@ -9267,6 +9318,14 @@ def _hilton_normal_year_month_setup_from_close(
             if not sr or not dr:
                 continue
             for col in (2, 3, 4, 5):
+                # For the newly closed month and beyond, B:D must come
+                # exclusively from the matching normal prior-year ROB,
+                # NOT the October closing snapshot. Likewise Revenue/Room
+                # Nights E are blank until the new month's weekly export.
+                if (label in ('revenue', 'room nights') and
+                        month_idx >= prev_month - 1):
+                    _rob_set_value(wk1, dr, col, None)
+                    continue
                 value = src.cell(sr, col).value
                 # Prevent stale master/2027 values from surviving in B:E.
                 if value is None or is_datelike(value) or is_formula(value):
@@ -9435,12 +9494,14 @@ def _hilton_normal_revenue_room_nights_from_prior_year(
                         )
                     value = src.cell(sr,src_col).value
                     if value is None:
-                        if week_name == 'wk one':
-                            raise ValueError(
-                                f'prior-year normal ROB missing {label} '
-                                f'{month_index+1:02d} {get_column_letter(src_col)}{sr}'
-                            )
-                        continue
+                        # A matched active week must never silently retain
+                        # stale template data when its historical source is
+                        # missing.  Non-reporting weeks are skipped above.
+                        raise ValueError(
+                            f'prior-year normal ROB missing {week_name} '
+                            f'{label} {month_index+1:02d} '
+                            f'{get_column_letter(src_col)}{sr}'
+                        )
                     # Arithmetic source formulas (such as a group-adjusted
                     # November 2025 OTB total) are intentionally preserved.
                     # Revenue/Room Nights cells use no relative coordinates
@@ -9468,7 +9529,53 @@ def _hilton_normal_revenue_room_nights_from_prior_year(
     return f'Hilton normal ROB Revenue/Room Nights corrected: {written} historical B:D cells from normal {expected_source_year} ROB in {reportable_weeks} comparable weeks; October onward current-year E cleared.'
 
 
-def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False):
+def _snt_validate_historical_rob(wb, historical_month):
+    """Validate a same-month prior-year SNT ROB without conflating E3 and E4.
+
+    E3 identifies the tracked revenue year, which can be NEXT year in a
+    historical workbook; E4 records the actual weekly snapshot date.
+    Require real ROB revenue and evidence of the intended historical period.
+    Never accept a workbook solely on a filename or a permissive year heading.
+    Returns (valid, reason).
+    """
+    if wb is None or 'wk one' not in wb.sheetnames:
+        return False, 'historical ROB has no wk one'
+    ws = wb['wk one']
+    blocks = rob_month_blocks(ws)
+    revenue_rows = [b.get('revenue') for b in blocks.values() if b.get('revenue')]
+    if not any(ws.cell(r, 5).value is not None for r in revenue_rows):
+        return False, 'historical WK1 has no column E Revenue data'
+
+    # The as-of dates identify the reporting *snapshot*. E3 is NOT a
+    # reliable calendar-year label for historical reporting workbooks.
+    dated = []
+    for name in ROB_SHEETS:
+        if name not in wb.sheetnames:
+            continue
+        d = _rob_valid_date(wb[name]['E4'].value)
+        if d is not None:
+            dated.append(d)
+    if dated:
+        if any((d.year, d.month) == (historical_month.year, historical_month.month)
+               for d in dated):
+            return True, None
+        return False, ('historical reporting dates ' +
+                       ', '.join(str(d) for d in dated) +
+                       f' do not match {historical_month:%b %Y}')
+
+    # Some old ROBs have missing E4 markers. In that case only permit
+    # unambiguous year headings and populated revenue, not a next-year E3.
+    try:
+        tracked = int(float(ws['E3'].value))
+    except (TypeError, ValueError):
+        tracked = None
+    if tracked == historical_month.year:
+        return True, None
+    return False, (f'historical ROB has no dated {historical_month:%b %Y} '
+                   f'week and E3={tracked!r}; source cannot be verified')
+
+
+def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False, normal_historical_upload=None):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
     `original_bytes` is the file's content exactly as it was before this
@@ -9639,26 +9746,12 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                         f"historical {_month:%b %Y} ROB has no WK1 tab"
                     )
                 else:
-                    _hist_ws = _source_wb[ROB_SHEETS[0]]
-                    _source_year = _hist_ws['E3'].value
-                    try:
-                        _source_year = int(float(_source_year))
-                    except (TypeError, ValueError):
-                        _source_year = None
-                    if _source_year is not None and _source_year != _month.year:
+                    _ok, _why = _snt_validate_historical_rob(
+                        _source_wb, _month,
+                    )
+                    if not _ok:
                         _preflight_problems.append(
-                            f"historical {_month:%b %Y} ROB has unexpected "
-                            f"year heading E3={_source_year}, expected {_month.year}"
-                        )
-                    _source_blocks = rob_month_blocks(_hist_ws)
-                    if not any(
-                        _hist_ws.cell(_labels['revenue'], 5).value is not None
-                        for _labels in _source_blocks.values()
-                        if 'revenue' in _labels
-                    ):
-                        _preflight_problems.append(
-                            f"historical {_month:%b %Y} WK1 has no column E "
-                            "Revenue data to seed the new year"
+                            f'historical {_month:%b %Y} ROB invalid: {_why}'
                         )
             except Exception as _exc:
                 _preflight_problems.append(
@@ -9873,22 +9966,46 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         _normal_ly_result = _hilton_find_confirmed_workbook(
             service, hotel_name, _normal_ly_month, next_year=False,
         )
-        if not _normal_ly_result:
-            return (None, 'Hilton Revenue/Room Nights not uploaded: '
-                    f'normal {_normal_ly_month:%b%Y} ROB missing from the '
-                    'hotel reporting folders. Need NOV2025 ROB, not '
-                    '2026 NOV2025 ROB. No upload performed.', None, None)
-        try:
-            _normal_ly_wb = _get_openpyxl_workbook_cached(
-                service, _normal_ly_result[0], data_only=False,
+        if _normal_ly_result is None:
+            _normal_ly_result = _hilton_find_normal_historical_anywhere(
+                service, hotel_name, _normal_ly_month,
             )
+        if normal_historical_upload is not None:
+            try:
+                _normal_ly_wb = openpyxl.load_workbook(
+                    io.BytesIO(normal_historical_upload), data_only=False,
+                )
+                _normal_source_label = (
+                    f'User-uploaded normal {_normal_ly_month:%b%Y} reference '
+                    f'for {hotel_name} (not required to be in Drive)'
+                )
+            except Exception as _err:
+                return (None, f'Hilton Revenue/Room Nights not uploaded: '
+                        f'unable to open normal-year reference: {_err}', None, None)
+        elif _normal_ly_result:
+            try:
+                _normal_ly_wb = _get_openpyxl_workbook_cached(
+                    service, _normal_ly_result[0], data_only=False,
+                )
+                _normal_source_label = _normal_ly_result[1]
+            except Exception as _err:
+                return (None, f'Hilton Revenue/Room Nights not uploaded: '
+                        f'normal-year reference could not be loaded: {_err}', None, None)
+        else:
+            return (None, 'Hilton Revenue/Room Nights not uploaded: '
+                    f'normal {_normal_ly_month:%b%Y} ROB was not visible to '
+                    'the app service account. Upload that normal-year ROB in '
+                    'the optional reference field on the Hilton monthly setup '
+                    '(not the year-prefixed next-year ROB). No upload performed.',
+                    None, None)
+        try:
             _normal_notes = _hilton_normal_revenue_room_nights_from_prior_year(
                 new_wb, _normal_ly_wb, target_month,
             )
-        except (ValueError, KeyError, TypeError, Exception) as _err:
+        except Exception as _err:
             return (None, f'Hilton Revenue/Room Nights not uploaded: '
                     f'{_err}. No upload performed.', None, None)
-        warnings.append(f'Normal prior-year source: {_normal_ly_result[1]}')
+        warnings.append(f'Normal prior-year source: {_normal_source_label}')
         warnings.append(_normal_notes)
         warnings.append(
             f"Verified {_src.title} October-month-end source: "
@@ -9921,13 +10038,15 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 for _sc, _dc in ((3,2),(4,3),(5,4)):
                     _src_value = _reference_wk1.cell(_sr,_sc).value
                     _dest_value = _verify['wk one'].cell(_dr,_dc).value
-                    if _src_value != _dest_value:
-                        # Formula translation can legitimately change syntax
-                        # while keeping meaning, so compare exact literals
-                        # only when the source is not a formula.
-                        if not is_formula(_src_value):
-                            return (None, f'Hilton Revenue/Room Nights readback mismatch '
-                                    f'{_label} {_month_index+1} col {_dc}. No upload.', None, None)
+                    _expected = (
+                        _rob_formula_for_destination(
+                            _src_value, _reference_wk1, _sr, _sc,
+                            _verify['wk one'], _dr, _dc,
+                        ) if is_formula(_src_value) else _src_value
+                    )
+                    if _expected != _dest_value:
+                        return (None, f'Hilton Revenue/Room Nights readback mismatch '
+                                f'{_label} {_month_index+1} col {_dc}. No upload.', None, None)
                 if _month_index >= target_month.month-2 and _verify['wk one'].cell(_dr,5).value is not None:
                     return (None, f'Hilton future-month E readback not blank: '
                             f'{_label} {_month_index+1}. No upload.', None, None)
@@ -10182,23 +10301,11 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                 f"WK1 from {ly_month_dt.strftime('%b %Y')} historical ROB"
             )
         else:
-            _history_wk1 = _history_seed_wb[ROB_SHEETS[0]]
-            _hist_year = _history_wk1['E3'].value
-            try:
-                _hist_year = int(float(_hist_year))
-            except (TypeError, ValueError):
-                _hist_year = None
-            if _hist_year is not None and _hist_year != ly_month_dt.year:
-                missing_required.append(
-                    f"historical ROB contains year {_hist_year} in E3 "
-                    f"instead of {ly_month_dt.year}"
-                )
-            _blocks = rob_month_blocks(_history_wk1)
-            if not any(
-                _history_wk1.cell(_rows['revenue'], 5).value is not None
-                for _rows in _blocks.values() if 'revenue' in _rows
-            ):
-                missing_required.append("historical WK1 has no year-E Revenue rows")
+            _ok, _why = _snt_validate_historical_rob(
+                _history_seed_wb, ly_month_dt,
+            )
+            if not _ok:
+                missing_required.append(_why)
         if missing_required:
             return (
                 None,
@@ -21515,6 +21622,25 @@ def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
 
         names = ", ".join(n for n, _ in selected_hotels)
         st.caption(f"ROB setup will run for: **{names}**")
+        # Optional Hilton-only fallback for older normal-year ROBs that
+        # are not in a Drive folder the app's service account can read.
+        # Each hotel requires its own reference; never use Littleton for
+        # another hotel's numbers. The 2027 builder is a separate path.
+        normal_historical_uploads = {}
+        if key_prefix == 'hil':
+            with st.expander('Optional: prior-year normal ROB references'):
+                st.caption(
+                    'Usually found automatically in Drive. If a normal prior-year '
+                    'ROB is missing from the app-visible folders, upload it here. '
+                    'For November 2026 use NOV2025 ROB (E3=2025), NOT '
+                    '2026 NOV2025 ROB (E3=2026). One file per property.'
+                )
+                for hist_hotel, hist_id in selected_hotels:
+                    normal_historical_uploads[hist_id] = st.file_uploader(
+                        f'{hist_hotel} — normal {target_month:%b} {target_month.year-1} ROB',
+                        type=['xlsx','xlsm'],
+                        key=f'hil_normal_hist_{hist_id}_{target_month:%Y%m}',
+                    )
 
         if st.button(
             "Set Up New ROB",
@@ -21549,6 +21675,11 @@ def render_portfolio_rob_month_setup(selected_hotels, key_prefix):
                         target_month,
                         progress_callback=_progress_cb,
                         hilton_mode=(key_prefix == "hil"),
+                        normal_historical_upload=(
+                            normal_historical_uploads[hotel_id].getvalue()
+                            if key_prefix == 'hil' and normal_historical_uploads.get(hotel_id)
+                            else None
+                        ),
                     )
                     progress.progress(
                         100,
