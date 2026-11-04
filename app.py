@@ -5687,6 +5687,8 @@ def _hilton_target_file_match(filename, report_month, next_year=False):
     name = str(filename or "").upper()
     if "ROB" not in name or "MASTER" in name:
         return False
+    if re.match(r"^\s*(?:BACKUP|BAK|OLD|ARCHIVE|COPY)\b", name):
+        return False
     tracked = report_month.year + 1
     lead = re.match(r"^\s*(20\d{2})\s+ROB\b", name)
     if next_year:
@@ -9222,6 +9224,152 @@ def _hilton_reconcile_q4_history(dest_wb, target_month, prev_close_ws,
     return notes, missing
 
 
+
+def _hilton_normal_year_month_setup_from_close(
+    destination, previous, target_month, completed_week,
+    previous_formulas=None,
+):
+    """Initialize a NORMAL reporting-year Hilton ROB from its previous month.
+
+    No following-year ROBs, no NOV2025 2026-track historical workbook, and
+    no December ROBs are consulted.  Column E is the current reporting year:
+    closed-month actuals and opening future OTB come from the last genuine
+    dated closing week; subsequent weekly exports update that OTB.  Historical
+    B:D are the available previous-week snapshots, NOT asserted to be
+    date-matched STLY November week 2/3/4 snapshots.
+    """
+    if 'wk one' not in destination.sheetnames:
+        raise ValueError('destination has no wk one')
+    if completed_week not in previous.sheetnames:
+        raise ValueError('completed previous-month week missing')
+    src = previous[completed_week]
+    year = target_month.year
+    prev_month = (target_month - datetime.timedelta(days=1)).month
+    try:
+        src_year = int(float(src['E3'].value))
+    except (TypeError, ValueError):
+        src_year = None
+    if src_year != year:
+        raise ValueError(f'previous ROB tracks {src_year}, expected {year}')
+
+    _set_rob_year_headers(destination, year)
+    wk1 = destination['wk one']
+    source_blocks = rob_month_blocks(src)
+    dest_blocks = rob_month_blocks(wk1)
+    transferred = 0
+    # Copy all available historical and current-year base *inputs* from the
+    # October closing snapshot. Avoid copying calculated ADR/pickup formulas.
+    for month_idx in range(12):
+        src_labels = source_blocks.get(month_idx, {})
+        dst_labels = dest_blocks.get(month_idx, {})
+        for label in _ROB_BASE_METRIC_LABELS:
+            sr, dr = src_labels.get(label), dst_labels.get(label)
+            if not sr or not dr:
+                continue
+            for col in (2, 3, 4, 5):
+                value = src.cell(sr, col).value
+                # Prevent stale master/2027 values from surviving in B:E.
+                if value is None or is_datelike(value) or is_formula(value):
+                    value = None
+                if _rob_set_value(wk1, dr, col, value):
+                    if value is not None:
+                        transferred += 1
+        # Current-year group-on-hold values may be carried forward as
+        # opening OTB; historical group-on-hold remains whatever was known
+        # at the previous reporting date, never fabricated.
+        for label in _ROB_SECONDARY_METRIC_LABELS:
+            sr, dr = src_labels.get(label), dst_labels.get(label)
+            if sr and dr:
+                val = src.cell(sr, 7).value
+                _rob_set_value(wk1, dr, 7,
+                               val if not is_formula(val) and not is_datelike(val) else None)
+
+    # The just-closed month must always have a verified final E actual.
+    close = source_blocks.get(prev_month - 1, {})
+    for label in ('revenue', 'room nights'):
+        sr = close.get(label)
+        val = src.cell(sr, 5).value if sr else None
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise ValueError(f'closing {prev_month}/{year} {label} missing')
+
+    # Copy historical as-of markers from the closing snapshot. Never invent
+    # November-2025 week dates when the corresponding snapshot wasn't read.
+    for month_idx, dst_hrow in _rob_month_header_rows(wk1).items():
+        src_hrow = _rob_month_header_rows(src).get(month_idx)
+        if src_hrow is not None:
+            for col in (2, 3, 4):
+                val = src.cell(src_hrow, col).value
+                if val is not None and not is_formula(val):
+                    _rob_set_value(wk1, dst_hrow, col, val,
+                                   number_format='mm/dd/yyyy')
+    # The active Week 1 has not yet been updated with November exports.
+    # Keep E4 empty, including on templates carrying a stale October date.
+    for name in ROB_SHEETS:
+        if name not in destination.sheetnames:
+            continue
+        ws = destination[name]
+        ws['E4'] = None
+        if name == 'wk one':
+            continue
+        for month_idx in range(12):
+            dest_labels = rob_month_blocks(ws).get(month_idx, {})
+            wk1_labels = dest_blocks.get(month_idx, {})
+            for label in _ROB_BASE_METRIC_LABELS:
+                dr, sr = dest_labels.get(label), wk1_labels.get(label)
+                if not dr or not sr:
+                    continue
+                if month_idx < target_month.month - 1:
+                    # Closed months can never change in subsequent November
+                    # weeks; refer to the verified wk one closing snapshot.
+                    for col in (2, 3, 4, 5):
+                        _rob_set_value(ws, dr, col,
+                            f"='wk one'!{get_column_letter(col)}{sr}")
+                else:
+                    # Future weeks are not yet reported. Do not pretend they
+                    # match November-2025 comparable dates or carry stale 2027
+                    # template data into current-year OTB.
+                    for col in (2, 3, 4, 5):
+                        _rob_set_value(ws, dr, col, None)
+            for label in _ROB_SECONDARY_METRIC_LABELS:
+                dr, sr = dest_labels.get(label), wk1_labels.get(label)
+                if dr:
+                    if month_idx < target_month.month - 1 and sr:
+                        for col in (7, 8):
+                            _rob_set_value(ws, dr, col,
+                                f"='wk one'!{get_column_letter(col)}{sr}")
+                    else:
+                        _rob_set_value(ws, dr, 7, None)
+
+    _set_rob_year_headers(destination, year)
+    err = _fill_rob_prev_table(
+        wk1, previous, previous_formulas, target_month,
+        tracked_year=year, prefer_asof_marker=True,
+        source_week_override=completed_week,
+    )
+    if err:
+        raise ValueError(f'Week 1 pickup baseline missing: {err}')
+    apply_rob_pickup_wow_formulas(destination, year)
+    # Week 1 pickup MUST subtract the immediately preceding week's same-year
+    # revenue; week 2+ pickup MUST subtract the preceding week's tab.
+    _one_blocks = rob_month_blocks(wk1)
+    _idx = target_month.month - 1
+    _revenue_row = _one_blocks.get(_idx, {}).get('revenue')
+    _pickup_row = _one_blocks.get(_idx, {}).get('pickup wow')
+    if not _revenue_row or not _pickup_row:
+        raise ValueError('target month Revenue/Pickup rows not found')
+    _pickup_formula = str(wk1.cell(_pickup_row, 5).value or '')
+    if not (_pickup_formula.startswith(f'=E{_revenue_row}-') and
+            '!' not in _pickup_formula):
+        raise ValueError(f'Week 1 pickup formula invalid: {_pickup_formula}')
+    return [
+        f'Hilton NORMAL {year} rollover used ONLY {completed_week} of '
+        f'{prev_month:02d}/{year} normal ROB (not a 2027 file).',
+        f'Carried {transferred} cached base inputs into Week 1.',
+        'Future weeks remain unreported; November STLY snapshots are NOT '
+        'invented or sourced from a next-year ROB.',
+        f'Week 1 pickup formula: {_pickup_formula}.',
+    ]
+
 def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date, progress_callback=None, hilton_mode=False, snt_mode=False):
     """Full ROB new-month setup.
     Returns (new_file_name, error_or_warn_str, new_file_id, original_bytes).
@@ -9315,80 +9463,40 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ):
             existing_id = None
             existing_name = None
-    # Hilton also must validate source files BEFORE any master is copied. This
-    # prevents leaving an unfinished November file behind when a previous-year
-    # ROB is missing or an October weekly snapshot is unusable.
+    if hilton_mode and existing_id and re.match(
+        r"^\s*(?:BACKUP|BAK|OLD|ARCHIVE|COPY)\b",
+        str(existing_name or ''), re.I,
+    ):
+        existing_id, existing_name = None, None
+
+    # Normal Hilton monthly setup must use the prior month's *same-year*
+    # ROB, never the dedicated next-year historical ROB (e.g. a workbook
+    # named "2026 NOV2025 ROB" is not a November 2026 source).
+    # Validate this before creating a Drive copy, so a missing October close
+    # cannot leave an unfinished November workbook behind.
     if hilton_mode and not (existing_id and "master" not in existing_name.lower()):
         _prev = (target_month - datetime.timedelta(days=1)).replace(day=1)
-        _historical = target_month.replace(year=target_month.year - 1)
-        _source_errors = []
-        for _role, _month in (("previous month", _prev), ("historical", _historical)):
-            _result, _error = _resolve_drive_workbook_session_cached(
-                service, hotel_id, hotel_name, "ROB", _month, force_refresh=True,
+        _result, _error = _resolve_drive_workbook_session_cached(
+            service, hotel_id, hotel_name, "ROB", _prev, force_refresh=True,
+        )
+        if not _result:
+            return (None, f"Hilton {target_month:%b %Y} monthly setup stopped: "
+                    f"previous normal ROB {_prev:%b %Y} missing: {_error}", None, None)
+        try:
+            _source_wb = _get_openpyxl_workbook_cached(
+                service, _result[0], data_only=True,
             )
-            if not _result:
-                _source_errors.append(f"{_role} {_month:%b %Y} ROB missing: {_error}")
-                continue
-            try:
-                _wb = _get_openpyxl_workbook_cached(
-                    service, _result[0], data_only=(_role == "previous month"),
+            _source_week = _hilton_previous_completed_week(_source_wb, target_month)
+            if _source_week is None:
+                raise ValueError("no dated and populated final reporting week")
+            _tracked = _source_wb[_source_week]['E3'].value
+            if int(float(_tracked)) != target_month.year:
+                raise ValueError(
+                    f"tracked year E3={_tracked!r}, expected {target_month.year}"
                 )
-                if _role == "previous month":
-                    if _hilton_previous_completed_week(_wb, target_month) is None:
-                        _source_errors.append(
-                            f"{_role} {_month:%b %Y} has no correctly dated "
-                            "week with numeric Revenue and Room Nights"
-                        )
-                elif "wk one" not in _wb.sheetnames:
-                    _source_errors.append(f"{_role} {_month:%b %Y} is missing wk one")
-                else:
-                    # Historical Hilton workbooks may legitimately have an E3
-                    # tracked-year header one year *after* the weekly snapshot.
-                    # E3=2026 in a NOV2025 source is not a 2027 ROB leak.
-                    # Validate actual dated week snapshots, not the year header.
-                    _cached_hist = _get_openpyxl_workbook_cached(
-                        service, _result[0], data_only=True,
-                    )
-                    _matching_hist_weeks = [
-                        _sheet for _sheet in ROB_SHEETS
-                        if _sheet in _cached_hist.sheetnames
-                        and (
-                            (lambda d: d is not None and
-                             (d.year, d.month) == (_month.year, _month.month))(
-                                _rob_valid_date(_cached_hist[_sheet]["E4"].value)
-                            )
-                        )
-                    ]
-                    if not _matching_hist_weeks:
-                        _source_errors.append(
-                            f"{_role} {_month:%b %Y} has no weekly E4 snapshot "
-                            f"dated {_month:%b %Y}; cannot validate its source "
-                            "from the tracked-year header alone"
-                        )
-                    else:
-                        _source_ws = _cached_hist[_matching_hist_weeks[0]]
-                        _metrics = rob_month_blocks(_source_ws)
-                        if not any(
-                            isinstance(_source_ws.cell(labels['revenue'], 5).value,
-                                       (int, float))
-                            and not isinstance(_source_ws.cell(labels['revenue'], 5).value,
-                                               bool)
-                            for labels in _metrics.values()
-                            if 'revenue' in labels
-                        ):
-                            _source_errors.append(
-                                f"{_role} {_month:%b %Y} contains dated weeks "
-                                "but lacks numeric historical revenue"
-                            )
-            except Exception as _exc:
-                _source_errors.append(f"{_role} {_month:%b %Y} failed to open: {_exc}")
-        if _source_errors:
-            return (
-                None,
-                "Hilton monthly setup did not create a file because sources "
-                "failed validation: " + "; ".join(_source_errors),
-                None, None,
-            )
+        except Exception as _exc:
+            return (None, f"Hilton {target_month:%b %Y} monthly setup stopped: "
+                    f"invalid previous normal ROB: {_exc}", None, None)
 
     # For a new SNT month, validate required upstream ROBs BEFORE copying a
     # master into Drive. The post-load validation below remains in place for
@@ -9635,6 +9743,60 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             "Budget/reference carry-forward skipped because the previous "
             "live ROB could not be loaded."
         )
+
+    # 2026/current-year Hilton monthly creation is an independent workflow.
+    # The 2027 builder uses separate historical seed logic and is untouched.
+    if hilton_mode:
+        _latest = _hilton_previous_completed_week(prev_wb, target_month)
+        if _latest is None:
+            return (None, "Hilton monthly setup stopped: no completed dated "
+                    "previous-month normal ROB. No upload performed.", None, None)
+        _src = prev_wb[_latest]
+        _close = rob_month_blocks(_src).get(prev_month_dt.month - 1, {})
+        _revrow, _rmsrow = _close.get('revenue'), _close.get('room nights')
+        _close_revenue = _src.cell(_revrow, 5).value if _revrow else None
+        _close_rooms = _src.cell(_rmsrow, 5).value if _rmsrow else None
+        if any(not isinstance(v, (int, float)) or isinstance(v, bool)
+               for v in (_close_revenue, _close_rooms)):
+            return (None, "Hilton monthly setup stopped: closing-month "
+                    "Revenue/Room Nights not numeric. No upload performed.", None, None)
+        try:
+            _summary = _hilton_normal_year_month_setup_from_close(
+                new_wb, prev_wb, target_month, _latest,
+                previous_formulas=prev_wb_formulas,
+            )
+        except (ValueError, KeyError) as _exc:
+            return (None, f"Hilton monthly setup not uploaded: {_exc}", None, None)
+        warnings.extend(_summary)
+        warnings.append(
+            f"Verified {_src.title} October-month-end source: "
+            f"Revenue {_close_revenue:,.2f}, Room Nights {_close_rooms:,.0f}; "
+            f"year {target_month.year}. No following-year ROB was read."
+        )
+        # Validate in-memory workbook *before* any Drive upload.
+        _wk1 = new_wb['wk one']
+        _oct_block = rob_month_blocks(_wk1).get(prev_month_dt.month - 1, {})
+        for _label, _expected in (('revenue', _close_revenue),
+                                  ('room nights', _close_rooms)):
+            _row = _oct_block.get(_label)
+            if _row is None or _wk1.cell(_row, 5).value != _expected:
+                return (None, f"Hilton {target_month:%b %Y} did not upload: "
+                        f"{prev_month_dt:%b %Y} {_label} failed readback.", None, None)
+        if _rob_valid_date(_wk1['E4'].value) is not None:
+            return (None, "Hilton monthly setup refused to upload a workbook "
+                    "with an already-populated Week 1 reporting date.", None, None)
+        _emit_rob_setup_progress(progress_callback, 0.93, "Saving Hilton ROB...")
+        strip_tables(new_wb)
+        _out = io.BytesIO()
+        new_wb.save(_out)
+        # Re-open the actual bytes to catch serialization/structural errors.
+        _verify = openpyxl.load_workbook(io.BytesIO(_out.getvalue()), data_only=False)
+        _revenue_row = rob_month_blocks(_verify['wk one'])[prev_month_dt.month - 1]['revenue']
+        if _verify['wk one'].cell(_revenue_row, 5).value != _close_revenue:
+            return (None, "Hilton ROB serialization check failed. No upload.", None, None)
+        drive_upload(service, new_file_id, _out.getvalue(), new_file_name)
+        _emit_rob_setup_progress(progress_callback, 1.0, "Hilton ROB setup complete.")
+        return new_file_name, "; ".join(warnings), new_file_id, new_wb_bytes
 
     _emit_rob_setup_progress(progress_callback, 0.44, "Loading comparable prior-year ROBs...")
     ly_month_dt = target_month.replace(year=target_month.year - 1)
