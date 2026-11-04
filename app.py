@@ -9466,8 +9466,32 @@ def _hilton_normal_revenue_room_nights_from_prior_year(
             if asof is None or (asof.year, asof.month) != (
                 expected_source_year, target_month.month
             ):
+                # Do not retain 0 or stale dates from the October template
+                # for weeks outside the historical November reporting cycle.
+                for _c in (2, 3, 4):
+                    dst.cell(4, _c).value = None
                 continue
         reportable_weeks += 1
+        # Historical date headings belong to the same November 2025
+        # snapshot as Revenue and Room Nights, not to the October 2026
+        # closing ROB. A normal 2025 source holds years 2023-2025 in C:E;
+        # the normal 2026 destination holds those years in B:D.
+        # Preserve dates as actual Excel date values, not text or formulas.
+        for _src_date_col, _dst_date_col in ((3, 2), (4, 3), (5, 4)):
+            _historical_date = _rob_valid_date(src.cell(4, _src_date_col).value)
+            if _historical_date is None:
+                raise ValueError(
+                    f'normal historical ROB missing date {week_name} '
+                    f'{get_column_letter(_src_date_col)}4'
+                )
+            if _historical_date.year != expected_source_year - (5 - _src_date_col):
+                raise ValueError(
+                    f'normal historical ROB unexpected date-year '
+                    f'{week_name} {get_column_letter(_src_date_col)}4: '
+                    f'{_historical_date}'
+                )
+            _rob_set_value(dst, 4, _dst_date_col, _historical_date,
+                           number_format='mm/dd/yyyy')
         dst_blocks = rob_month_blocks(dst)
         src_blocks = rob_month_blocks(src)
         for month_index in range(9, 12):
@@ -10024,6 +10048,29 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         new_wb.save(_out)
         # Re-open the actual bytes to catch serialization/structural errors.
         _verify = openpyxl.load_workbook(io.BytesIO(_out.getvalue()), data_only=False)
+        # Verify the historical comparison DATES in the saved workbook for
+        # each corresponding November reporting week.  They must come from
+        # the same prior-year normal ROB as its Revenue and Room Nights.
+        for _sheet in ROB_SHEETS:
+            if _sheet not in _normal_ly_wb.sheetnames or _sheet not in _verify.sheetnames:
+                continue
+            _source_sheet = _normal_ly_wb[_sheet]
+            _dest_sheet = _verify[_sheet]
+            _source_asof = _rob_valid_date(_source_sheet['E4'].value)
+            if _source_asof is None or (_source_asof.year, _source_asof.month) != (
+                target_month.year - 1, target_month.month
+            ):
+                for _dest_col in (2, 3, 4):
+                    if _dest_sheet.cell(4, _dest_col).value is not None:
+                        return (None, f'Hilton unreported {_sheet} historical date not blank. No upload.', None, None)
+                continue
+            for _source_col, _dest_col in ((3, 2), (4, 3), (5, 4)):
+                _expected_date = _rob_valid_date(_source_sheet.cell(4, _source_col).value)
+                _actual_date = _rob_valid_date(_dest_sheet.cell(4, _dest_col).value)
+                if _actual_date != _expected_date:
+                    return (None, f'Hilton historical reporting date mismatch '
+                            f'{_sheet} {get_column_letter(_dest_col)}4: '
+                            f'{_actual_date} expected {_expected_date}. No upload.', None, None)
         # Read back all Week 1 Revenue/Room Nights historical rows and the
         # intentional current-year October-November-December blanks.
         _reference_wk1 = _normal_ly_wb['wk one']
