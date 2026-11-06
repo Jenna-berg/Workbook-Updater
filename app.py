@@ -8223,7 +8223,8 @@ def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
     This helper keeps each mapped destination week tied to one source week,
     but copies the three historical year columns by semantic month/row label.
     It also carries the year header and reporting-date headers. Current-year
-    destination column E is never touched.
+    destination column E is never touched. Summary/total sections below the
+    monthly blocks are preserved exactly from the destination template.
     """
     copied = 0
     col_map = ((3, 2), (4, 3), (5, 4))
@@ -8271,27 +8272,15 @@ def _rob_seed_historical_columns_hilton(source_ws, dest_ws):
                 dest_ws.cell(dst_row, dest_col).value = value
                 copied += 1
 
-    # Preserve summary / total sections after the final month block only when
-    # the source and destination row labels match on the same row. This keeps
-    # established Hilton totals without reintroducing cross-layout row drift.
-    src_last = max(src_headers.values()) if src_headers else 0
-    dst_last = max(dst_headers.values()) if dst_headers else 0
-    src_start = src_last + 1
-    dst_start = dst_last + 1
-    tail_rows = min(source_ws.max_row - src_start + 1, dest_ws.max_row - dst_start + 1)
-    for offset in range(max(0, tail_rows)):
-        sr = src_start + offset
-        dr = dst_start + offset
-        src_label = str(source_ws.cell(sr, 1).value or '').strip().lower()
-        dst_label = str(dest_ws.cell(dr, 1).value or '').strip().lower()
-        if not src_label or src_label != dst_label:
-            continue
-        for source_col, dest_col in col_map:
-            value = source_ws.cell(sr, source_col).value
-            if value is None:
-                continue
-            dest_ws.cell(dr, dest_col).value = value
-            copied += 1
+    # Summary formulas belong to the DESTINATION ROB template, not the
+    # mapped historical snapshot. Do not copy the tail after December.
+    #
+    # In particular, A105:E117 may contain total pickup, total group and
+    # group-pickup calculations. Copying historical C:E -> destination B:D
+    # here used to shift year references and retain the historical source's
+    # week-tab references. Even source cached values must not replace these
+    # formulas. The template's summary calculates from the monthly inputs
+    # copied above; its labels, year links, formulas and blanks stay intact.
 
     return copied
 
