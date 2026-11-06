@@ -20789,56 +20789,93 @@ OOO_TAB_RGB = "FF00FF00"  # bright green, per explicit request — distinct from
 OOO_REPORT_FILE_KEYWORD = "SELL-OUT EFFICIENCY REPORT"
 
 
-def _ooo_drive_report_candidates(service):
-    """Search every visible Drive page, including shared drives and shortcuts.
+def _ooo_is_excel_file(info):
+    """Accept native Excel uploads even when Drive reports a generic MIME type."""
+    mime = str(info.get("mimeType") or "").lower()
+    if mime.startswith("application/vnd.google-apps."):
+        return False
+    return mime in {
+        "application/vnd.ms-excel.sheet.macroenabled.12",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    } or str(info.get("name") or "").lower().endswith((".xlsm", ".xlsx"))
 
-    Filename matching is deliberately less brittle than the old exact substring:
-    Sell-Out / Sell Out / Sellout Efficiency Report are all supported. Drive
-    `name contains` is used first so reports aren't lost beyond page one.
-    """
+
+def _ooo_direct_report_file(service, file_ref):
+    """Resolve an explicit Drive file ID/link and validate shortcut targets."""
+    ref = str(file_ref or "").strip()
+    match = re.search(r"/d/([A-Za-z0-9_-]+)", ref) or re.search(
+        r"[?&]id=([A-Za-z0-9_-]+)", ref
+    )
+    fid = match.group(1) if match else ref
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", fid):
+        return None, "Enter a Drive file link or file ID, rather than a folder link."
+    try:
+        seen = set()
+        for _ in range(5):
+            if fid in seen:
+                return None, "The supplied Drive shortcut contains a loop."
+            seen.add(fid)
+            info = service.files().get(
+                fileId=fid, supportsAllDrives=True,
+                fields="id,name,mimeType,trashed,shortcutDetails(targetId,targetMimeType)",
+            ).execute()
+            if info.get("trashed"):
+                return None, "The specified Sell-Out workbook is in the trash."
+            if info.get("mimeType") == "application/vnd.google-apps.shortcut":
+                fid = (info.get("shortcutDetails") or {}).get("targetId")
+                if not fid:
+                    return None, "The supplied shortcut has no accessible target."
+                continue
+            if not _ooo_is_excel_file(info):
+                return None, ("The selected file is not an Excel .xlsm/.xlsx workbook. "
+                              "Use the original Excel report, not a converted Google Sheet.")
+            return info.get("id", fid), info.get("name", "Sell-Out Efficiency Report.xlsm")
+        return None, "Too many nested shortcuts; paste the original workbook's link."
+    except Exception as exc:
+        return None, ("The app could not access the specified Sell-Out workbook. "
+                      "Check the original file's sharing with the app's service account. "
+                      f"Drive error: {exc}")
+
+
+def _ooo_drive_report_candidates(service):
+    """Paginate visible files, allowing filename variations and generic MIME types."""
     queries = [
         "trashed = false and (name contains 'Sell' or name contains 'sell' "
         "or name contains 'Efficiency' or name contains 'efficiency')",
-        # A fallback for accounts where Drive's name search is inconsistent.
-        "trashed = false and (mimeType='application/vnd.ms-excel.sheet.macroEnabled.12' "
-        "or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-        "or mimeType='application/vnd.google-apps.shortcut' "
-        "or mimeType='application/vnd.google-apps.spreadsheet')",
+        "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
     ]
-    seen = {}
-    errors = []
+    seen, errors = {}, []
     for q in queries:
         token = None
         while True:
             try:
                 result = service.files().list(
                     q=q,
-                    fields='nextPageToken,files(id,name,mimeType,modifiedTime,shortcutDetails(targetId,targetMimeType))',
+                    fields='nextPageToken,incompleteSearch,files(id,name,mimeType,modifiedTime,shortcutDetails(targetId,targetMimeType))',
                     pageSize=1000, pageToken=token,
                     supportsAllDrives=True, includeItemsFromAllDrives=True,
                 ).execute()
             except Exception as exc:
                 errors.append(str(exc))
                 break
-            for f in result.get('files', []):
-                name = str(f.get('name') or '')
-                norm = re.sub(r'[^A-Z0-9]', '', name.upper())
+            if result.get('incompleteSearch'):
+                errors.append("Drive returned an incomplete search; use the workbook's direct link.")
+            for info in result.get('files', []):
+                norm = re.sub(r'[^A-Z0-9]', '', str(info.get('name') or '').upper())
                 if 'SELLOUT' not in norm or 'EFFICIENCY' not in norm:
                     continue
-                mimetype = f.get('mimeType')
-                if mimetype == 'application/vnd.google-apps.shortcut':
-                    details = f.get('shortcutDetails') or {}
-                    fid = details.get('targetId')
-                    mimetype = details.get('targetMimeType')
-                else:
-                    fid = f.get('id')
-                if not fid or mimetype not in {
-                    'application/vnd.ms-excel.sheet.macroEnabled.12',
-                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                }:
+                candidate = info
+                if info.get('mimeType') == 'application/vnd.google-apps.shortcut':
+                    fid, name_or_error = _ooo_direct_report_file(service, info['id'])
+                    if not fid:
+                        errors.append(f"{info.get('name')}: {name_or_error}")
+                        continue
+                    candidate = dict(info, id=fid, name=name_or_error)
+                elif not _ooo_is_excel_file(info):
+                    errors.append(f"{info.get('name')}: not an Excel .xlsm/.xlsx file.")
                     continue
-                candidate = dict(f, id=fid, mimeType=mimetype)
-                seen[fid] = candidate
+                if candidate.get('id'):
+                    seen[candidate['id']] = candidate
             token = result.get('nextPageToken')
             if not token:
                 break
@@ -20847,26 +20884,28 @@ def _ooo_drive_report_candidates(service):
     return list(seen.values()), errors
 
 
-def find_ooo_report_file(service):
-    """Return the accessible Sell-Out Efficiency workbook or a precise error.
-
-    Multiple matches are reported, not silently substituted. A -TEST copy is
-    ranked behind the actual report, so the normal production report wins.
-    """
+def find_ooo_report_file(service, file_ref=None):
+    """Use an explicit file reference first; otherwise discover one unambiguous report."""
+    if file_ref and str(file_ref).strip():
+        return _ooo_direct_report_file(service, file_ref)
     candidates, errors = _ooo_drive_report_candidates(service)
     if not candidates:
-        detail = f" Drive query error: {errors[0]}" if errors else ''
+        detail = f" Details: {'; '.join(errors[:3])}" if errors else ''
         return None, (
-            "No Sell-Out Efficiency Report workbook is visible to this app's Drive "
-            "account. Check that the actual .xlsm/.xlsx file (not just a shortcut "
-            "inside a private folder) is shared with its service account, and "
-            "that the file name includes 'Sell-Out' and 'Efficiency'." + detail
+            "Automatic search did not find an accessible Excel Sell-Out Efficiency "
+            "Report. Paste its Drive file link above to check it directly. The original "
+            "Excel workbook must be shared with the app's service account; a Google "
+            "Sheets conversion or a shortcut alone is not sufficient." + detail
         )
+    # A partial listing cannot establish uniqueness safely.
+    if errors:
+        return None, ("Drive search could not establish one complete, unambiguous result. "
+                      "Paste the intended workbook's Drive link. Details: " + '; '.join(errors[:3]))
     production = [f for f in candidates if not re.search(r'(?i)(?:^|[\s_-])(?:TEST|COPY)(?:$|[\s_-])', f['name'])]
     preferred = production if production else candidates
     if len(preferred) != 1:
         names = ', '.join(f['name'] for f in preferred[:12])
-        return None, f"Multiple Sell-Out Efficiency workbooks visible ({len(preferred)}): {names}. Rename/archive duplicates so the production file is unambiguous."
+        return None, f"Multiple Sell-Out Efficiency workbooks visible ({len(preferred)}): {names}. Paste the intended workbook's Drive link to choose it."
     return preferred[0]['id'], preferred[0]['name']
 
 
@@ -20920,22 +20959,21 @@ def build_ooo_monthly_totals(wb, year, month, sheet_names):
             skipped.append(name)
             continue
         days_included += 1
-        row = 8
-        while True:
-            prop = ws.cell(row=row, column=3).value
+        # Read-only worksheets stream XML. Iterating once avoids re-reading
+        # the sheet from the beginning for every cell/property.
+        for values in ws.iter_rows(min_row=8, min_col=3, max_col=10, values_only=True):
+            prop = values[0]
             if prop is None or str(prop).strip() == "":
                 break
             prop = str(prop).strip()
-            val = ws.cell(row=row, column=10).value
             try:
-                val = float(val) if val is not None else 0.0
+                val = float(values[7]) if values[7] is not None else 0.0
             except (TypeError, ValueError):
                 val = 0.0
             if prop not in totals:
                 totals[prop] = 0.0
                 order.append(prop)
             totals[prop] += val
-            row += 1
     return order, totals, days_included, skipped
 
 
@@ -21070,51 +21108,40 @@ def match_ooo_property_to_hotel(prop_name, hotels):
 
 
 def _find_ooo_adr_source_workbook(service, hotel_id, hotel_name, target_year, target_month):
-    """Find the best finalized ROB week for the selected OOO reporting month.
+    """Use Week 1 of the following month's ROB for the reporting month's final ADR.
 
-    Unlike the old implementation this does not anchor to today's month, so
-    last-month reports still work when a new calendar month begins. Prefer
-    the following month's ROB for finalized previous-month data, then the
-    selected month's ROB, then the previous month's as a last resort.
-    A candidate must contain a valid ADR to be accepted.
+    Never substitute an earlier in-month snapshot or a later weekly tab. The
+    reporting year comes from row 3, not the leading year in a ROB filename.
     """
     target = datetime.date(target_year, target_month, 1)
-    previous = (target - datetime.timedelta(days=1)).replace(day=1)
     following = (target + datetime.timedelta(days=32)).replace(day=1)
-    tried = []
-    for month_dt in (following, target, previous):
-        result, err = resolve_drive_workbook(service, hotel_id, hotel_name, 'ROB', month_dt)
-        if not result:
-            tried.append(f"{month_dt.strftime('%b %Y')} ROB: {err}")
-            continue
-        fid, fname = result
+    result, err = resolve_drive_workbook(service, hotel_id, hotel_name, 'ROB', following)
+    if not result:
+        return None, None, None, f"{following:%b %Y} ROB: {err}"
+    fid, fname = result
+    try:
         wb_bytes = drive_download(service, fid)
-        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False, read_only=False)
-        dated = []
-        for i, sheet_name in enumerate(ROB_SHEETS):
+        sheet_name = ROB_SHEETS[0]
+        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=True, read_only=True)
+        try:
             if sheet_name not in wb.sheetnames:
-                continue
-            ws = wb[sheet_name]
-            asof = ws['E4'].value
+                return None, None, None, f"{fname}: Week 1 tab '{sheet_name}' not found."
+            # E4 is the current workbook's reporting date even when the target
+            # historical year is in D (e.g. a 2027 ROB containing 2026 actuals).
+            asof = wb[sheet_name]['E4'].value
             if isinstance(asof, datetime.datetime):
                 asof = asof.date()
-            if isinstance(asof, datetime.date):
-                dated.append((asof, i, sheet_name))
-        # Prefer latest real dated tab; do not rely on arbitrary colored tabs
-        # or stale values in unused master weeks.
-        candidates = [x[2] for x in sorted(dated, reverse=True)]
-        if not candidates:
-            # Legacy ROBs without dated E4 markers.
-            candidates = [name for name in reversed(ROB_SHEETS)
-                          if name in wb.sheetnames and
-                          any(wb[name].cell(r, 2).value not in (None, '') for r in range(5, 15))]
-        wb.close()
-        for sheet_name in candidates:
-            adr, adr_err = read_rob_adr(wb_bytes, sheet_name, target_year, target_month)
-            if adr is not None:
-                return wb_bytes, sheet_name, fname, None
-        tried.append(f'{fname}: no completed week with valid ADR for {target:%b %Y}')
-    return None, None, None, '; '.join(tried)
+            if not isinstance(asof, datetime.date) or (asof.year, asof.month) != (following.year, following.month):
+                return None, None, None, (f"{fname}, {sheet_name}: E4 does not confirm "
+                                          f"a completed {following:%b %Y} Week 1 snapshot.")
+        finally:
+            wb.close()
+        adr, adr_err = read_rob_adr(wb_bytes, sheet_name, target_year, target_month)
+        if adr is None:
+            return None, None, None, f"{fname}, {sheet_name}: {adr_err}"
+        return wb_bytes, sheet_name, fname, None
+    except Exception as exc:
+        return None, None, None, f"{fname}: could not read Week 1 ADR: {exc}"
 
 
 def build_ooo_adr_lookup(service, order, hotels, year, month):
@@ -21132,7 +21159,7 @@ def build_ooo_adr_lookup(service, order, hotels, year, month):
             out[prop] = (None, src_err)
             continue
         adr, adr_err = read_rob_adr(wb_bytes, sheet_name, year, month)
-        out[prop] = (adr, adr_err)
+        out[prop] = (adr, adr_err or f"Source: {file_name} — {sheet_name}; {datetime.date(year, month, 1):%b %Y}")
     return out
 
 
@@ -26673,7 +26700,7 @@ with tab_ooo:
         "summary tab — right after the Report tab (2nd tab on the sheet), named e.g. "
         "'JUL 2026' — totaling each property's End. OOO Rooms across every daily tab in "
         "the selected month, with an ADR column pulled from that property's own ROB "
-        "(latest dated week for the selected month, with adjacent-month fallback), "
+        "(Week 1 of the following month, using the reporting month and year), "
         "and writes it back to Drive. The file is never re-saved through openpyxl, so the "
         "macro buttons on every existing tab are left completely untouched."
     )
@@ -26697,24 +26724,47 @@ with tab_ooo:
     )
     ooo_target_dt = ooo_month_options[ooo_sel_label]
 
+    ooo_file_ref = st.text_input(
+        "Sell-Out Efficiency workbook Drive link or file ID (optional)",
+        key="ooo_report_file_ref",
+        help="Paste the original Excel workbook's file link to bypass automatic search. "
+             "The file must still be accessible to this app's service account.",
+    ).strip()
+    ooo_account = service_account_email()
+    if ooo_account:
+        st.caption(f"Drive account used by this app: {ooo_account}")
+    # Never offer to apply a preview made for a different file reference.
+    if ("ooo_order" in st.session_state and
+            st.session_state.get("ooo_preview_file_ref", "") != ooo_file_ref):
+        for _key in ("ooo_order", "ooo_bytes", "ooo_file_id", "ooo_file_name"):
+            st.session_state.pop(_key, None)
+
     if st.button("Preview Monthly OOO Report", key="ooo_preview", type="primary"):
+        # Failed previews must not leave a previous workbook ready to apply.
+        for _key in ("ooo_order", "ooo_bytes", "ooo_file_id", "ooo_file_name"):
+            st.session_state.pop(_key, None)
         try:
             svc = get_drive_service()
-            ooo_file_id, ooo_file_name = find_ooo_report_file(svc)
+            ooo_file_id, ooo_file_name = find_ooo_report_file(svc, ooo_file_ref)
             if not ooo_file_id:
                 st.error(ooo_file_name)
             else:
                 ooo_bytes = drive_download(svc, ooo_file_id)
                 ooo_wb = openpyxl.load_workbook(io.BytesIO(ooo_bytes), data_only=True, read_only=True)
                 ooo_months = list_ooo_available_months(ooo_wb)
+                ooo_present_dates = [d for d in
+                                     (_parse_ooo_sheet_date(n) for n in ooo_wb.sheetnames)
+                                     if d is not None]
                 match = next((m for m in ooo_months
                               if m[0] == ooo_target_dt.year and m[1] == ooo_target_dt.month), None)
                 if not match:
+                    ooo_wb.close()
                     st.error(f"No dated tabs found for {ooo_target_dt.strftime('%B %Y')} in {ooo_file_name}.")
                 else:
                     ooo_year, ooo_month, ooo_sheet_names = match
                     order, totals, days_included, skipped = build_ooo_monthly_totals(
                         ooo_wb, ooo_year, ooo_month, ooo_sheet_names)
+                    ooo_wb.close()
                     if not order:
                         st.error(
                             "None of that month's tabs matched the expected layout "
@@ -26732,6 +26782,8 @@ with tab_ooo:
                                 hotels_for_adr = get_hotels_from_drive()
                             adr_lookup = build_ooo_adr_lookup(svc, order, hotels_for_adr, ooo_year, ooo_month)
                         st.session_state["ooo_hotels_seen"] = [h[0] for h in hotels_for_adr]
+                        st.session_state["ooo_present_dates"] = ooo_present_dates
+                        st.session_state["ooo_preview_file_ref"] = ooo_file_ref
                         st.session_state["ooo_file_id"]       = ooo_file_id
                         st.session_state["ooo_file_name"]     = ooo_file_name
                         st.session_state["ooo_bytes"]         = ooo_bytes
@@ -26766,6 +26818,17 @@ with tab_ooo:
         with st.expander(f"Hotel folders this app can see in Drive ({len(hotels_seen)})"):
             st.write(", ".join(hotels_seen) if hotels_seen else
                      "None — no hotel folders are shared with this environment's service account.")
+        # Report gaps explicitly; a partial month must not look complete.
+        ooo_present = set(st.session_state.get("ooo_present_dates", []))
+        ooo_expected = {
+            datetime.date(ooo_target_dt.year, ooo_target_dt.month, d)
+            for d in range(1, calendar.monthrange(ooo_target_dt.year, ooo_target_dt.month)[1] + 1)
+        }
+        ooo_missing = sorted(ooo_expected - ooo_present)
+        if ooo_missing:
+            st.warning("Partial month: no daily tabs for " +
+                       ", ".join(d.strftime("%b %d") for d in ooo_missing) +
+                       ". Totals include available daily reports only.")
         if st.session_state.get("ooo_skipped"):
             st.caption(f"Skipped tabs that didn't match the expected layout: "
                        f"{', '.join(st.session_state['ooo_skipped'])}")
