@@ -373,6 +373,14 @@ def parse_srp_activity(file_like):
     identified when its InnCode isn't one we know.
     """
     raw = pd.read_excel(file_like, sheet_name=0, header=None)
+    if (raw[0].astype(str).str.strip() == "SRP").any() and not (
+        raw[0].astype(str).str.strip() == "Stay ID"
+    ).any():
+        raise ValueError(
+            "This is an SRP Maintenance / SRP List rate-code reference, not "
+            "the SRP Activity booking export. Upload the Activity report with "
+            "Stay ID, Arrival Date, Room Nights, Room Revenue * and Property - InnCode."
+        )
     hr = _find_header_row(raw, "Stay ID")
     df = pd.read_excel(file_like, sheet_name=0, header=hr)
     df = df[df["Stay ID"].notna()]
@@ -5153,6 +5161,14 @@ def get_hotels_from_drive():
 
             grouped.setdefault(canonical, []).append(folder["id"])
 
+        # Explicit reporting roots can have arbitrary folder names. If a known
+        # root is visible, do not require its name to contain REVENUE REPORTS.
+        for root_label, root_id in HILTON_CONFIRMED_REPORT_ROOTS.items():
+            canonical = next((label for label in PORTFOLIO_HOTELS["Hilton"]
+                              if label.upper() == root_label), None)
+            if canonical and canonical not in grouped and root_id in folder_by_id:
+                grouped[canonical] = [root_id]
+
         hotels = []
         for hotel_label, ids in grouped.items():
             # De-duplicate IDs while preserving Drive discovery order.
@@ -5248,6 +5264,7 @@ PORTFOLIO_HOTELS = {
         "Nashua":         ["NASHUA"],
         "Kansas City":    ["KANSAS"],
         "Memphis":        ["MEMPHIS"],
+        "Salt Lake City": ["SALT LAKE CITY", "SALT LAKE CIY", "SLCWS"],
     },
     "IHG": {
         "Salem":          ["SALEM"],
@@ -5274,7 +5291,7 @@ ANCILLARY_EXTRA_DRIVE_HOTELS = {
 # Confirmed from real exports; the three blanks have not appeared in one yet.
 # Every code below is the one the property's own SRP report prints in its
 # "Property: <code> - <name>" header, so the mapping is the vendor's, not a
-# guess. All nine are listed: a hotel missing from here used to be skipped
+# guess. All configured hotels are listed: a hotel missing from here used to be skipped
 # with a warning, which is how a three-hotel run quietly became a one-hotel
 # run. _match_inncode can now also fall back to the export's
 # 'Property - Name' column, so a code changing underneath us degrades to a
@@ -5289,6 +5306,7 @@ HILTON_INNCODES = {
     "Northbrook":    "CHINB",   # Chicago Northbrook Hilton
     "Andover":       "BOSOR",   # DoubleTree by Hilton Boston-Andover
     "Silver Spring": "DCAGS",   # DoubleTree Washington DC Silver Spring
+    "Salt Lake City": "SLCWS",  # DoubleTree Suites Salt Lake City Downtown
 }
 
 # Hilton properties do not run a Strategy Report.
@@ -5667,6 +5685,7 @@ def _drive_excel_children_cached(_service, parent_id, include_google_sheets=Fals
 # hotel-discovery and per-month resolver paths from creating duplicate files.
 # Never search across hotels: an inaccessible root falls back to legacy lookup.
 HILTON_CONFIRMED_REPORT_ROOTS = {
+    "SALT LAKE CITY": "1eKTOqKGI06YPwSwOoZBYlXA5bsn8js5i",
     "KANSAS CITY": "146kICySGKhXzWukB8b3xdrfCDf8-ZC2i",
     "LITTLETON": "1BGvHLpFpEHKuFcRONJ9c58AF4d-Mb-7P",
     "NASHUA": "1-ACfv7xSfv_qVwIbVkaoZF4Z5-cz-8SG",
@@ -5682,6 +5701,15 @@ def _hilton_confirmed_root(hotel_name):
     return None
 
 
+def _rob_explicit_tracking_year(filename):
+    """Recognize both '2027 ROB NOV2026' and 'NOV2026 ROB 2027'."""
+    name = str(filename or "").upper()
+    match = re.match(r"^\s*(20\d{2})\s+ROB\b", name)
+    if match is None:
+        match = re.search(r"\bROB\s+(20\d{2})\b", name)
+    return int(match.group(1)) if match else None
+
+
 def _hilton_target_file_match(filename, report_month, next_year=False):
     """Require an exact reporting-month token and the correct ROB family."""
     name = str(filename or "").upper()
@@ -5691,10 +5719,11 @@ def _hilton_target_file_match(filename, report_month, next_year=False):
         return False
     tracked = report_month.year + 1
     lead = re.match(r"^\s*(20\d{2})\s+ROB\b", name)
+    explicit_year = _rob_explicit_tracking_year(name)
     if next_year:
-        if not lead or int(lead.group(1)) != tracked:
+        if explicit_year != tracked:
             return False
-    elif lead:
+    elif lead or (explicit_year is not None and explicit_year != report_month.year):
         return False
     if not next_year and re.match(r"^\s*20\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s*20\d{2}\s+ROB\b", name):
         # A year-prefixed historical ROB (e.g. '2026 NOV2025 ROB') is
@@ -6072,14 +6101,9 @@ def drive_find_regular_rob_file(
         if "MASTER" in upper or "COPY" in upper:
             continue
 
-        leading = re.match(
-            r"^\s*(20\d{2})\s+ROB\b",
-            upper,
-            flags=re.I,
-        )
-        leading_year = int(leading.group(1)) if leading else None
+        leading_year = _rob_explicit_tracking_year(name)
 
-        # A year-prefixed file for another tracked year is the special
+        # An explicitly tracked file (prefix or ROB 2027) for another year is the special
         # next-year/historical ROB, not the normal ROB for this month.
         if (
             target_year is not None
@@ -14357,6 +14381,9 @@ def _find_exact_monthly_workbook_in_folder(
             # Historical year-prefixed ROBs are never the current monthly ROB.
             if re.match(r"^\s*20\d{2}\s+ROB\b", up):
                 continue
+            explicit_year = _rob_explicit_tracking_year(name)
+            if explicit_year is not None and explicit_year != target_month.year:
+                continue
         elif keyword_up and keyword_up not in up:
             continue
 
@@ -14514,10 +14541,11 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         # resolved only by the separate next-year workflow.
         if workbook_type == "ROB" and _hilton_confirmed_root(hotel_name):
             _leading_year = re.match(r"^\s*(20\d{2})\s+ROB\b", str(fname).upper())
-            if _leading_year:
+            _tracked = _rob_explicit_tracking_year(fname)
+            if _leading_year or (_tracked is not None and _tracked != month_date.year):
                 return None, (
                     f"Found '{fname}' but it belongs to the "
-                    f"{_leading_year.group(1)} future-year ROB family, not "
+                    f"{_tracked} future-year ROB family, not "
                     f"the {month_date.year} normal ROB."
                 )
 
@@ -21939,7 +21967,7 @@ def render_hilton_update(hotels):
 
         srp_file = st.file_uploader(
             "SRP Activity — all Hilton properties (one file)",
-            type=["xlsx"], key="hil_srp")
+            type=["xlsx", "xls"], key="hil_srp")
 
         wash_files = {}
         if selected:
