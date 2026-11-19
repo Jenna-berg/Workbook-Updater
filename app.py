@@ -26479,7 +26479,7 @@ def _marg_weekly_read_state(workbook_bytes, report_month):
             return state
         ws = wb[name]
         # One pass is necessary for read-only workbooks with missing dimensions.
-        rows = list(ws.iter_rows(min_row=1, max_col=26, values_only=True))
+        rows = list(ws.iter_rows(min_row=1, max_col=31, values_only=True))
         def get(r, c):
             return rows[r - 1][c - 1] if r <= len(rows) else None
         if get(1, 26) != MARG_WEEKLY_MARKER:
@@ -26508,12 +26508,169 @@ def _marg_weekly_read_state(workbook_bytes, report_month):
         for slot in range(5):
             for i, (_, key, _) in enumerate(MARG_WEEKLY_MESSAGE_FIELDS):
                 for r, suffix in [(5 + i, ''), (17 + i, 'STLY')]:
-                    value = get(r, 15 + slot)
+                    value = get(r, (27 if get(17, 26) == 'PLYMOUTH_STYLE_V2' else 15) + slot)
                     if value is not None:
                         state['messaging'][slot][key + suffix] = value
         return state
     finally:
         wb.close()
+
+
+def _marg_weekly_apply_1620_format(ws, report_month, state, sections):
+    """Match the supplied 1620 tracker: Calibri 10, blue/red headers,
+    gray count/revenue cells, merged week pairs and accounting formats.
+    Only the generated Margaritaville month is styled; archives are untouched.
+    """
+    money = '_("$"* #,##0.00_);_("$"* \\(#,##0.00\\);_("$"* "-"??_);_(@_)'
+    white, blue, navy = 'FFFFFFFF', 'FF1155CC', 'FF1C4587'
+    week_colors = ['FF980000', 'FFFF0000', 'FFE06666', 'FFF4CCCC', 'FFE6B8AF']
+    ws.column_dimensions['A'].width = 42.63
+    for c in range(2, 12):
+        ws.column_dimensions[get_column_letter(c)].width = 11.13 if c % 2 == 0 else 12.5
+    ws.column_dimensions['L'].width = 10.75
+    ws['A1'].fill = PatternFill('solid', fgColor=blue)
+    ws['A1'].font = Font(name='Calibri', size=10, bold=True, color=white)
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.sheet_properties.tabColor = '1155CC'
+    ws.row_dimensions[1].height = 15.75
+    for header, first, total in sections:
+        # Match the source's compact height while allowing long Oaky deal
+        # titles to wrap instead of being clipped by the count column.
+        for r in range(header, total + 1):
+            ws.row_dimensions[r].height = 15.75
+            for c in range(1, 13):
+                cell = ws.cell(r, c)
+                cell.font = Font(name='Calibri', size=10)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.fill = PatternFill(fill_type=None)
+        ws.cell(header+1, 1, 'Name' if header == 2 else 'Upsell Name')
+        for c in range(1, 13):
+            ws.cell(header+1, c).fill = PatternFill('solid', fgColor=blue)
+            ws.cell(header+1, c).font = Font(name='Calibri', size=10, bold=True, color=white)
+        ws.cell(header, 1).fill = PatternFill('solid', fgColor='FFFF0000')
+        ws.cell(header, 1).font = Font(name='Calibri', size=10, bold=True, color=white)
+        ws.cell(header, 12, 'AVERAGE')
+        ws.cell(header, 12).fill = PatternFill('solid', fgColor=blue)
+        ws.cell(header, 12).font = Font(name='Calibri', size=10, bold=True, color=white)
+        for slot, color in enumerate(week_colors):
+            cc, rc = 2+slot*2, 3+slot*2
+            ws.merge_cells(start_row=header, start_column=cc, end_row=header, end_column=rc)
+            ws.cell(header, cc).fill = PatternFill('solid', fgColor=color)
+            ws.cell(header, cc).font = Font(name='Calibri', size=10, bold=True, color=white)
+            ws.cell(header+1, cc, 'Total number' if header == 2 else 'Total Count')
+            ws.cell(header+1, rc, 'Total Revenue')
+            ws.cell(header+1, rc).number_format = money
+            for r in range(first, total+1):
+                ws.cell(r, cc).fill = PatternFill('solid', fgColor='FFF3F3F3' if r == total else 'FFD9D9D9')
+                ws.cell(r, rc).fill = PatternFill('solid', fgColor='FFF3F3F3')
+                ws.cell(r, cc).number_format = '#,##0'
+                ws.cell(r, rc).number_format = money
+        for r in range(first, total+1):
+            ws.cell(r, 1).fill = PatternFill('solid', fgColor=navy)
+            ws.cell(r, 1).font = Font(name='Calibri', size=10, bold=True, color=white)
+            ws.cell(r, 1).alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            label = str(ws.cell(r, 1).value or '')
+            if len(label) > 40:
+                ws.row_dimensions[r].height = 15.75 * math.ceil(len(label)/40)
+            ws.cell(r, 12).font = Font(name='Calibri', size=10, bold=True)
+            ws.cell(r, 12).number_format = '"$"#,##0.00'
+    # Store per-week messaging history away from the presentation view.
+    for r in list(range(5, 12)) + list(range(17, 24)):
+        for i in range(5):
+            ws.cell(r, 27+i, ws.cell(r, 15+i).value)
+    for c in range(27, 32):
+        ws.column_dimensions[get_column_letter(c)].hidden = True
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_col >= 14 and merged.max_col <= 19:
+            ws.unmerge_cells(str(merged))
+    for row in ws.iter_rows(min_row=1, max_row=29, min_col=14, max_col=19):
+        for cell in row:
+            cell.value = None
+            cell.fill = PatternFill(fill_type=None)
+    # Match 1620's messaging sidebar at T:W; show the latest weekly snapshot.
+    ws.column_dimensions['T'].width = 37.63
+    ws.column_dimensions['U'].width = 16
+    ws.column_dimensions['V'].width = 19.88
+    ws.column_dimensions['W'].width = 16
+    ws.merge_cells('T1:Y1')
+    ws.merge_cells('T2:Y2')
+    ws['T1'] = f'Margaritaville Messaging Overview - {report_month:%B}'
+    ws['T2'] = report_month.year
+    for ref, fill in [('T1', blue), ('T2', 'FFFF0000')]:
+        ws[ref].fill = PatternFill('solid', fgColor=fill)
+        ws[ref].font = Font(name='Calibri', size=10, bold=True, color=white)
+        ws[ref].alignment = Alignment(horizontal='center', vertical='center')
+    for c, value in [(20, 'Metric'), (21, report_month.year), (22, 'STLY'), (23, 'YoY')]:
+        ws.cell(18, c, value).fill = PatternFill('solid', fgColor=blue)
+        ws.cell(18, c).font = Font(name='Calibri', size=10, bold=True, color=white)
+    latest = max((i for i, d in enumerate(state['dates']) if d), default=None)
+    for i, (label, key, pct) in enumerate(MARG_WEEKLY_MESSAGE_FIELDS):
+        r = 19+i
+        ws.cell(r, 20, label).font = Font(name='Calibri', size=10, bold=True)
+        for c, suffix in [(21, ''), (22, 'STLY')]:
+            value = state['messaging'][latest].get(key+suffix) if latest is not None else None
+            ws.cell(r, c, value)
+        ws.cell(r, 23, f'=IF(OR(U{r}="",V{r}=""),"",U{r}-V{r})')
+        for c in range(21,24):
+            ws.cell(r, c).font = Font(name='Calibri', size=10)
+            ws.cell(r, c).number_format = '0.0%' if pct else '#,##0.0'
+    notes = ['Oaky upsells only; Canary messaging only.',
+             'Each week is a month-to-date snapshot. Do not add snapshots together.',
+             f'First reporting slot: Week {state["firstWeek"]}. Earlier unrun weeks remain blank.']
+    for r, text in enumerate(notes, 28):
+        ws.merge_cells(start_row=r, start_column=20, end_row=r, end_column=25)
+        ws.cell(r, 20, text).font = Font(name='Calibri', size=10, italic=True)
+        ws.cell(r, 20).alignment = Alignment(wrap_text=True, vertical='center')
+        ws.row_dimensions[r].height = 30
+    ws.cell(17, 26, 'PLYMOUTH_STYLE_V2')
+
+
+def _marg_weekly_slot_fingerprint(workbook_bytes, report_month, week_slot):
+    """Compare selected-week inputs, not ZIP timestamps or unrelated sheets."""
+    state = _marg_weekly_read_state(workbook_bytes, report_month)
+    slot = int(week_slot)-1
+    records = []
+    for key, record in sorted(state['records'].items()):
+        pair, prior_pair = record['current'][slot], record['stly'][slot]
+        if pair != [None, None] or prior_pair != [None, None]:
+            records.append((key, pair, prior_pair))
+    signature = {'date': state['dates'][slot], 'stlyDate': state['stlyDates'][slot],
+                 'records': records, 'messaging': state['messaging'][slot]}
+    def canonical(value):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value) if value else 0.0
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        return value
+    return hashlib.sha256(json.dumps(canonical(signature), sort_keys=True, default=str).encode()).hexdigest()
+
+
+def margaritaville_rebase_weekly_update(preview_base, live_bytes, report_month,
+                                      week_slot, week_date, oaky_file,
+                                      stly_oaky_file=None, messaging=None, month_end=False):
+    """Reapply the requested snapshot to the newest workbook if its slot is unchanged.
+
+    Harmless re-exports and changes elsewhere do not block saving. Concurrent
+    edits to this exact snapshot still require a new preview.
+    """
+    before = _marg_weekly_slot_fingerprint(preview_base, report_month, week_slot)
+    live = _marg_weekly_slot_fingerprint(live_bytes, report_month, week_slot)
+    if before != live:
+        raise ValueError(f'Week {week_slot} data changed in Drive after this preview. '
+                         'Rebuild to review that week before replacing it. Other weeks were not changed.')
+    return margaritaville_build_weekly_update(live_bytes, report_month, week_slot,
+        week_date, oaky_file, stly_oaky_file, messaging=messaging, month_end=month_end)
+
+
+def _marg_weekly_drive_version(service, file_id):
+    info = service.files().get(fileId=file_id, supportsAllDrives=True,
+                              fields='id,version,modifiedTime,md5Checksum').execute()
+    token = (info.get('version'), info.get('md5Checksum'), info.get('modifiedTime'))
+    if not any(token):
+        raise ValueError('Drive did not return a workbook version; rebuild before saving.')
+    return token
 
 
 def _marg_weekly_make_sheet(report_month, state):
@@ -26633,6 +26790,8 @@ def _marg_weekly_make_sheet(report_month, state):
     for i in range(5):
         ws.cell(5+i, 26, state['dates'][i])
         ws.cell(11+i, 26, state['stlyDates'][i])
+    _marg_weekly_apply_1620_format(ws, report_month, state,
+        [(2, 4, cur_total), (stly_header, stly_first, stly_total), (var_header, var_first, var_total)])
     wb.calculation.fullCalcOnLoad = True
     out = io.BytesIO()
     wb.save(out)
@@ -26886,7 +27045,7 @@ def _render_margaritaville_weekly_tab():
     # be applied after selecting another month/week or replacing an export.
     def digest(file):
         return hashlib.sha256(_ar_upload_bytes(file)).hexdigest() if file is not None else None
-    signature = (report_month.isoformat(), slot, week_date.isoformat(), source,
+    signature = ('marg-weekly-save-v2', report_month.isoformat(), slot, week_date.isoformat(), source,
                  digest(reference), digest(current), digest(prior), tuple(sorted(messaging.items())))
     if st.session_state.get('marg_weekly_signature') != signature:
         st.session_state.pop('marg_weekly_result', None)
@@ -26924,12 +27083,22 @@ def _render_margaritaville_weekly_tab():
         if result['target'] and st.button('Save Weekly Update to Drive', key='marg_weekly_save', type='primary'):
             try:
                 svc, target = get_drive_service(), result['target']
+                version = _marg_weekly_drive_version(svc, target['file_id'])
                 live = drive_download(svc, target['file_id'])
-                if hashlib.sha256(live).digest() != hashlib.sha256(result['base']).digest():
-                    raise ValueError('The Drive workbook changed after this preview. Rebuild before saving.')
-                drive_upload(svc, target['file_id'], result['bytes'], target['file_name'])
+                rebased, save_summary = margaritaville_rebase_weekly_update(
+                    result['base'], live, report_month, slot, week_date,
+                    current, prior, messaging=messaging, month_end=slot == 5)
+                if _marg_weekly_drive_version(svc, target['file_id']) != version:
+                    raise ValueError('The workbook changed during saving. Rebuild before trying again.')
+                drive_upload(svc, target['file_id'], rebased, target['file_name'])
                 st.session_state['marg_weekly_undo'] = {'target': target, 'before': live,
-                                                      'afterHash': hashlib.sha256(result['bytes']).digest()}
+                                                      'afterHash': hashlib.sha256(rebased).digest()}
+                try:
+                    st.session_state['marg_weekly_undo']['afterVersion'] = _marg_weekly_drive_version(svc, target['file_id'])
+                except Exception:
+                    # The upload already succeeded. A failed optional undo
+                    # check must not report a failed save to the user.
+                    pass
                 st.success('Saved the selected weekly snapshot to the existing Drive report.')
                 st.session_state.pop('marg_weekly_result', None)
             except Exception as exc:
@@ -26939,7 +27108,9 @@ def _render_margaritaville_weekly_tab():
             undo = st.session_state['marg_weekly_undo']
             svc, target = get_drive_service(), undo['target']
             live = drive_download(svc, target['file_id'])
-            if hashlib.sha256(live).digest() != undo['afterHash']:
+            saved_version = undo.get('afterVersion')
+            if ((saved_version is not None and _marg_weekly_drive_version(svc, target['file_id']) != saved_version)
+                    or (saved_version is None and hashlib.sha256(live).digest() != undo['afterHash'])):
                 raise ValueError('The workbook changed since this save. Undo was stopped to preserve newer changes.')
             drive_upload(svc, target['file_id'], undo['before'], target['file_name'])
             st.session_state.pop('marg_weekly_undo', None)
